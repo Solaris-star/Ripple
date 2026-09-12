@@ -1,0 +1,3 @@
+import { tool } from "@opencode-ai/plugin"
+const base=()=>process.env.RIPPLE_TOOL_BASE||"";const token=()=>process.env.RIPPLE_AGENT_TOOL_TOKEN||"";
+export default tool({description:"调用当前 Ripple AI 协作会话已经固定并由 Broker 允许的 MCP Tool。不能访问未选择的 MCP，也不能启动任意进程。",args:{capability_id:tool.schema.string().min(1).max(180),arguments:tool.schema.object({}).passthrough().optional()},async execute(args,context){const r=await fetch(base()+"/api/ripple-agent/tools/mcp",{method:"POST",headers:{"Content-Type":"application/json","X-Ripple-Agent-Token":token()},body:JSON.stringify({remote_session_id:context.sessionID,capability_id:args.capability_id,arguments:args.arguments||{}})});const t=await r.text();if(!r.ok)throw new Error(`Ripple tool failed (${r.status})`);return t}})

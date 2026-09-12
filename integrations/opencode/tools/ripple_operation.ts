@@ -1,0 +1,4 @@
+import { tool } from "@opencode-ai/plugin"
+const base=()=>process.env.RIPPLE_TOOL_BASE||"";const token=()=>process.env.RIPPLE_AGENT_TOOL_TOKEN||"";
+async function post(body:unknown){const r=await fetch(base()+"/api/ripple-agent/tools/operation",{method:"POST",headers:{"Content-Type":"application/json","X-Ripple-Agent-Token":token()},body:JSON.stringify(body)});const t=await r.text();if(!r.ok)throw new Error(`Ripple tool failed (${r.status})`);return t}
+export default tool({description:"执行 Ripple 已注册的结构化高频操作：topic_evaluate、text_polish、comment_analysis、template_apply、publish_checklist。只返回经校验的分析/预览结果，不自动修改内容、审核或平台状态。",args:{operation:tool.schema.string(),input:tool.schema.object({}).passthrough(),source:tool.schema.object({}).passthrough().optional()},async execute(args){return post({operation:args.operation,input:args.input,source:args.source||{}})}})

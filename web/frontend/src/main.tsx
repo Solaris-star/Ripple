@@ -1,0 +1,20 @@
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+import ErrorBoundary from './components/ErrorBoundary.tsx'
+import { initializeTheme } from './lib/theme.ts'
+
+export const BUILD_ID = 'ripple-0.2.7';
+// 打到控制台，便于确认浏览器加载的是最新前端（排查缓存旧包）
+console.log(`%cRipple build: ${BUILD_ID}`, 'color:#8b5cf6;font-weight:bold');
+
+initializeTheme();
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
+  </StrictMode>,
+)

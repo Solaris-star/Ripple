@@ -1,0 +1,55 @@
+title = "Ripple gitleaks configuration"
+minVersion = "v8.25.0"
+
+[extend]
+useDefault = true
+
+# Keep these exceptions narrow: every entry must match the generic-api-key rule,
+# one exact source path, and one documented synthetic/protocol-constant pattern.
+[[allowlists]]
+description = "Synthetic WeChat app secret used only by the fake HTTP fixture"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+paths = ['''^tests/test_wechat_adapter\.py$''']
+regexes = ['''^[0-9a-f]{32}$''']
+
+[[allowlists]]
+description = "Historical interaction test idempotency key"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^tests/test_interactions\.py$''']
+regexes = ['''idempotency_key="api-interaction-account"''']
+
+[[allowlists]]
+description = "Historical smoke-test idempotency key"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^scripts/ripple_v02_smoke\.py$''']
+regexes = ['''idempotency_key.*smoke-v02-schedule-001''']
+
+[[allowlists]]
+description = "Publishing unit-test idempotency key"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^tests/test_ripple\.py$''']
+regexes = ['''idempotency_key.*creation-key-001''']
+
+[[allowlists]]
+description = "Content-guard selftest deliberately contains a fake API-key-shaped sample"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "line"
+paths = ['''^skills/shared/scripts/content_guard\.py$''']
+regexes = ['''kv secret.*api_key=abcd1234efgh5678''']
+
+[[allowlists]]
+description = "Public XHS signing-algorithm constant ported from the attributed MIT upstream, not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "match"
+paths = ['''^skills/ripple/skill-xhs-analyzer/src/lib/signing\.ts$''']
+regexes = ['''HEX_KEY''']

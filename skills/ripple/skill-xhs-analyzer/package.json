@@ -1,0 +1,67 @@
+{
+  "name": "@lucasygu/redbook",
+  "version": "0.8.1",
+  "description": "CLI tool for Xiaohongshu (Red Note) - read and post via private API",
+  "type": "module",
+  "main": "./dist/lib/client.js",
+  "exports": {
+    ".": "./dist/lib/client.js",
+    "./cookies": "./dist/lib/cookies.js",
+    "./signing": "./dist/lib/signing.js",
+    "./render": "./dist/lib/render.js"
+  },
+  "bin": {
+    "redbook": "dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "scripts/",
+    "SKILL.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc && node -e \"if(process.platform!=='win32')require('fs').chmodSync('dist/cli.js',0o755)\"",
+    "dev": "tsc --watch",
+    "prepublishOnly": "npm run build",
+    "postinstall": "node scripts/postinstall.js",
+    "preuninstall": "node scripts/preuninstall.js",
+    "start": "node dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "xiaohongshu",
+    "redbook",
+    "xhs",
+    "red-note",
+    "cli",
+    "claude-code",
+    "claude-code-skill"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@steipete/sweet-cookie": "^0.1.0",
+    "commander": "^13.1.0",
+    "kleur": "^4.1.5"
+  },
+  "peerDependencies": {
+    "marked": ">=9.0.0",
+    "puppeteer-core": ">=25.10.0"
+  },
+  "peerDependenciesMeta": {
+    "puppeteer-core": {
+      "optional": true
+    },
+    "marked": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "marked": "^15.0.0",
+    "puppeteer-core": "^25.10.0",
+    "typescript": "^5.7.0"
+  }
+}

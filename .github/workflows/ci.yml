@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install package and audit tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pip-audit build
+      - name: Tests
+        run: python -m pytest -q
+      - name: Python dependency audit
+        run: python -m pip_audit
+      - name: Package build
+        run: python -m build
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/frontend
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.19.0'
+          cache: npm
+          cache-dependency-path: web/frontend/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build
+      - run: npm run lint
+      - run: npm audit --audit-level=high
+
+  xhs-analyzer:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: skills/ripple/skill-xhs-analyzer
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.19.0'
+          cache: npm
+          cache-dependency-path: skills/ripple/skill-xhs-analyzer/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Gitleaks full-history scan
+        shell: bash
+        run: |
+          docker run --rm -w /repo -v "$PWD:/repo:ro" \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git . --config=.gitleaks.toml --redact --verbose
+
+  repository-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Forbidden runtime files
+        shell: bash
+        run: |
+          test -z "$(git ls-files '.env' '.env.*' '.ripple-private/**' 'outputs/**' | grep -v -E '(^|/)\.env\.example$|outputs/\.gitkeep$' || true)"
+      - name: Git whitespace
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}"..."${{ github.event.pull_request.head.sha }}"
+          else
+            git show --check --oneline --format= HEAD
+          fi
