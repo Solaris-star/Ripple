@@ -4,11 +4,19 @@ import {
   errorText,
   fetchAgentProfiles,
   fetchAgentRuntimes,
+  runAgentAdapterAction,
   saveAgentProfileInheritance,
   scanAgentProfiles,
   setDefaultAgentProfile,
 } from '../../lib/ripple';
-import type { AgentProfileMeta, AgentProfileState, AgentRuntimeCatalog, AgentRuntimeMeta } from '../../lib/ripple';
+import type {
+  AgentAdapterAction,
+  AgentAdapterOption,
+  AgentProfileMeta,
+  AgentProfileState,
+  AgentRuntimeCatalog,
+  AgentRuntimeMeta,
+} from '../../lib/ripple';
 import { Feedback } from './Common';
 
 const SUPPORTED = [
@@ -35,7 +43,7 @@ const CONNECTION_LABEL: Record<string, string> = {
 };
 
 function fallbackRuntime(runtime: string, name: string): AgentRuntimeMeta {
-  return { runtime, name, installed: false, healthy: false, connection_state: 'not_installed', capabilities: {} };
+  return { runtime, name, installed: false, healthy: false, connection_state: 'not_installed', capabilities: {}, adapters: [] };
 }
 
 function counts(profile?: AgentProfileMeta) {
@@ -51,6 +59,7 @@ export default function AgentRuntimeSettings() {
   const [runtimes, setRuntimes] = useState<AgentRuntimeCatalog | null>(null);
   const [profiles, setProfiles] = useState<AgentProfileState | null>(null);
   const [busy, setBusy] = useState(false);
+  const [activeAction, setActiveAction] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
@@ -75,7 +84,7 @@ export default function AgentRuntimeSettings() {
       const state = await scanAgentProfiles();
       setProfiles(state);
       setRuntimes(await fetchAgentRuntimes());
-      setNotice('扫描完成。');
+      setNotice('扫描完成。仅检测到的本机 Agent 会显示适配选项。');
     } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   };
 
@@ -97,10 +106,26 @@ export default function AgentRuntimeSettings() {
     catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   };
 
+  const runAdapterAction = async (runtime: AgentRuntimeMeta, adapter: AgentAdapterOption, action: AgentAdapterAction) => {
+    if (busy || activeAction) return;
+    const key = `${runtime.runtime}:${adapter.id}:${action.id}`;
+    setBusy(true); setActiveAction(key); setError(''); setNotice('');
+    try {
+      const result = await runAgentAdapterAction(runtime.runtime, adapter.id, action.id);
+      setRuntimes(result.runtimes);
+      setNotice(result.result?.detail || `${adapter.label} 操作完成。`);
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+      setActiveAction('');
+    }
+  };
+
   return <section className="r2-settings-section" data-section="agent-runtimes">
     <div><h2>Agent</h2></div>
     <div className="r2-settings-form"><Feedback error={error} notice={notice} />
-      <div className="r2-section-heading"><strong>本机 Agent</strong><button className="r2-button" disabled={busy} onClick={() => void scan()}>{busy ? '扫描中…' : '重新扫描'}</button></div>
+      <div className="r2-section-heading"><strong>本机 Agent</strong><button className="r2-button" disabled={busy} onClick={() => void scan()}>{busy && !activeAction ? '扫描中…' : '重新扫描'}</button></div>
       <div className="r2-agent-runtime-list">{displayed.map((runtime) => {
         const profile = profileByRuntime.get(runtime.runtime);
         const isDefault = runtimes?.default_runtime === runtime.runtime;
@@ -122,6 +147,27 @@ export default function AgentRuntimeSettings() {
             {profile?.changed_since_review && <button className="r2-text-button" disabled={busy} onClick={() => void acknowledge(profile.id)}>确认更新</button>}
           </div>
           {runtime.detail && runtime.installed && !selectable && <div className="r2-agent-runtime-detail" title={runtime.detail}>{runtime.detail}</div>}
+          {!!runtime.adapters?.length && <div className="r2-agent-adapter-list">
+            {runtime.adapters.map((adapter) => <div className={`r2-agent-adapter ${adapter.state}`} key={adapter.id}>
+              <div className="r2-agent-adapter-info">
+                <div><strong>{adapter.label}</strong><span>{adapter.state_label}</span></div>
+                <small>{adapter.package ? `${adapter.package}@${adapter.version}` : adapter.protocol}</small>
+                <p>{adapter.detail || adapter.description}</p>
+              </div>
+              {!!adapter.actions.length && <div className="r2-agent-adapter-actions">
+                {adapter.actions.map((action) => {
+                  const key = `${runtime.runtime}:${adapter.id}:${action.id}`;
+                  return <button
+                    key={action.id}
+                    className={action.danger ? 'r2-text-button' : 'r2-button'}
+                    disabled={busy}
+                    onClick={() => void runAdapterAction(runtime, adapter, action)}
+                    title="仅操作 Ripple 私有适配目录，不修改 Agent 本体或全局配置"
+                  >{activeAction === key ? '处理中…' : action.label}</button>;
+                })}
+              </div>}
+            </div>)}
+          </div>}
           {profile && profile.installed && <details className="r2-agent-inheritance">
             <summary>继承设置 {counts(profile).map(([label, value]) => `${label} ${value}`).join(' · ')}</summary>
             <div>{INHERITANCE.map((item) => <label key={item.key} title={item.title}>
@@ -131,6 +177,9 @@ export default function AgentRuntimeSettings() {
           </details>}
         </div>;
       })}</div>
+      <p className="r2-muted r2-agent-adapter-note">
+        Ripple 不会预装 ACP。只有检测到本机 Agent 后，才会展示可信且已完成安全验证的按需安装项；没有可验证适配的 Agent 不会出现虚假下载按钮。
+      </p>
     </div>
   </section>;
 }

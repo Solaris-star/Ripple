@@ -19,9 +19,14 @@ def test_runtime_catalog_exposes_supported_and_fail_closed_adapters():
     if codex.get("selectable"):
         assert codex["capabilities"]["restricted_mode"] is True
         assert codex["models"] and codex["current_model"]
-    assert items["hermes"]["capabilities"]["restricted_mode"] is False
+    hermes = items["hermes"]
+    assert hermes["capabilities"]["restricted_mode"] is bool(hermes.get("selectable"))
     assert items["claude_code"]["capabilities"]["profile_import"] is True
-    assert all("connection_state" in row and "current_model" in row and "models" in row for row in items.values())
+    assert all(
+        "connection_state" in row and "current_model" in row and "models" in row and "adapters" in row
+        for row in items.values()
+    )
+    assert all(row["adapters"] == [] for row in items.values() if not row.get("native_detected"))
 
 
 def test_runtime_catalog_is_visible_before_scan_and_joins_model_after_scan(tmp_path, monkeypatch):

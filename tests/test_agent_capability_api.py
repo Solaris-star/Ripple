@@ -42,6 +42,13 @@ def test_agent_capability_and_session_config_api_are_server_authoritative(tmp_pa
         "enabled": True, "base_url": "https://example.invalid/v1", "model": "plain", "default_model": "plain",
         "models": registry.model_state("plain")["models"], "api_key_set": True,
     })
+    monkeypatch.setattr(webapp, "_agent_session_registry_args", lambda: {
+        "runtime_ids": ["opencode"],
+        "default_runtime": "opencode",
+        "profile_runtimes": {},
+        "default_profile": "",
+        "runtime_model_states": {"opencode": registry.model_state("plain")},
+    })
 
     with TestClient(webapp.app, base_url="http://localhost") as client:
         catalog = client.get("/api/agent/capabilities")

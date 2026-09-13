@@ -40,6 +40,10 @@ class FakeAdapter:
         self.calls.append(("stop_turn", web_id, timeout))
         return True
 
+    def has_active_turns(self) -> bool:
+        self.calls.append(("has_active_turns",))
+        return False
+
     def delete_session(self, session_id: str) -> bool:
         self.calls.append(("delete_session", session_id))
         return True
@@ -92,10 +96,12 @@ def test_manager_resolves_remote_sessions_and_delegates_lifecycle():
 
     assert manager.web_session_for_remote("claude-remote") == "web-claude"
     assert manager.stop_turn("web-default", 2.0) is True
+    assert manager.has_active_turns("claude_code") is False
     assert manager.delete_session("remote-default") is True
     manager.close()
 
     assert ("stop_turn", "web-default", 2.0) in opencode.calls
+    assert ("has_active_turns",) in claude.calls
     assert ("delete_session", "remote-default") in opencode.calls
     assert ("close",) in opencode.calls
     assert ("close",) in claude.calls

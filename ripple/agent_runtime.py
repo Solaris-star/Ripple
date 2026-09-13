@@ -168,6 +168,11 @@ class AgentRuntimeManager:
                 return value
         return None
 
+    def has_active_turns(self, runtime_id: str) -> bool:
+        adapter = self.get(runtime_id)
+        probe = getattr(adapter, "has_active_turns", None)
+        return bool(probe()) if callable(probe) else False
+
     def close(self) -> None:
         for adapter in self._adapters.values():
             adapter.close()

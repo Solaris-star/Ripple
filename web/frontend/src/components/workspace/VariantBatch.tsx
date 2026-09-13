@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, errorText } from '../../lib/ripple';
+import { newId } from '../../lib/id';
 import type { Channel, Mother, PlatformVariant } from '../../lib/ripple';
 import { Feedback, Mark, Modal } from './Common';
 
@@ -8,7 +9,7 @@ export default function VariantBatch({ source, onClose, onDone }: { source: Moth
   const [selected, setSelected] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const key = useRef(crypto.randomUUID());
+  const key = useRef(newId());
   const gate = useRef(false);
   const existing = useMemo(() => new Set((source.variants || []).map(item => item.platform)), [source.variants]);
   useEffect(() => { api<Channel[]>('/api/ripple/channels').then(setChannels).catch(e => setError(errorText(e))); }, []);

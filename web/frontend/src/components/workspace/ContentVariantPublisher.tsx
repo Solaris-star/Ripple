@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { api, dateText, errorText, executeStructuredOperation, taskAction, uploadMedia } from '../../lib/ripple';
+import { newId } from '../../lib/id';
 import type { Account, BlogConnector, Channel, Mother, PlatformVariant, PreflightResult, PublishChecklistOutput, Task, VariantContent } from '../../lib/ripple';
 import { Feedback, Mark, Modal, Status } from './Common';
 
@@ -89,7 +90,7 @@ export default function ContentVariantPublisher({ variantId, source, onNavigate,
     if (current.source_version_id !== source.version_id) throw new Error('当前平台版本基于旧母稿。请先“同步最新母稿”并保存。');
     if (task && task.variant_version_id === current.version_id && !terminal.has(task.status)) return task;
     const created = await api<Task>(`/api/ripple/variants/${current.id}/tasks`, 'POST', {
-      expected_version: current.version_id, idempotency_key: crypto.randomUUID(),
+      expected_version: current.version_id, idempotency_key: newId(),
     });
     setTask(created); setNotice(`已创建发布任务快照 · ${created.id.slice(0, 8)}。平台版本仍可继续编辑。`); return created;
   };

@@ -428,6 +428,7 @@ def test_missing_job_stream_fails_promptly(tmp_path, monkeypatch):
 
 def test_chat_stop_interrupts_mapped_agent_runtime_session(monkeypatch):
     calls = []
+    monkeypatch.setattr(web._AGENT_CAPABILITIES, "get_session", lambda *_args, **_kwargs: {"runtime_id": "opencode"})
     monkeypatch.setattr(web._AGENT_RUNTIME, "stop_turn", lambda session_id, timeout=5.0, **kwargs: calls.append((session_id, timeout, kwargs.get("runtime_id"))) or True)
     result = asyncio.run(web.api_chat_stop(web.StopRequest(sessionId="stop-cleanup-test")))
     web._STOPPED_CHAT.discard("stop-cleanup-test")

@@ -15,7 +15,9 @@ from __future__ import annotations
 from collections import deque
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
 import json
+import mimetypes
 import os
 from pathlib import Path
 import queue
@@ -30,6 +32,7 @@ import uuid
 from typing import Any, Callable
 
 from .agent_runtime import AgentRuntimeError, AgentToolBridgeConfig
+from .acp_client import AcpProcessClient
 
 
 _MAX_MODEL_CACHE = 12 * 1024 * 1024
@@ -728,3 +731,423 @@ class CodexAgentAdapter:
     def close(self) -> None:
         with self._lock: active = list(self._active.items())
         for web_id, _process in active: self.stop_turn(web_id, 1.0)
+
+
+class CodexAcpAgentAdapter:
+    """Restricted Codex runtime backed by the official opt-in Codex ACP package.
+
+    The ACP package bundles a compatible Codex app-server. Ripple points it at an
+    isolated CODEX_HOME that references only the user's auth file, disables every
+    native tool and global MCP, then injects exactly one short-lived Ripple MCP
+    lease. A synthetic provider probe proves the model-visible tool surface before
+    the runtime becomes selectable.
+    """
+
+    runtime_id = "codex"
+    display_name = "Codex"
+    adapter_id = "codex_acp"
+
+    _DISABLED_FEATURES = {
+        "view_image", "shell_tool", "unified_exec", "web_search_request", "standalone_web_search",
+        "search_tool", "in_app_browser", "browser_use", "browser_use_external", "computer_use",
+        "image_generation", "plugins", "apps", "multi_agent", "multi_agent_v2", "tool_suggest",
+        "tool_search", "hooks", "request_permissions_tool", "default_mode_request_user_input",
+        "code_mode", "goals", "memories", "js_repl",
+    }
+    _PROVIDER_KEYS = {
+        "name", "base_url", "env_key", "wire_api", "requires_openai_auth", "supports_websockets",
+        "query_params", "http_headers", "request_max_retries", "stream_max_retries", "stream_idle_timeout_ms",
+    }
+
+    def __init__(self, private_dir: Path, *, tool_token: str, provisioning_service, client_factory=None):
+        self.private_dir = private_dir.resolve() / "codex-acp"
+        self.workspace = self.private_dir / "workspace"
+        self.home = self.private_dir / "home"
+        self.map_path = self.private_dir / "session-map.json"
+        self.catalog_path = self.private_dir / "safe-model-catalog.json"
+        self.tool_token = tool_token
+        self._provisioning_service = provisioning_service
+        self._client_factory = client_factory or AcpProcessClient
+        self._native = CodexAgentAdapter(private_dir, tool_token=tool_token)
+        self._lock = threading.RLock()
+        self._session_locks: dict[str, threading.Lock] = {}
+        self._active: dict[str, tuple[AcpProcessClient, str]] = {}
+        self._probe_version = ""
+        self._probe_ok = False
+        self._probe_detail = "Codex ACP restricted-mode 尚未验证。"
+        self._probe_checked_at = 0.0
+
+    def _command(self) -> list[str]:
+        return self._provisioning_service.resolve_command(self.adapter_id)
+
+    def _native_command(self) -> list[str]:
+        return self._native._command()
+
+    def _version_text(self) -> str:
+        native = self._native._version_text()
+        try:
+            result = subprocess.run(self._command() + ["--version"], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=8, check=False)
+            acp = (result.stdout or result.stderr or "").strip().splitlines()[0][:80]
+        except (OSError, subprocess.SubprocessError, AgentRuntimeError, IndexError):
+            acp = ""
+        return " · ".join(value for value in (native, acp) if value)
+
+    def model_catalog(self) -> dict:
+        return self._native.model_catalog()
+
+    @staticmethod
+    def _link_or_copy(source: Path, target: Path) -> None:
+        if not source.is_file():
+            target.unlink(missing_ok=True)
+            return
+        if target.is_symlink():
+            try:
+                if target.resolve() == source.resolve():
+                    return
+            except OSError:
+                pass
+            target.unlink(missing_ok=True)
+        elif target.exists():
+            try:
+                if os.path.samefile(source, target):
+                    return
+            except OSError:
+                pass
+            target.unlink(missing_ok=True)
+        try:
+            target.symlink_to(source.resolve())
+        except OSError:
+            try:
+                os.link(source, target)
+            except OSError:
+                shutil.copy2(source, target)
+                try:
+                    target.chmod(0o600)
+                except OSError:
+                    pass
+
+    def _prepare_home(self) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        try:
+            self.home.chmod(0o700)
+        except OSError:
+            pass
+        native_home = self._native._home()
+        self._link_or_copy(native_home / "auth.json", self.home / "auth.json")
+        model_cache = native_home / "models_cache.json"
+        if model_cache.is_file() and model_cache.stat().st_size <= _MAX_MODEL_CACHE:
+            try:
+                shutil.copy2(model_cache, self.home / "models_cache.json")
+            except OSError:
+                pass
+
+    def _safe_config(self, system_text: str = "", model_id: str = "", *, probe_base: str = "") -> dict:
+        source = self._native._profile_config()
+        config: dict[str, Any] = {
+            "approval_policy": "never",
+            "web_search": "disabled",
+            "include_apps_instructions": False,
+            "include_permissions_instructions": False,
+            "features": {name: False for name in sorted(self._DISABLED_FEATURES)},
+            "tools": {
+                "update_plan": {"enabled": False},
+                "experimental_request_user_input": {"enabled": False},
+            },
+        }
+        if system_text:
+            config["developer_instructions"] = system_text[:48000]
+        selected_model = str(model_id or source.get("model") or "").strip()
+        if selected_model:
+            config["model"] = selected_model[:200]
+        provider_id = str(source.get("model_provider") or "").strip()
+        providers = source.get("model_providers") if isinstance(source.get("model_providers"), dict) else {}
+        provider = providers.get(provider_id) if provider_id and isinstance(providers.get(provider_id), dict) else None
+        if provider_id and provider:
+            config["model_provider"] = provider_id
+            config["model_providers"] = {
+                provider_id: {key: deepcopy(value) for key, value in provider.items() if key in self._PROVIDER_KEYS}
+            }
+        if probe_base:
+            config["model"] = "ripple-probe"
+            config["model_provider"] = "ripple_probe"
+            config.setdefault("model_providers", {})["ripple_probe"] = {
+                "name": "Ripple Probe", "base_url": probe_base, "env_key": "RIPPLE_CODEX_PROBE_KEY",
+                "wire_api": "responses", "requires_openai_auth": False, "supports_websockets": False,
+            }
+        return config
+
+    def _process_env(self, system_text: str = "", model_id: str = "", *, tool_token: str = "", probe_base: str = "") -> dict[str, str]:
+        self._prepare_home()
+        env = self._native._process_env(tool_token)
+        for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
+        source = self._native._profile_config()
+        provider_id = str(source.get("model_provider") or "").strip()
+        providers = source.get("model_providers") if isinstance(source.get("model_providers"), dict) else {}
+        provider = providers.get(provider_id) if provider_id and isinstance(providers.get(provider_id), dict) else {}
+        env_key = str(provider.get("env_key") or "").strip()
+        if env_key and os.environ.get(env_key):
+            env[env_key] = os.environ[env_key]
+        env["CODEX_HOME"] = str(self.home)
+        env["INITIAL_AGENT_MODE"] = "read-only"
+        env["CODEX_CONFIG"] = json.dumps(self._safe_config(system_text, model_id, probe_base=probe_base), ensure_ascii=False)
+        env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+        env["no_proxy"] = env["NO_PROXY"]
+        if probe_base:
+            env["RIPPLE_CODEX_PROBE_KEY"] = "ripple-probe"
+        env.pop("CODEX_PATH", None)  # use the exact Codex version bundled by the locked ACP package
+        return env
+
+    def _new_client(self, env: dict[str, str]):
+        if self._client_factory is AcpProcessClient:
+            return AcpProcessClient(self._command(), self.workspace, env=env, label="Codex ACP")
+        return self._client_factory(self._command(), self.workspace)
+
+    def _restricted_probe(self) -> tuple[bool, str]:
+        version = self._version_text()
+        if version and self._probe_version == version and (self._probe_ok or time.monotonic() - self._probe_checked_at < 30):
+            return self._probe_ok, self._probe_detail
+        _CaptureHandler.requests = queue.Queue()
+        _CaptureHandler.hits = queue.Queue()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _CaptureHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True, name="ripple-codex-acp-probe")
+        thread.start()
+        client = None
+        try:
+            base = f"http://127.0.0.1:{server.server_port}/v1"
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            env = self._process_env(probe_base=base)
+            client = self._new_client(env)
+            client.start()
+            result = client.request("session/new", {"cwd": str(self.workspace), "mcpServers": []}, timeout=60)
+            session_id = str((result or {}).get("sessionId") or "") if isinstance(result, dict) else ""
+            if not session_id:
+                raise AgentRuntimeError("Codex ACP probe 未返回会话标识。", 502)
+            client.prompt(session_id, [{"type": "text", "text": "Reply with probe."}], lambda *_: None, timeout=60)
+            payload = _CaptureHandler.requests.get(timeout=10)
+            tools = self._native._tool_names(payload)
+            if tools:
+                detail = "Codex ACP restricted-mode 仍暴露非 Ripple 工具：" + ", ".join(tools[:12])
+                self._probe_version, self._probe_ok, self._probe_detail, self._probe_checked_at = version, False, detail, time.monotonic()
+                return False, detail
+            self._probe_version, self._probe_ok, self._probe_detail, self._probe_checked_at = version, True, "", time.monotonic()
+            return True, ""
+        except (OSError, queue.Empty, AgentRuntimeError, subprocess.SubprocessError) as exc:
+            detail = f"Codex ACP restricted-mode probe 失败：{str(exc)[:240]}"
+            self._probe_version, self._probe_ok, self._probe_detail, self._probe_checked_at = version, False, detail, time.monotonic()
+            return False, detail
+        finally:
+            if client is not None:
+                client.close()
+            server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+    def detect(self) -> dict:
+        try:
+            self._native_command()
+        except AgentRuntimeError as exc:
+            return {"runtime": self.runtime_id, "name": self.display_name, "installed": False, "ready": False, "detail": str(exc)}
+        authenticated, detail = self._native._auth_status()
+        bridge = False
+        try:
+            self._command(); bridge = True
+        except AgentRuntimeError as exc:
+            if authenticated:
+                detail = str(exc)
+        ready = False
+        if authenticated and bridge:
+            ready, detail = self._restricted_probe()
+        return {
+            "runtime": self.runtime_id, "name": self.display_name, "installed": True,
+            "authenticated": authenticated, "bridge_installed": bridge, "ready": ready,
+            "version": self._version_text(), "detail": detail, **self.model_catalog(),
+        }
+
+    def capabilities(self) -> dict:
+        ready = bool(self.detect().get("ready"))
+        return {
+            "streaming": ready, "thinking": ready, "attachments": ready,
+            "attachment_types": ["text", "image"], "session_resume": ready, "cancel": ready,
+            "native_model_selection": ready, "native_effort": ready, "mcp": ready,
+            "ripple_tools": ready, "profile_import": True, "restricted_mode": ready,
+        }
+
+    def status(self, tool_base: str, *, start: bool = False) -> dict:
+        detected = self.detect(); healthy = bool(detected.get("ready"))
+        return {
+            "configured": bool(detected.get("installed")), "healthy": healthy, "runtime": self.runtime_id,
+            "version": detected.get("version", ""), "detail": "" if healthy else detected.get("detail", ""),
+            "capabilities": self.capabilities() if healthy else {"restricted_mode": False, "profile_import": True},
+        }
+
+    def start_or_attach(self, tool_base: str) -> dict:
+        value = self.status(tool_base, start=False)
+        if not value.get("healthy"):
+            raise AgentRuntimeError(str(value.get("detail") or "Codex ACP Runtime 当前不可用。"), 503)
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        return value
+
+    def _read_map(self) -> dict[str, str]:
+        try:
+            if not self.map_path.is_file() or self.map_path.stat().st_size > 1024 * 1024:
+                return {}
+            raw = json.loads(self.map_path.read_text(encoding="utf-8"))
+            return {str(key): str(value) for key, value in raw.items() if isinstance(value, str) and _THREAD_ID_RE.fullmatch(value)}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_map(self, value: dict[str, str]) -> None:
+        _atomic_json(self.map_path, value)
+
+    def mapped_session(self, web_id: str) -> str | None:
+        with self._lock:
+            return self._read_map().get(web_id)
+
+    def web_session_for_remote(self, remote_session_id: str) -> str | None:
+        with self._lock:
+            return next((web for web, remote in self._read_map().items() if remote == remote_session_id), None)
+
+    def create_or_resume_session(self, web_session_id: str, tool_base: str) -> str:
+        existing = self.mapped_session(web_session_id)
+        if existing:
+            return existing
+        raise AgentRuntimeError("Codex ACP 会话需要在首轮请求中创建。", 409)
+
+    @staticmethod
+    def _mcp_servers(tool_bridge: AgentToolBridgeConfig | None) -> list[dict]:
+        if tool_bridge is None:
+            return []
+        if not _safe_loopback_url(tool_bridge.endpoint) or not tool_bridge.token:
+            raise AgentRuntimeError("Ripple MCP Bridge 配置无效。", 422)
+        return [{
+            "name": "ripple", "type": "http", "url": tool_bridge.endpoint,
+            "headers": [{"name": "Authorization", "value": "Bearer " + tool_bridge.token}],
+        }]
+
+    @staticmethod
+    def _prompt_parts(user_text: str, files: list[dict]) -> list[dict]:
+        prompt: list[dict] = [{"type": "text", "text": user_text}]
+        for item in files[:12]:
+            try:
+                path = Path(item["path"])
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+            except (KeyError, OSError, TypeError, ValueError):
+                continue
+            name = str(item.get("name") or path.name)[:240]
+            mime = str(item.get("mime") or mimetypes.guess_type(name)[0] or "application/octet-stream")[:120]
+            if mime.startswith("image/") and size <= _MAX_IMAGE_ATTACHMENT:
+                try:
+                    prompt.append({"type": "image", "mimeType": mime, "data": base64.b64encode(path.read_bytes()).decode("ascii")})
+                except OSError:
+                    continue
+            elif (mime.startswith("text/") or path.suffix.lower() in {".txt", ".md", ".json", ".yaml", ".yml", ".csv", ".html"}) and size <= _MAX_TEXT_ATTACHMENT:
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
+                    continue
+                prompt.append({"type": "text", "text": f"\n--- Explicit attachment: {name} ---\n{text}\n--- End attachment ---"})
+            else:
+                prompt.append({"type": "text", "text": f"\n[Attachment {name} ({mime}) is present, but this restricted Codex ACP adapter cannot read that binary type.]"})
+        return prompt
+
+    def run_turn(self, web_id: str, user_text: str, system_text: str, files: list[dict], tool_base: str,
+                 emit: Callable[[str, str], None], *, timeout: int = 600, model_id: str | None = None,
+                 effort: str = "auto", effort_mode: str = "auto", enabled_tools: list[str] | None = None,
+                 tool_bridge: AgentToolBridgeConfig | None = None) -> tuple[str, str]:
+        self.start_or_attach(tool_base)
+        if enabled_tools and tool_bridge is None:
+            raise AgentRuntimeError("Codex 需要 Ripple MCP lease 才能使用业务能力。", 403)
+        model_state = self.model_catalog()
+        target_model = str(model_id or model_state.get("default_model") or "")
+        allowed_models = {row["id"] for row in model_state.get("models", [])}
+        if target_model and allowed_models and target_model not in allowed_models:
+            raise AgentRuntimeError("所选 Codex 模型当前不可用。", 422)
+        lock = self._session_locks.setdefault(web_id, threading.Lock())
+        if not lock.acquire(timeout=min(timeout, 300)):
+            raise AgentRuntimeError("这个会话上一条仍在运行，请稍后重试。", 409)
+        client = None
+        session_id = ""
+        collected: list[str] = []
+
+        def capture(kind: str, text: str) -> None:
+            if kind == "token":
+                collected.append(text)
+            emit(kind, text)
+
+        try:
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            env = self._process_env(system_text, target_model, tool_token=tool_bridge.token if tool_bridge else "")
+            client = self._new_client(env)
+            client.start()
+            mcp_servers = self._mcp_servers(tool_bridge)
+            existing = self.mapped_session(web_id)
+            if existing:
+                client.request("session/load", {"sessionId": existing, "cwd": str(self.workspace), "mcpServers": mcp_servers}, timeout=60)
+                session_id = existing
+            else:
+                result = client.request("session/new", {"cwd": str(self.workspace), "mcpServers": mcp_servers}, timeout=60)
+                session_id = str((result or {}).get("sessionId") or "") if isinstance(result, dict) else ""
+                if not session_id:
+                    raise AgentRuntimeError("Codex ACP 未返回会话标识。", 502)
+                with self._lock:
+                    mapping = self._read_map(); mapping[web_id] = session_id; self._save_map(mapping)
+            client.request("session/set_mode", {"sessionId": session_id, "modeId": "read-only"}, timeout=20)
+            if target_model:
+                client.request("session/set_config_option", {"sessionId": session_id, "configId": "model", "value": target_model}, timeout=20)
+            native_effort = {"low": "low", "medium": "medium", "high": "high", "extra_high": "xhigh", "xhigh": "xhigh"}.get(effort)
+            if native_effort:
+                client.request("session/set_config_option", {"sessionId": session_id, "configId": "reasoning_effort", "value": native_effort}, timeout=20)
+            with self._lock:
+                self._active[web_id] = (client, session_id)
+            result = client.prompt(session_id, self._prompt_parts(user_text, files), capture, timeout=timeout)
+            stop_reason = str(result.get("stopReason") or "")
+            if stop_reason in {"cancelled", "refusal"} and not collected:
+                return "", session_id
+            return "".join(collected), session_id
+        finally:
+            with self._lock:
+                active = self._active.get(web_id)
+                if active and active[0] is client:
+                    self._active.pop(web_id, None)
+            if client is not None:
+                client.close()
+            lock.release()
+
+    def has_active_turns(self) -> bool:
+        with self._lock:
+            return bool(self._active)
+
+    def stop_turn(self, web_id: str, timeout: float = 5.0) -> bool:
+        with self._lock:
+            active = self._active.get(web_id)
+        if not active:
+            return False
+        client, session_id = active
+        client.cancel(session_id)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._active.get(web_id) is not active:
+                    return True
+            time.sleep(.05)
+        client.close()
+        return True
+
+    def delete_session(self, session_id: str) -> bool:
+        with self._lock:
+            mapping = self._read_map()
+            next_map = {web: remote for web, remote in mapping.items() if remote != session_id}
+            if next_map == mapping:
+                return False
+            self._save_map(next_map)
+        return True
+
+    def close(self) -> None:
+        with self._lock:
+            active = list(self._active.values())
+            self._active.clear()
+        for client, session_id in active:
+            client.cancel(session_id); client.close()

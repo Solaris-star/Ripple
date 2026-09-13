@@ -206,8 +206,51 @@ export interface AgentSkillMeta { id: string; name: string; description: string;
 export interface AgentPluginMeta { id: string; name: string; description: string; skills: string[]; mcp_tools: string[]; }
 export interface AgentCapabilityCatalog { mcp_tools: AgentCapabilityMeta[]; skills: AgentSkillMeta[]; plugins: AgentPluginMeta[]; models: AgentModelMeta[]; default_model: string; }
 export interface AgentRuntimeCapabilities { restricted_mode?: boolean; native_model_selection?: boolean; native_effort?: boolean; profile_import?: boolean; streaming?: boolean; attachments?: boolean; mcp?: boolean; [key: string]: unknown; }
-export interface AgentRuntimeMeta { runtime: string; name: string; installed: boolean; configured?: boolean; ready?: boolean; selectable?: boolean; healthy: boolean; running?: boolean; version?: string; detail?: string; dependency?: string; connection_state?: string; current_model?: string; current_effort?: string; profile_id?: string; models?: AgentModelMeta[]; capabilities: AgentRuntimeCapabilities; }
+export interface AgentAdapterAction { id: 'install' | 'repair' | 'verify' | 'uninstall'; label: string; danger?: boolean; }
+export interface AgentAdapterOption {
+  id: string;
+  runtime_id: string;
+  label: string;
+  kind: 'builtin' | 'npm_acp' | 'unavailable';
+  protocol: string;
+  description: string;
+  source_url?: string;
+  state: 'missing' | 'present_unmanaged' | 'installed_unverified' | 'ready' | 'verification_failed' | 'unavailable';
+  state_label: string;
+  detail: string;
+  managed: boolean;
+  package?: string;
+  version?: string;
+  installed_version?: string;
+  actions: AgentAdapterAction[];
+}
+export interface AgentRuntimeMeta {
+  runtime: string;
+  name: string;
+  installed: boolean;
+  native_detected?: boolean;
+  configured?: boolean;
+  ready?: boolean;
+  selectable?: boolean;
+  healthy: boolean;
+  running?: boolean;
+  version?: string;
+  detail?: string;
+  dependency?: string;
+  connection_state?: string;
+  current_model?: string;
+  current_effort?: string;
+  profile_id?: string;
+  models?: AgentModelMeta[];
+  capabilities: AgentRuntimeCapabilities;
+  adapters?: AgentAdapterOption[];
+}
 export interface AgentRuntimeCatalog { default_runtime: string; items: AgentRuntimeMeta[]; }
+export interface AgentAdapterActionResult {
+  ok: boolean;
+  result: { ok?: boolean; state?: string; managed?: boolean; version?: string; adapter_id?: string; detail?: string };
+  runtimes: AgentRuntimeCatalog;
+}
 export interface AgentProfileComponent { count: number; mode: string; items: Array<{ name?: string; path?: string; size?: number; sha256?: string }>; }
 export interface AgentProfileInheritance { rules: boolean; skills: boolean; agents: boolean; commands: boolean; mcp: boolean; plugins: boolean; model: boolean; effort: boolean; memory: boolean; }
 export interface AgentProfileMeta { id: string; runtime_id: string; name: string; installed: boolean; source_root: string; inherit_mode: string; model: string; effort: string; components: Record<string, AgentProfileComponent>; fingerprints: Record<string, string>; blocked_detected: Record<string, boolean | number>; blocked_inheritance: string[]; inheritance: AgentProfileInheritance; accepted_fingerprint: string; changed_since_review: boolean; reviewed_at?: string; }
@@ -220,6 +263,11 @@ export const fetchAgentCapabilities = () => api<AgentCapabilityCatalog>('/api/ag
 export const fetchAgentSessionConfig = (sessionId: string) => api<AgentSessionConfig>(`/api/agent/sessions/${encodeURIComponent(sessionId)}/config`);
 export const saveAgentSessionConfig = (sessionId: string, patch: Partial<AgentSessionConfig>) => api<AgentSessionConfig>(`/api/agent/sessions/${encodeURIComponent(sessionId)}/config`, 'PUT', patch);
 export const fetchAgentRuntimes = () => api<AgentRuntimeCatalog>('/api/agent/runtimes');
+export const runAgentAdapterAction = (runtimeId: string, adapterId: string, action: AgentAdapterAction['id']) => api<AgentAdapterActionResult>(
+  `/api/agent/runtimes/${encodeURIComponent(runtimeId)}/adapters/${encodeURIComponent(adapterId)}/actions`,
+  'POST',
+  { action },
+);
 export const fetchAgentProfiles = () => api<AgentProfileState>('/api/agent/profiles');
 export const scanAgentProfiles = () => api<AgentProfileState>('/api/agent/profiles/scan', 'POST', {});
 export const setDefaultAgentProfile = (profileId: string) => api<AgentProfileState>('/api/agent/profiles/default', 'PUT', { profile_id: profileId });

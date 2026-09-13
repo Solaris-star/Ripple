@@ -29,6 +29,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = ["pytest>=8,<10"]
 # 隐式水印深度清理：ControlNet/diffusion 运行时体积较大且要求 NVIDIA CUDA，因此不进入默认安装。
 watermark = ["remove-ai-watermarks[diffusion]>=0.22,<0.23"]
 
@@ -37,3 +38,6 @@ ripple = "ripple.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["ripple*"]
+
+[tool.setuptools.package-data]
+ripple = ["agent_adapters.json"]

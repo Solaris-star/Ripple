@@ -30,7 +30,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Ripple.ps1
 
 浏览器打开 `http://127.0.0.1:7860`。
 
-`setup.ps1` 只在仓库内创建 `.venv`、安装项目依赖并构建前端；它不会全局安装或修改 OpenCode / Claude Code / Codex / Hermes。
+`setup.ps1` 只在仓库内创建 `.venv`、安装项目依赖并构建前端；它不会全局安装或修改 OpenCode / Claude Code / Codex / Hermes，也不会预装第三方 ACP。检测到本机 Agent 后，Ripple 才在设置页展示已验证的适配选项；外部 ACP 仅在用户明确点击后安装到 Workspace 私有目录（默认 `.ripple-private/outputs/agent-adapters/`）。
 
 ### Linux / macOS
 

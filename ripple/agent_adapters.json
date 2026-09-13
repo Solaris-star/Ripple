@@ -1,0 +1,62 @@
+{
+  "schema": 1,
+  "adapters": [
+    {
+      "id": "opencode_native",
+      "runtime_id": "opencode",
+      "label": "Ripple OpenCode 原生适配",
+      "kind": "builtin",
+      "protocol": "opencode-http",
+      "enabled": true,
+      "description": "Ripple 已内置 OpenCode 的受限本地适配，不需要下载 ACP。",
+      "source_url": "https://github.com/anomalyco/opencode"
+    },
+    {
+      "id": "claude_acp",
+      "runtime_id": "claude_code",
+      "label": "Claude Agent ACP",
+      "kind": "npm_acp",
+      "protocol": "acp-stdio",
+      "enabled": true,
+      "description": "安装到 Ripple 的 Workspace 私有目录；不修改本机 Agent 全局安装。",
+      "package": "@agentclientprotocol/claude-agent-acp",
+      "version": "0.76.0",
+      "integrity": "sha512-8Xh1ryud5b1fOGLfF+S7dW2hhIZ/h4WopKtD//JRcQWxu7dutZvzN/MhRSDjqRcxqf3UIZRx1K0OhnlY/hMaOg==",
+      "entrypoint": "dist/index.js",
+      "binary": "claude-agent-acp",
+      "node_min": 22,
+      "env_override": "RIPPLE_CLAUDE_ACP_BIN",
+      "legacy_managed": [
+        "agent-bridges/claude-acp/node_modules/@zed-industries/claude-agent-acp/dist/index.js",
+        "agent-bridges/claude-acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js"
+      ],
+      "source_url": "https://github.com/agentclientprotocol/claude-agent-acp"
+    },
+    {
+      "id": "codex_acp",
+      "runtime_id": "codex",
+      "label": "Codex ACP",
+      "kind": "npm_acp",
+      "protocol": "acp-stdio",
+      "enabled": true,
+      "description": "按需安装官方 Codex ACP。Ripple 使用隔离 CODEX_HOME、禁用内建工具与全局 MCP，并在启用前验证模型可见工具面。",
+      "package": "@agentclientprotocol/codex-acp",
+      "version": "1.11.0",
+      "integrity": "sha512-opPKsRaekgdmQpOpHrR0EEDn9chgtiN+b+h0V78fTuQP84TNzB7vrn3EtKODwbiJQTBHJAlynjSFQazFfaT+VQ==",
+      "entrypoint": "dist/index.js",
+      "binary": "codex-acp",
+      "node_min": 22,
+      "source_url": "https://github.com/agentclientprotocol/codex-acp"
+    },
+    {
+      "id": "hermes_transport",
+      "runtime_id": "hermes",
+      "label": "Hermes 原生 ACP",
+      "kind": "builtin",
+      "protocol": "acp-stdio",
+      "enabled": true,
+      "description": "复用用户已安装的 Hermes ACP，通过 Ripple restricted shim 只开放当前会话的 Ripple MCP，不下载安装第二份 Hermes。",
+      "source_url": "https://github.com/NousResearch/hermes-agent"
+    }
+  ]
+}

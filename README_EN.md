@@ -30,7 +30,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Start-Ripple.ps1
 
 Open `http://127.0.0.1:7860` in your browser.
 
-`setup.ps1` only creates `.venv` inside the repository, installs project dependencies, and builds the frontend. It does not globally install or modify OpenCode / Claude Code / Codex / Hermes.
+`setup.ps1` only creates `.venv` inside the repository, installs project dependencies, and builds the frontend. It does not globally install or modify OpenCode / Claude Code / Codex / Hermes, and it does not preinstall third-party ACP adapters. After a local Agent is detected, Ripple shows only verified adapter options; external ACP packages are installed in Workspace-private storage (by default `.ripple-private/outputs/agent-adapters/`) only after an explicit user action.
 
 ### Linux / macOS
 

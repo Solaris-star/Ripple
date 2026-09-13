@@ -8,6 +8,7 @@ import {
   fetchInteractionSources, fetchInteractions, refreshInteractionResult,
   resolveUnknownInteraction, syncInteractionComments, updateInteraction,
 } from '../../lib/ripple';
+import { newId } from '../../lib/id';
 import type {
   Account, Interaction, InteractionCapability, InteractionComment, InteractionContentSummary,
   InteractionInsight, InteractionItem, InteractionSource,
@@ -341,7 +342,7 @@ export default function InteractionCenter({ persona, onNavigate }: { persona: st
     return createInteraction({
       platform: source.platform, source_id: source.id, kind: 'reply',
       items: [{ id: detailComment.id, nickname: detailComment.nickname, content: detailComment.content.slice(0, 500), reply: detailReply.trim() }],
-      idempotency_key: crypto.randomUUID(),
+      idempotency_key: newId(),
     });
   };
 
@@ -374,21 +375,21 @@ export default function InteractionCenter({ persona, onNavigate }: { persona: st
     if (!source || source.kind !== 'remote') throw new Error('请先从已连接平台同步评论。');
     const items = selectedComments.map((row) => ({ id: row.id, nickname: row.nickname, content: row.content.slice(0, 500), reply: (replies[row.id] || '').trim() }));
     if (!items.length || items.some((row) => !row.reply)) throw new Error('请先选择评论并填写每条回复。');
-    const draft = await createInteraction({ platform: source.platform, source_id: source.id, kind: 'reply', items, idempotency_key: crypto.randomUUID() });
+    const draft = await createInteraction({ platform: source.platform, source_id: source.id, kind: 'reply', items, idempotency_key: newId() });
     await refreshLists(); openReview(draft); setView('drafts'); setNotice('已建立待确认回复任务，请完整审阅后再执行。');
   });
 
   const createDeleteDraft = () => run(async () => {
     if (!source || source.kind !== 'remote' || !sourceCapability?.delete) throw new Error('当前平台尚未接入托管删除。');
     if (!selectedComments.length) throw new Error('请选择要删除的评论。');
-    const draft = await createInteraction({ platform: source.platform, source_id: source.id, kind: 'delete', items: selectedComments.map((row) => ({ id: row.id, nickname: row.nickname, content: row.content.slice(0, 500) })), idempotency_key: crypto.randomUUID() });
+    const draft = await createInteraction({ platform: source.platform, source_id: source.id, kind: 'delete', items: selectedComments.map((row) => ({ id: row.id, nickname: row.nickname, content: row.content.slice(0, 500) })), idempotency_key: newId() });
     await refreshLists(); openReview(draft); setView('drafts'); setNotice('已建立删除草稿；删除不可恢复，请完整审阅后确认。');
   });
 
   const createCommentDraft = () => run(async () => {
     if (!source || source.kind !== 'remote' || !sourceCapability?.comment) throw new Error('当前平台尚未接入托管发表评论。');
     if (!newComment.trim()) throw new Error('请输入评论内容。');
-    const draft = await createInteraction({ platform: source.platform, source_id: source.id, kind: 'comment', text: newComment.trim(), idempotency_key: crypto.randomUUID() });
+    const draft = await createInteraction({ platform: source.platform, source_id: source.id, kind: 'comment', text: newComment.trim(), idempotency_key: newId() });
     setNewComment(''); await refreshLists(); openReview(draft); setView('drafts'); setNotice('已建立待确认评论草稿；尚未发送。');
   });
 

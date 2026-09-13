@@ -43,9 +43,10 @@ from ripple.agent_runtime import AgentRuntimeError, AgentRuntimeManager, AgentTo
 from ripple.agent_profiles import AgentProfileRegistry
 from ripple.agent_tool_bridge import AgentToolLease, RippleAgentToolBridge, install_agent_tool_bridge
 from ripple.claude_code_runtime import ClaudeCodeAgentAdapter
-from ripple.codex_runtime import CodexAgentAdapter
+from ripple.codex_runtime import CodexAcpAgentAdapter
 from ripple.hermes_runtime import HermesAgentAdapter
 from ripple.opencode_runtime import OpenCodeAgentAdapter
+from ripple.agent_provisioning import AgentAdapterProvisioningService
 from ripple.agent_capabilities import AgentCapabilityRegistry, EFFORTS
 from ripple.media_generation import MediaGenerationService
 from ripple.media_connections import MediaConnectionStore
@@ -876,10 +877,20 @@ def _agent_runtime_env() -> dict[str, str]:
 
 
 _AGENT_TOOL_TOKEN = secrets.token_urlsafe(32)
+_AGENT_PROVISIONING = AgentAdapterProvisioningService(app.state.ripple.private)
+app.state.agent_provisioning = _AGENT_PROVISIONING
 _OPENCODE_ADAPTER = OpenCodeAgentAdapter(PROJECT_ROOT, app.state.ripple.private, _agent_runtime_env, tool_token=_AGENT_TOOL_TOKEN)
-_CLAUDE_CODE_ADAPTER = ClaudeCodeAgentAdapter(app.state.ripple.private, tool_token=_AGENT_TOOL_TOKEN)
-_CODEX_ADAPTER = CodexAgentAdapter(app.state.ripple.private, tool_token=_AGENT_TOOL_TOKEN)
-_HERMES_ADAPTER = HermesAgentAdapter(app.state.ripple.private, tool_token=_AGENT_TOOL_TOKEN)
+_CLAUDE_CODE_ADAPTER = ClaudeCodeAgentAdapter(
+    app.state.ripple.private,
+    tool_token=_AGENT_TOOL_TOKEN,
+    provisioning_service=_AGENT_PROVISIONING,
+)
+_CODEX_ADAPTER = CodexAcpAgentAdapter(
+    app.state.ripple.private,
+    tool_token=_AGENT_TOOL_TOKEN,
+    provisioning_service=_AGENT_PROVISIONING,
+)
+_HERMES_ADAPTER = HermesAgentAdapter(app.state.ripple.private, tool_token=_AGENT_TOOL_TOKEN, project_root=PROJECT_ROOT)
 _AGENT_RUNTIME = AgentRuntimeManager(
     [_OPENCODE_ADAPTER, _CLAUDE_CODE_ADAPTER, _CODEX_ADAPTER, _HERMES_ADAPTER],
     default_runtime="opencode", tool_token=_AGENT_TOOL_TOKEN,
@@ -1058,6 +1069,11 @@ class AgentProfileDefaultInput(BaseModel):
 class AgentProfileInheritanceInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     inheritance: dict[str, bool] = Field(default_factory=dict, max_length=20)
+
+
+class AgentAdapterActionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: str = Field(pattern=r"^(install|repair|verify|uninstall)$")
 
 
 def _model_config_status() -> dict:
@@ -1310,9 +1326,10 @@ async def api_agent_runtimes():
         detail = str(status.get("detail") or detected.get("detail") or "")
         if profile.get("installed") and not detected.get("installed"):
             detail = "检测到本机 Agent 配置，但当前服务进程未找到对应可执行程序。"
-        items.append({
+        runtime_row = {
             **detected,
             "installed": installed,
+            "native_detected": bool(detected.get("installed")),
             "configured": configured,
             "selectable": selectable,
             "healthy": selectable,
@@ -1325,12 +1342,39 @@ async def api_agent_runtimes():
             "capabilities": capabilities,
             "detail": detail,
             "dependency": str(status.get("dependency") or detected.get("dependency") or ""),
-        })
+        }
+        runtime_row["adapters"] = _AGENT_PROVISIONING.options_for_runtime(runtime_id, runtime_row)
+        items.append(runtime_row)
     default_profile = str(profile_state.get("default_profile") or "")
     stored_default = next((runtime_id for runtime_id, row in profiles.items() if row.get("id") == default_profile), "")
     selectable_ids = [row["runtime"] for row in items if row.get("selectable")]
     default_runtime = stored_default if stored_default in selectable_ids else (selectable_ids[0] if selectable_ids else _AGENT_RUNTIME.default_runtime_id)
     return {"default_runtime": default_runtime, "items": items}
+
+
+@app.post("/api/agent/runtimes/{runtime_id}/adapters/{adapter_id}/actions")
+async def api_agent_adapter_action(runtime_id: str, adapter_id: str, req: AgentAdapterActionInput):
+    """Run one server-declared action for a detected Agent's trusted adapter option."""
+    try:
+        catalog = await api_agent_runtimes()
+        runtime_state = next(
+            (row for row in catalog.get("items", []) if str(row.get("runtime") or "") == runtime_id),
+            None,
+        )
+        if not isinstance(runtime_state, dict):
+            raise AgentRuntimeError("Agent Runtime 未注册。", 404)
+        if req.action == "uninstall" and _AGENT_RUNTIME.has_active_turns(runtime_id):
+            raise AgentRuntimeError("该 Agent 仍有运行中的会话，结束后才能卸载适配。", 409)
+        result = await asyncio.to_thread(
+            _AGENT_PROVISIONING.perform,
+            runtime_id,
+            adapter_id,
+            req.action,
+            runtime_state,
+        )
+        return {"ok": True, "result": result, "runtimes": await api_agent_runtimes()}
+    except AgentRuntimeError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
 
 
 @app.get("/api/agent/capabilities")
@@ -3691,13 +3735,17 @@ async def api_ideas_delete(iid: str):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("RIPPLE_PORT", os.environ.get("RIPPLE_PORT", "7860")))
+    host = (os.environ.get("RIPPLE_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    port = int(os.environ.get("RIPPLE_PORT", "7860"))
     proxy_url = os.environ.get("VSCODE_PROXY_URI", "").replace("{{port}}", str(port))
     print("\n  Ripple · local content workspace")
     print(f"  http://127.0.0.1:{port}")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        print(f"  http://{host}:{port}  (bind)")
+        print(f"  LAN bind enabled — open via this machine's LAN IP:{port}")
     if proxy_url:
         print(f"  {proxy_url}")
     print()
     # OAuth callbacks carry short-lived authorization codes in the query string;
     # keep access logs off so those values are never written to terminal logs.
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="info", access_log=False)
+    uvicorn.run(app, host=host, port=port, log_level="info", access_log=False)

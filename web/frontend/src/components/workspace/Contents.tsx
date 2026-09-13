@@ -4,6 +4,7 @@ import type { Page } from '../Sidebar';
 import { IconChevron } from '../icons';
 import type { AgentTurnInjection, UploadedFile } from '../../lib/api';
 import { api, dateText, errorText, uploadMedia } from '../../lib/ripple';
+import { newId } from '../../lib/id';
 import type { Mother } from '../../lib/ripple';
 import type { ChatSession, StreamState } from '../../lib/store';
 import { Empty, Feedback, Mark } from './Common';
@@ -96,7 +97,7 @@ export default function Contents({
   const [resizingPane, setResizingPane] = useState<'list' | 'ai' | null>(null);
   const [aiUpdate, setAiUpdate] = useState<{ created: boolean; fields: string[] } | null>(null);
   const [undo, setUndo] = useState<UndoState | null>(null);
-  const key = useRef(crypto.randomUUID());
+  const key = useRef(newId());
   const gate = useRef(false);
   const focusHandled = useRef(false);
   const handledArtifact = useRef('');
@@ -256,7 +257,7 @@ export default function Contents({
     if (dirty && !window.confirm('当前主稿尚未保存，放弃修改？')) return false;
     aiBaseline.current = null;
     setSelected(item); setDraft(item ? { ...item.content, media: [...item.content.media] } : blank()); setSelectedVariantId('');
-    setDirty(false); setError(''); setNotice(''); setAiUpdate(null); setUndo(null); key.current = crypto.randomUUID();
+    setDirty(false); setError(''); setNotice(''); setAiUpdate(null); setUndo(null); key.current = newId();
     return true;
   };
   const save = () => run(async () => {

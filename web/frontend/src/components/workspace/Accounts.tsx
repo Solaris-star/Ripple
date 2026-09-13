@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Page } from '../Sidebar';
 import { api, base, dateText, errorText, ACCOUNT_LABELS } from '../../lib/ripple';
+import { newId } from '../../lib/id';
 import type { Account, BlogConnector, Channel, ExecutionNode, RippleStatus } from '../../lib/ripple';
 import { Header, Feedback, Mark, Modal } from './Common';
 
@@ -63,7 +64,7 @@ export default function Accounts({ onNavigate }: { onNavigate: (page: Page) => v
   const [loginId, setLoginId] = useState<string | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [sms, setSms] = useState('');
-  const creationKey = useRef(crypto.randomUUID());
+  const creationKey = useRef(newId());
   const browserHint = currentBrowserChannel();
 
   const refresh = useCallback(async () => {
@@ -116,7 +117,7 @@ export default function Accounts({ onNavigate }: { onNavigate: (page: Page) => v
     setXNodeId(node?.id || 'local');
     const available = (node?.interactive_browsers || []) as BrowserChannel[];
     setXBrowserChannel(browserHint && available.includes(browserHint) ? browserHint : available[0] || '');
-    creationKey.current = crypto.randomUUID();
+    creationKey.current = newId();
   };
 
   const openBlog = (item?: BlogConnector) => {
@@ -125,7 +126,7 @@ export default function Accounts({ onNavigate }: { onNavigate: (page: Page) => v
 
   const openWechat = (item?: Account) => {
     setAdd('wechat'); setLabel(item?.label || ''); setConsent(false); setWechatSecret(''); setWechatEditId(item?.id || null);
-    setWechatAppId(item?.identity?.remote_id || ''); creationKey.current = crypto.randomUUID();
+    setWechatAppId(item?.identity?.remote_id || ''); creationKey.current = newId();
   };
 
   const copyUrl = (value: string, name: string) => {

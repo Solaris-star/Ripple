@@ -71,6 +71,24 @@ RIPPLE_BOOTSTRAP_CODE=<至少 24 个字符的高熵一次性值>
 
 设置页检测本机已有的 OpenCode、Claude Code、Codex 和 Hermes。Ripple 不复制用户的全局 Agent 配置，也不会在安装阶段改写它们。
 
+Agent 适配采用**检测后按需供应**：
+
+1. `setup.ps1` / `setup.sh` 不预装任何第三方 ACP。
+2. 只有当前服务进程确实检测到本机 Agent，设置页才显示该 Runtime 的适配选项。
+3. 外部适配器的包名、精确版本、完整性摘要、入口与来源固定在 `ripple/agent_adapters.json`；浏览器不能提交 npm 包名、命令、URL 或安装路径。
+4. 用户明确点击后，适配器才下载到 Workspace 私有目录；默认路径是 `.ripple-private/outputs/agent-adapters/`。安装完成还必须通过 ACP 初始化握手，才会标为可用。
+5. Ripple 只卸载带有效 receipt 的受管目录，不会删除全局 Agent、外部 ACP、登录态或用户配置。
+6. OpenCode 使用 Ripple 内置适配，无需下载 ACP；Claude ACP 与 Codex ACP 都按用户选择安装。Codex ACP 运行时使用隔离 `CODEX_HOME`，不继承全局 MCP/插件，并在启用前执行模型工具面探针。新版 Hermes 自带原生 ACP，Ripple 通过 restricted shim 复用它，只开放当前会话的 Ripple MCP，不下载安装第二份 Hermes。
+
+通用控制面接口为：
+
+```text
+GET  /api/agent/runtimes
+POST /api/agent/runtimes/{runtime_id}/adapters/{adapter_id}/actions
+```
+
+动作仅接受服务端当前状态允许的 `install`、`verify`、`repair`、`uninstall`。Server 模式下该接口只允许 Owner/Admin，并要求 Session 与 CSRF 校验。
+
 Agent 获得业务能力时通过受控 Skill / MCP / Tool 租约。租约有能力白名单和过期时间，不提供任意 shell/file/network 权限。
 
 Python 包、CLI、Skill 路径和公开发行元信息统一使用 Ripple 命名。OpenCode、Claude Code、Codex、Hermes 仅作为可插拔第三方 Agent Runtime 集成出现。
@@ -97,6 +115,7 @@ Mother content
 Python：
 
 ```bash
+python -m pip install -e ".[dev]"
 python -m pytest -q
 ```
 
