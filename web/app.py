@@ -925,8 +925,20 @@ def _agent_runtime_model_states(profile_state: dict | None = None) -> dict[str, 
                 models = []
         profile = profiles.get(runtime_id, {})
         profile_model = str(profile.get("model") or "").strip()
-        if profile_model and not any(str(row.get("id")) == profile_model for row in models):
-            models.insert(0, {"id": profile_model, "name": profile_model, "effort_levels": list(EFFORTS), "supports_reasoning": True, "source": "native_profile"})
+        if profile_model:
+            # Normalize provider prefixes so "model" and "provider:model" dedupe.
+            # The provider prefix ("custom:m365") is derived from the catalog's
+            # default model id ("custom:m365:gpt-5.6-sol" -> "custom:m365:").
+            prefix = (default_model.rsplit(":", 1)[0] + ":") if ":" in default_model else ""
+
+            def _bare(value: str) -> str:
+                return value[len(prefix):] if prefix and value.startswith(prefix) else value
+            match = next((row for row in models if str(row.get("id")) == profile_model
+                          or _bare(str(row.get("id"))) == _bare(profile_model)), None)
+            if match:
+                profile_model = str(match.get("id") or profile_model)
+            else:
+                models.insert(0, {"id": profile_model, "name": profile_model, "effort_levels": list(EFFORTS), "supports_reasoning": True, "source": "native_profile"})
         if not default_model and profile_model:
             default_model = profile_model
         if not default_model and models:

@@ -201,9 +201,70 @@ class HermesAgentAdapter:
         model = values.get("model.default", "")
         provider = values.get("model.provider", "")
         model_id = f"{provider}:{model}" if provider and model and not model.startswith(provider + ":") else model
-        rows = ([{"id": model_id, "name": model, "effort_levels": ["auto"], "supports_reasoning": True, "source": "native_hermes"}]
-                if model_id else [])
-        return {"models": rows, "default_model": model_id}
+        rows: list[dict] = []
+        seen: set[str] = set()
+
+        def _add(identifier: str) -> None:
+            identifier = str(identifier or "").strip()
+            if identifier and identifier not in seen:
+                seen.add(identifier)
+                rows.append({"id": identifier, "name": identifier.split(":", 1)[-1],
+                             "effort_levels": ["auto"], "supports_reasoning": True, "source": "native_hermes"})
+
+        # Live provider catalog first — the configured endpoint usually serves
+        # more models than the single config default.
+        for url, api_key in self._model_list_endpoints():
+            try:
+                import urllib.request
+                headers = {"Accept": "application/json", "User-Agent": "Ripple-Hermes/1.0"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                request = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    payload = json.loads(response.read().decode("utf-8", "replace"))
+                for row in payload.get("data", []) if isinstance(payload, dict) else []:
+                    name = str(row.get("id") or "").strip() if isinstance(row, dict) else ""
+                    if name:
+                        _add(f"{provider}:{name}" if provider and not name.startswith(provider + ":") else name)
+                if rows:
+                    break
+            except (OSError, ValueError):
+                continue
+        # Config default last so the user's chosen default is never dropped.
+        _add(model_id)
+        return {"models": rows, "default_model": model_id or (rows[0]["id"] if rows else "")}
+
+    def _model_list_endpoints(self) -> list[tuple[str, str]]:
+        """Resolve the configured provider's live /v1/models URL and API key."""
+        provider = os.environ.get("RIPPLE_HERMES_MODEL_PROVIDER", "").strip()
+        if not provider:
+            try:
+                result = subprocess.run(self._native_command() + ["config", "get", "model.provider"], capture_output=True,
+                                        text=True, encoding="utf-8", errors="replace", timeout=10, check=False)
+                if result.returncode == 0:
+                    provider = (result.stdout or "").strip().splitlines()[0][:200]
+            except (OSError, subprocess.SubprocessError, AgentRuntimeError, IndexError):
+                provider = ""
+        if not provider:
+            return []
+        try:
+            script = (
+                "import json,sys;"
+                "sys.path.insert(0,'');"
+                "from hermes_cli.runtime_provider import resolve_runtime_provider;"
+                f"r=resolve_runtime_provider(requested={provider!r});"
+                "print(json.dumps({'base_url':r.get('base_url') or '','api_key':r.get('api_key') or ''}))"
+            )
+            result = subprocess.run([self._python_for_entry(self._entry()), "-c", script], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=30, check=False)
+            payload = json.loads((result.stdout or "").strip().splitlines()[-1]) if (result.stdout or "").strip() else {}
+            base = str(payload.get("base_url") or "").strip().rstrip("/")
+            api_key = str(payload.get("api_key") or "").strip()
+            if base.startswith(("http://", "https://")):
+                return [(base + "/models", api_key)]
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError, AgentRuntimeError):
+            pass
+        return []
 
     def _new_client(self):
         self.workspace.mkdir(parents=True, exist_ok=True)
