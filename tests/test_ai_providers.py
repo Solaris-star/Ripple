@@ -64,7 +64,7 @@ def test_multiple_ai_providers_and_purpose_routes_are_independent(tmp_path, monk
     assert service.resolved("x_campaign_discovery", fallback_to_default=False)["provider_id"] == xai["id"]
 
 
-def test_x_search_capability_cannot_be_assumed_from_grok_model_name(tmp_path, monkeypatch):
+def test_openai_compatible_grok_gateway_can_verify_and_use_x_search(tmp_path, monkeypatch):
     from ripple import ai_providers
     monkeypatch.setattr(ai_providers, "protect", fake_protect)
     service = AIProviderService(tmp_path / "private")
@@ -74,10 +74,29 @@ def test_x_search_capability_cannot_be_assumed_from_grok_model_name(tmp_path, mo
     )
     provider = state["providers"][0]
     service.set_route("x_campaign_discovery", provider["id"], "grok-4.6")
-    with pytest.raises(WorkflowError, match="xAI"):
-        service.probe(provider["id"], "grok-4.6", "x_search")
-    with pytest.raises(WorkflowError, match="X Search"):
-        service.x_search("creator challenge")
+    seen = []
+
+    class Response:
+        content = b'{"output":[{"content":[{"text":"RIPPLE_OK"}]}]}'
+        def raise_for_status(self): return None
+        def json(self): return {"output": [{"content": [{"text": "RIPPLE_OK"}]}]}
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def post(self, url, headers=None, json=None):
+            seen.append((url, json))
+            return Response()
+
+    monkeypatch.setattr(ai_providers.httpx, "Client", Client)
+    result = service.probe(provider["id"], "grok-4.6", "x_search")
+    assert result["ok"] is True
+    assert service.public_state()["providers"][0]["capabilities"]["x_search"] == "verified"
+    search = service.x_search("creator challenge")
+    assert search["text"] == "RIPPLE_OK"
+    assert all(url == "https://gateway.example/v1/responses" for url, _ in seen)
+    assert all(call[1]["tools"] == [{"type": "x_search"}] for call in seen)
 
 
 def test_discover_existing_provider_prefers_current_editor_base_url(tmp_path, monkeypatch):

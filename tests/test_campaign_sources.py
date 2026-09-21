@@ -129,6 +129,47 @@ def test_bilibili_detail_parser_separates_prizes_winning_conditions_and_entry_re
     assert "页面明确的奖励包括：瓜分5000元" in result["summary_hint"]
 
 
+def test_bilibili_task_templates_extract_creation_tasks_rewards_and_live_specs():
+    payload = {"layerTree": [
+        {"name": "EraTasklistPc", "props": {"tasklist": [{
+            "taskName": "每日投稿#王者万象棋正式上线 活动话题视频",
+            "awardName": "抽奖次数",
+            "checkpoints": [{"alias": "每日投稿#王者万象棋正式上线 活动话题视频"}],
+        }]}},
+        {"name": "EvaTaskButton", "props": {"taskItem": {
+            "taskName": "当日专区开播≥60分钟（直播）",
+            "awardName": "线索*50",
+            "checkpoints": [{"alias": "当日专区开播≥60分钟（直播）"}],
+        }}},
+        {"name": "EvaText", "props": {"content": "参赛作品必须原创视频"}},
+    ]}
+    html = '<script>window.__BILIACT_EVAPAGEDATA__ = ' + json.dumps(payload, ensure_ascii=False) + ';</script>'
+    result = _bilibili_detail_from_html(html)
+    assert "每日投稿#王者万象棋正式上线 活动话题视频" in result["content_requirements"]
+    assert "当日专区开播≥60分钟（直播）" in result["content_requirements"]
+    assert "参赛作品必须原创视频" in result["content_requirements"]
+    assert result["required_topics"] == ["王者万象棋正式上线"]
+    assert "抽奖次数" in result["prizes"] and "线索*50" in result["prizes"]
+    assert "当日专区开播≥60分钟（直播）" in result["winning_conditions"]
+    assert "live" in result["submission_spec"]["formats"]
+    assert result["submission_spec"]["duration_seconds"]["min"] == 3600
+    assert result["submission_spec"]["original_required"] is True
+
+
+def test_x_source_accepts_verified_x_search_capability_from_compatible_gateway(source_service, monkeypatch):
+    _, service = source_service
+    service.configure("x", {"method": "xai"})
+    monkeypatch.setattr(service.ai, "resolved", lambda *args, **kwargs: {
+        "provider_id": "gateway", "provider_name": "Grok Gateway", "kind": "openai-compatible",
+        "model": "grok-4.5-search", "capabilities": {"x_search": "verified"},
+    })
+    state = service.public_state()
+    x = next(row for row in state["items"] if row["platform"] == "x")
+    assert x["status"] == "ready"
+    assert x["automatic"] is True
+    assert "grok-4.5-search" in x["detail"]
+
+
 def test_bilibili_detail_parser_does_not_invent_image_only_rules():
     payload = {"layerTree": [{"name": "EvaModal", "alias": "活动规则弹窗", "props": {
         "modalContentLayoutContainerProps": {"background": {"src": "//i0.hdslb.com/rules.png"}}
@@ -139,6 +180,7 @@ def test_bilibili_detail_parser_does_not_invent_image_only_rules():
     assert result["prizes"] == []
     assert result["winning_conditions"] == []
     assert result["reward_rules"] == []
+    assert result["image_only_rule_panels"] == 1
 
 
 def test_bilibili_detail_rejects_off_domain_redirect(source_service):

@@ -405,8 +405,6 @@ class AIProviderService:
                     response.raise_for_status()
                     ok = bool(response.json())
             else:
-                if provider.get("kind") != "xai":
-                    raise WorkflowError("X Search / Web Search 只能对显式配置为 xAI 的 Provider 进行能力测试。", 422)
                 tool = "x_search" if capability == "x_search" else "web_search"
                 payload = {"model": model_id, "input": [{"role": "user", "content": "返回一句简短测试结果。"}],
                            "tools": [{"type": tool}]}
@@ -429,9 +427,9 @@ class AIProviderService:
                  allowed_handles: list[str] | None = None, max_handles: int = 20) -> dict[str, Any]:
         cfg = self.resolved("x_campaign_discovery", fallback_to_default=False)
         if not cfg:
-            raise WorkflowError("尚未配置 X 活动发现的 xAI Provider 路由。", 409)
-        if cfg["kind"] != "xai" or cfg["capabilities"].get("x_search") != "verified":
-            raise WorkflowError("所选 xAI Provider 尚未通过 X Search 能力测试。", 409)
+            raise WorkflowError("尚未配置 X 活动发现的 X Search Provider 路由。", 409)
+        if cfg["capabilities"].get("x_search") != "verified":
+            raise WorkflowError("所选 Provider / Model 尚未通过 X Search 能力测试。", 409)
         tool: dict[str, Any] = {"type": "x_search"}
         handles = [str(x).lstrip("@")[:50] for x in (allowed_handles or []) if str(x).strip()][:max_handles]
         if handles:
@@ -457,6 +455,6 @@ class AIProviderService:
         except WorkflowError:
             raise
         except (httpx.HTTPError, ValueError, TypeError):
-            raise WorkflowError("xAI X Search 请求失败，请检查额度和 Provider 配置。", 502) from None
+            raise WorkflowError("X Search 请求失败，请检查模型权限、Provider 兼容性、额度与 /responses 工具支持。", 502) from None
         return {"text": _extract_response_text(data), "raw": data,
                 "provider_id": cfg["provider_id"], "model": cfg["model"]}

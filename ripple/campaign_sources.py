@@ -303,6 +303,33 @@ def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
     prizes: list[str] = []
     winning_conditions: list[str] = []
     reward_rules: list[str] = []
+    image_only_rule_panels = 0
+
+    def add_task_item(task: Any) -> None:
+        if not isinstance(task, dict):
+            return
+        task_name = re.sub(r"\s+", " ", str(task.get("taskName") or "")).strip()
+        checkpoints = task.get("checkpoints") if isinstance(task.get("checkpoints"), list) else []
+        checkpoint_names = [re.sub(r"\s+", " ", str(row.get("alias") or "")).strip() for row in checkpoints if isinstance(row, dict) and str(row.get("alias") or "").strip()]
+        combined = " ".join([task_name, *checkpoint_names])
+        if not re.search(r"(投稿|视频|直播|图文|创作|作品|开播|发布|稿件)", combined):
+            return
+        if task_name:
+            content_requirements.append(task_name)
+        for checkpoint in checkpoint_names:
+            if checkpoint and checkpoint != task_name:
+                content_requirements.append(checkpoint)
+        for text in [task_name, *checkpoint_names]:
+            for topic in re.findall(r"#([^#\s]+)", text):
+                topics.append(topic.strip("，。；;、"))
+        award = re.sub(r"\s+", " ", str(task.get("awardName") or "")).strip()
+        if award and award not in {"0", "无"}:
+            prizes.append(award)
+            condition = task_name or (checkpoint_names[-1] if checkpoint_names else "")
+            if condition:
+                winning_conditions.append(condition)
+                reward_rules.append(f"{award}：{condition}")
+
 
     for node in nodes:
         name = str(node.get("name") or "")
@@ -336,6 +363,25 @@ def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
                     winning_conditions.append(condition)
                     if _bili_nonzero_prize(bonus) and not placeholder_one_yuan:
                         reward_rules.append(f"{bonus}：{condition}")
+
+        if name == "EraTasklistPc":
+            tasklist = props.get("tasklist") if isinstance(props.get("tasklist"), list) else []
+            for task in tasklist[:100]:
+                add_task_item(task)
+
+        if name == "EvaTaskButton":
+            add_task_item(props.get("taskItem"))
+
+        if name == "EvaText":
+            text = re.sub(r"\s+", " ", str(props.get("content") or "")).strip()
+            if text and re.search(r"(投稿|视频|直播|图文|创作|作品|原创|首发|时长|分区|话题)", text):
+                content_requirements.append(text)
+
+        if name == "EvaModal":
+            modal = props.get("modalContentLayoutContainerProps") if isinstance(props.get("modalContentLayoutContainerProps"), dict) else {}
+            background = modal.get("background") if isinstance(modal.get("background"), dict) else {}
+            if str(background.get("src") or "").strip():
+                image_only_rule_panels += 1
 
         if name == "EvaLinkButton":
             button_text = ""
@@ -375,6 +421,7 @@ def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
         "submission_spec": infer_submission_spec(evidence_text),
         "_agent_evidence_text": evidence_text,
         "rule_evidence_fingerprint": evidence_fingerprint({"text": fingerprint_text, "topics": required_topics, "prizes": prizes, "winning_conditions": winning_conditions, "submission_spec": infer_submission_spec(fingerprint_text)}),
+        "image_only_rule_panels": image_only_rule_panels,
     }
 
 
@@ -484,10 +531,8 @@ class CampaignSourceService:
             cfg = self.ai.resolved("x_campaign_discovery", fallback_to_default=False)
             if not cfg:
                 return "needs_config", "请在 AI Provider 中配置“X 活动发现”路由。"
-            if cfg.get("kind") != "xai":
-                return "needs_config", "X Search 路由必须绑定显式配置为 xAI 的 Provider。"
             if (cfg.get("capabilities") or {}).get("x_search") != "verified":
-                return "needs_config", "请先在模型设置中执行一次 xAI X Search 能力测试。"
+                return "needs_config", "请先对“X 活动发现”绑定的模型执行一次 X Search 能力测试。"
             return "ready", f"{cfg.get('provider_name')} / {cfg.get('model')}"
         if method == "x_api":
             account, status = self._effective_account("x", str(state["x"].get("x_api_account_id") or ""), adapter="x-api")

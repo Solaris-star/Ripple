@@ -805,15 +805,17 @@ export default function CampaignsPage({
                   <div className="campaign-card-facts">
                     <div><small>活动时间</small><strong>{campaignTime(campaign)}</strong></div>
                     <div><small>来源</small><strong>{sourceText}</strong></div>
-                    {specText && <div><small>参赛作品</small><span>{specText}</span></div>}
-                    {!!campaign.eligibility?.length && <div><small>参与条件</small><span>{concise(campaign.eligibility, '')}</span></div>}
-                    {(campaign.prizes?.length || campaign.reward_summary) && <div><small>奖品 / 奖励</small><span>{concise(campaign.prizes, campaign.reward_summary || '')}</span></div>}
-                    {!!campaign.winning_conditions?.length && <div><small>获奖条件</small><span>{concise(campaign.winning_conditions, '')}</span></div>}
-                    {incomplete && <div className="campaign-missing"><small>规则信息</small><span>待补充：{missing.map((key) => MISSING_LABELS[key] || key).join('、')}</span></div>}
+                    <div><small>参赛作品</small><span className={!specText ? 'campaign-fact-empty' : ''}>{specText || '—'}</span></div>
+                    <div><small>参与条件</small><span className={!campaign.eligibility?.length ? 'campaign-fact-empty' : ''}>{campaign.eligibility?.length ? concise(campaign.eligibility, '') : '—'}</span></div>
+                    <div><small>奖品 / 奖励</small><span className={!(campaign.prizes?.length || campaign.reward_summary) ? 'campaign-fact-empty' : ''}>{campaign.prizes?.length || campaign.reward_summary ? concise(campaign.prizes, campaign.reward_summary || '') : '—'}</span></div>
+                    <div><small>获奖条件</small><span className={!campaign.winning_conditions?.length ? 'campaign-fact-empty' : ''}>{campaign.winning_conditions?.length ? concise(campaign.winning_conditions, '') : '—'}</span></div>
+                    <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
                   </div>
                   <div className="campaign-actions">
                     <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看详情</button>
-                    {incomplete && <button className="btn btn-sm campaign-agent-button" disabled={!!enrichingId || agentBatchActive || campaign.enrichment_status === 'running'} onClick={() => void enrichOne(campaign)}>✦ {enrichingId === campaign.id || campaign.enrichment_status === 'running' ? 'Agent 补全中…' : 'Agent 补全'}</button>}
+                    {incomplete
+                      ? <button className="btn btn-sm campaign-agent-button" disabled={!!enrichingId || agentBatchActive || campaign.enrichment_status === 'running'} onClick={() => void enrichOne(campaign)}>✦ {enrichingId === campaign.id || campaign.enrichment_status === 'running' ? 'Agent 补全中…' : 'Agent 补全'}</button>
+                      : <span className="campaign-action-placeholder" aria-hidden="true" />}
                     <button className="btn btn-sm btn-primary" disabled={campaign.status === 'ended' || campaign.status === 'cancelled'}
                       onClick={() => void generateIdeas(campaign)}><IconSkills size={13} /> 生成选题</button>
                   </div>

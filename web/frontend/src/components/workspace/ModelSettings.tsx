@@ -32,6 +32,7 @@ export default function ModelSettings() {
   const [notice, setNotice] = useState('');
   const [discovering, setDiscovering] = useState(false);
   const [discoverFeedback, setDiscoverFeedback] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
+  const xDiscoveryProviderId = state?.routes.x_campaign_discovery?.provider_id || '';
 
   const load = async () => setState(await fetchAIProviders());
   useEffect(() => { void load().catch((e) => setError(e instanceof Error ? e.message : '模型配置读取失败')); }, []);
@@ -128,7 +129,7 @@ export default function ModelSettings() {
 
   const probe = async (provider: AIProvider, capability: 'chat' | 'x_search' | 'web_search') => {
     if (capability !== 'chat' && !window.confirm(
-      `${capability === 'x_search' ? 'X Search' : 'Web Search'} 测试会发起一次真实 xAI 检索，可能产生费用。继续？`,
+      `${capability === 'x_search' ? 'X Search' : 'Web Search'} 测试会向当前 Provider 的 /responses 发起一次真实工具调用，可能产生费用。继续？`,
     )) return;
     setBusy(true); setError(''); setNotice('');
     try {
@@ -169,7 +170,7 @@ export default function ModelSettings() {
           </div>
           <div className="r2-api-actions">
             <button disabled={busy} onClick={() => void probe(provider, 'chat')}>测试 Chat</button>
-            {provider.kind === 'xai' && <button disabled={busy} onClick={() => void probe(provider, 'x_search')}>测试 X Search</button>}
+            {(provider.kind === 'xai' || provider.id === xDiscoveryProviderId) && <button disabled={busy} onClick={() => void probe(provider, 'x_search')}>测试 X Search</button>}
             <button disabled={busy} onClick={() => editProvider(provider)}>管理</button>
             <button className="danger" disabled={busy} onClick={() => void remove(provider)}>移除</button>
           </div>
@@ -188,7 +189,7 @@ export default function ModelSettings() {
               <option value="">未单独配置{purpose.id !== 'default_agent' ? '（回退默认 Agent）' : ''}</option>
               {routeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
-            {purpose.id === 'x_campaign_discovery' && <small className="r2-muted">使用 Grok/xAI 时需绑定 xAI Provider，并单独通过 X Search 能力测试。X Developer API 在活动数据源中配置。</small>}
+            {purpose.id === 'x_campaign_discovery' && <small className="r2-muted">可绑定 xAI 或兼容网关中的 Grok 模型；是否可用于采集由真实 X Search 能力测试决定。X Developer API 在活动数据源中配置。</small>}
             {purpose.id === 'default_agent' && <small className="r2-muted">B站活动规则补全默认跟随这里的模型；脚本能解析完整时不会调用模型。</small>}
           </label>;
         })}
