@@ -77,9 +77,9 @@ def test_openai_compatible_grok_gateway_can_verify_and_use_x_search(tmp_path, mo
     seen = []
 
     class Response:
-        content = b'{"output":[{"content":[{"text":"RIPPLE_OK"}]}]}'
+        content = b'{"output":[{"type":"x_search_call","id":"xs_1","status":"completed"},{"type":"message","content":[{"text":"RIPPLE_OK"}]}]}'
         def raise_for_status(self): return None
-        def json(self): return {"output": [{"content": [{"text": "RIPPLE_OK"}]}]}
+        def json(self): return {"output": [{"type": "x_search_call", "id": "xs_1", "status": "completed"}, {"type": "message", "content": [{"text": "RIPPLE_OK"}]}]}
 
     class Client:
         def __init__(self, *args, **kwargs): pass
@@ -93,10 +93,60 @@ def test_openai_compatible_grok_gateway_can_verify_and_use_x_search(tmp_path, mo
     result = service.probe(provider["id"], "grok-4.6", "x_search")
     assert result["ok"] is True
     assert service.public_state()["providers"][0]["capabilities"]["x_search"] == "verified"
+    evidence = service.public_state()["providers"][0]["capability_evidence"]["x_search"]
+    assert evidence["method"] == ai_providers.X_SEARCH_VERIFY_METHOD
+    assert evidence["model_id"] == "grok-4.6"
     search = service.x_search("creator challenge")
     assert search["text"] == "RIPPLE_OK"
     assert all(url == "https://gateway.example/v1/responses" for url, _ in seen)
     assert all(call[1]["tools"] == [{"type": "x_search"}] for call in seen)
+    assert all(call[1]["tool_choice"] == "required" for call in seen)
+
+
+def test_x_search_probe_does_not_verify_text_only_response(tmp_path, monkeypatch):
+    from ripple import ai_providers
+    monkeypatch.setattr(ai_providers, "protect", fake_protect)
+    service = AIProviderService(tmp_path / "private")
+    state = service.upsert(
+        name="Gateway", kind="openai-compatible", base_url="https://gateway.example/v1",
+        api_key="secret", models=["grok-4.6"], default_model="grok-4.6",
+    )
+    provider = state["providers"][0]
+
+    class Response:
+        content = b'{"output":[{"type":"message","content":[{"text":"RIPPLE_OK"}]}]}'
+        def raise_for_status(self): return None
+        def json(self): return {"output": [{"type": "message", "content": [{"text": "RIPPLE_OK"}]}]}
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def post(self, *args, **kwargs): return Response()
+
+    monkeypatch.setattr(ai_providers.httpx, "Client", Client)
+    with pytest.raises(WorkflowError, match="没有实际调用 x_search"):
+        service.probe(provider["id"], "grok-4.6", "x_search")
+    assert service.public_state()["providers"][0]["capabilities"]["x_search"] == "failed"
+
+
+def test_legacy_x_search_verified_without_strict_evidence_is_downgraded(tmp_path, monkeypatch):
+    from ripple import ai_providers
+    monkeypatch.setattr(ai_providers, "protect", fake_protect)
+    service = AIProviderService(tmp_path / "private")
+    state = service.upsert(
+        name="Legacy Gateway", kind="openai-compatible", base_url="https://gateway.example/v1",
+        api_key="secret", models=["grok-4.6"], default_model="grok-4.6",
+    )
+    provider_id = state["providers"][0]["id"]
+    raw = json.loads(service.path.read_text(encoding="utf-8"))
+    raw["providers"][0]["capabilities"]["x_search"] = "verified"
+    raw["providers"][0].pop("capability_evidence", None)
+    service.path.write_text(json.dumps(raw), encoding="utf-8")
+    assert service.public_state()["providers"][0]["capabilities"]["x_search"] == "unknown"
+    service.set_route("x_campaign_discovery", provider_id, "grok-4.6")
+    with pytest.raises(WorkflowError, match="严格 X Search"):
+        service.x_search("creator challenge")
 
 
 def test_x_search_probe_timeout_reports_specific_error(tmp_path, monkeypatch):
@@ -134,7 +184,7 @@ def test_x_search_runtime_timeout_reports_specific_error(tmp_path, monkeypatch):
     )
     provider = state["providers"][0]
     service.set_route("x_campaign_discovery", provider["id"], "grok-4.5-search")
-    service._update_capability(provider["id"], "x_search", "verified")
+    service._update_capability(provider["id"], "x_search", "verified", model_id="grok-4.5-search", method=ai_providers.X_SEARCH_VERIFY_METHOD)
 
     class Client:
         def __init__(self, *args, **kwargs): pass
@@ -148,6 +198,21 @@ def test_x_search_runtime_timeout_reports_specific_error(tmp_path, monkeypatch):
     with pytest.raises(WorkflowError, match="X Search 请求超时（60 秒）") as exc:
         service.x_search("creator challenge")
     assert exc.value.status == 504
+
+
+def test_x_search_verification_is_bound_to_tested_model(tmp_path, monkeypatch):
+    from ripple import ai_providers
+    monkeypatch.setattr(ai_providers, "protect", fake_protect)
+    service = AIProviderService(tmp_path / "private")
+    state = service.upsert(
+        name="Gateway", kind="openai-compatible", base_url="https://gateway.example/v1",
+        api_key="secret", models=["grok-a", "grok-b"], default_model="grok-a",
+    )
+    provider = state["providers"][0]
+    service.set_route("x_campaign_discovery", provider["id"], "grok-b")
+    service._update_capability(provider["id"], "x_search", "verified", model_id="grok-a", method=ai_providers.X_SEARCH_VERIFY_METHOD)
+    with pytest.raises(WorkflowError, match="严格 X Search"):
+        service.x_search("creator challenge")
 
 
 def test_discover_existing_provider_prefers_current_editor_base_url(tmp_path, monkeypatch):

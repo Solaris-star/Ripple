@@ -162,6 +162,7 @@ def test_x_source_accepts_verified_x_search_capability_from_compatible_gateway(s
     monkeypatch.setattr(service.ai, "resolved", lambda *args, **kwargs: {
         "provider_id": "gateway", "provider_name": "Grok Gateway", "kind": "openai-compatible",
         "model": "grok-4.5-search", "capabilities": {"x_search": "verified"},
+        "capability_evidence": {"x_search": {"method": "responses_required_tool_v2", "model_id": "grok-4.5-search"}},
     })
     state = service.public_state()
     x = next(row for row in state["items"] if row["platform"] == "x")

@@ -34,6 +34,22 @@ MAX_PROVIDERS = 20
 MAX_MODELS = 200
 MAX_RESPONSE = 2 * 1024 * 1024
 MODEL_ID = re.compile(r"^[A-Za-z0-9._:/-]{1,200}$")
+X_SEARCH_VERIFY_METHOD = "responses_required_tool_v2"
+
+
+def _responses_used_tool(data: dict[str, Any], capability: str) -> bool:
+    expected_type = "x_search_call" if capability == "x_search" else "web_search_call"
+    output = data.get("output")
+    if isinstance(output, list) and any(isinstance(item, dict) and item.get("type") == expected_type for item in output):
+        return True
+    usage = data.get("server_side_tool_usage")
+    if isinstance(usage, dict):
+        key = "SERVER_SIDE_TOOL_X_SEARCH" if capability == "x_search" else "SERVER_SIDE_TOOL_WEB_SEARCH"
+        try:
+            return int(usage.get(key) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+    return False
 
 
 def _now() -> str:
@@ -145,12 +161,20 @@ class AIProviderService:
         raw = _read(self.path)
         if not raw:
             return self._empty()
-        providers = raw.get("providers") if isinstance(raw.get("providers"), list) else []
+        providers = [p for p in (raw.get("providers") if isinstance(raw.get("providers"), list) else []) if isinstance(p, dict)]
+        for provider in providers:
+            caps = provider.get("capabilities") if isinstance(provider.get("capabilities"), dict) else {}
+            evidence = provider.get("capability_evidence") if isinstance(provider.get("capability_evidence"), dict) else {}
+            x_evidence = evidence.get("x_search") if isinstance(evidence.get("x_search"), dict) else {}
+            if caps.get("x_search") == "verified" and x_evidence.get("method") != X_SEARCH_VERIFY_METHOD:
+                caps["x_search"] = "unknown"
+            provider["capabilities"] = caps
+            provider["capability_evidence"] = evidence
         routes = raw.get("routes") if isinstance(raw.get("routes"), dict) else {}
         return {
             "schema": 2,
             "revision": max(0, int(raw.get("revision") or 0)),
-            "providers": [p for p in providers if isinstance(p, dict)],
+            "providers": providers,
             "routes": {k: v for k, v in routes.items() if k in PURPOSES and isinstance(v, dict)},
             "updated_at": str(raw.get("updated_at") or _now()),
         }
@@ -335,6 +359,7 @@ class AIProviderService:
             "api_key": key,
             "model": model_id,
             "capabilities": deepcopy(provider.get("capabilities") or {}),
+            "capability_evidence": deepcopy(provider.get("capability_evidence") or {}),
         }
 
     def discover(self, *, provider_id: str = "", kind: str = "openai-compatible",
@@ -376,11 +401,16 @@ class AIProviderService:
         rows = _model_rows(values if isinstance(values, list) else [])
         return rows[:MAX_MODELS]
 
-    def _update_capability(self, provider_id: str, capability: str, value: str) -> None:
+    def _update_capability(self, provider_id: str, capability: str, value: str, *, model_id: str = "", method: str = "") -> None:
         state = self._state()
         provider = self._provider(state, provider_id)
         capabilities = provider.setdefault("capabilities", {})
+        evidence = provider.setdefault("capability_evidence", {})
         capabilities[capability] = value
+        if value == "verified" and method:
+            evidence[capability] = {"method": method, "model_id": model_id[:200], "verified_at": _now()}
+        else:
+            evidence.pop(capability, None)
         provider["updated_at"] = _now()
         self._write(state)
 
@@ -406,15 +436,19 @@ class AIProviderService:
                     ok = bool(response.json())
             else:
                 tool = "x_search" if capability == "x_search" else "web_search"
-                payload = {"model": model_id, "input": [{"role": "user", "content": "返回一句简短测试结果。"}],
-                           "tools": [{"type": tool}]}
+                payload = {"model": model_id, "input": [{"role": "user", "content": "使用已配置的搜索工具返回一句简短测试结果。"}],
+                           "tools": [{"type": tool}], "tool_choice": "required"}
                 with httpx.Client(timeout=httpx.Timeout(60, connect=8), trust_env=False,
                                   follow_redirects=False) as client:
                     response = client.post(provider["base_url"].rstrip("/") + "/responses",
                                            headers={"Authorization": "Bearer " + key}, json=payload)
                     response.raise_for_status()
                     body = response.json()
-                    ok = bool(_extract_response_text(body) or body.get("output"))
+                    tool_used = _responses_used_tool(body, capability)
+                    ok = tool_used and bool(_extract_response_text(body) or body.get("output"))
+                    if not tool_used:
+                        self._update_capability(provider_id, capability, "failed")
+                        raise WorkflowError(f"Provider 返回了响应，但没有实际调用 {tool}；本次不能标记为已验证。", 502)
         except WorkflowError:
             raise
         except httpx.TimeoutException:
@@ -432,7 +466,11 @@ class AIProviderService:
         except (ValueError, TypeError):
             self._update_capability(provider_id, capability, "failed")
             raise WorkflowError("Provider 能力测试返回了无法解析的响应。", 502) from None
-        self._update_capability(provider_id, capability, "verified" if ok else "failed")
+        if capability in {"x_search", "web_search"}:
+            self._update_capability(provider_id, capability, "verified" if ok else "failed", model_id=model_id,
+                                    method=X_SEARCH_VERIFY_METHOD if capability == "x_search" and ok else ("responses_required_tool_v2" if ok else ""))
+        else:
+            self._update_capability(provider_id, capability, "verified" if ok else "failed")
         return {"ok": bool(ok), "capability": capability, "provider_id": provider_id, "model_id": model_id}
 
     def x_search(self, prompt: str, *, from_date: str = "", to_date: str = "",
@@ -440,8 +478,9 @@ class AIProviderService:
         cfg = self.resolved("x_campaign_discovery", fallback_to_default=False)
         if not cfg:
             raise WorkflowError("尚未配置 X 活动发现的 X Search Provider 路由。", 409)
-        if cfg["capabilities"].get("x_search") != "verified":
-            raise WorkflowError("所选 Provider / Model 尚未通过 X Search 能力测试。", 409)
+        evidence = (cfg.get("capability_evidence") or {}).get("x_search") or {}
+        if cfg["capabilities"].get("x_search") != "verified" or evidence.get("method") != X_SEARCH_VERIFY_METHOD or evidence.get("model_id") != cfg["model"]:
+            raise WorkflowError("所选 Provider / Model 尚未通过严格 X Search 能力测试。", 409)
         tool: dict[str, Any] = {"type": "x_search"}
         handles = [str(x).lstrip("@")[:50] for x in (allowed_handles or []) if str(x).strip()][:max_handles]
         if handles:
@@ -454,6 +493,7 @@ class AIProviderService:
             "model": cfg["model"],
             "input": [{"role": "user", "content": prompt}],
             "tools": [tool],
+            "tool_choice": "required",
         }
         try:
             with httpx.Client(timeout=httpx.Timeout(60, connect=8), trust_env=False,

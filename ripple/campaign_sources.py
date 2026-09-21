@@ -531,8 +531,9 @@ class CampaignSourceService:
             cfg = self.ai.resolved("x_campaign_discovery", fallback_to_default=False)
             if not cfg:
                 return "needs_config", "请在 AI Provider 中配置“X 活动发现”路由。"
-            if (cfg.get("capabilities") or {}).get("x_search") != "verified":
-                return "needs_config", "请先对“X 活动发现”绑定的模型执行一次 X Search 能力测试。"
+            evidence = ((cfg.get("capability_evidence") or {}).get("x_search") or {})
+            if (cfg.get("capabilities") or {}).get("x_search") != "verified" or evidence.get("model_id") != cfg.get("model"):
+                return "needs_config", "请先对“X 活动发现”绑定的模型执行一次严格 X Search 能力测试。"
             return "ready", f"{cfg.get('provider_name')} / {cfg.get('model')}"
         if method == "x_api":
             account, status = self._effective_account("x", str(state["x"].get("x_api_account_id") or ""), adapter="x-api")
