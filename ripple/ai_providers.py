@@ -466,7 +466,15 @@ class AIProviderService:
                 data = response.json()
         except WorkflowError:
             raise
-        except (httpx.HTTPError, ValueError, TypeError):
-            raise WorkflowError("X Search 请求失败，请检查模型权限、Provider 兼容性、额度与 /responses 工具支持。", 502) from None
+        except httpx.TimeoutException:
+            raise WorkflowError("X Search 请求超时（60 秒）；该网关虽然通过能力探测，但实际检索没有在采集窗口内完成。", 504) from None
+        except httpx.HTTPStatusError as exc:
+            raise WorkflowError(f"X Search 返回 HTTP {exc.response.status_code}；请检查模型权限、额度与网关的 /responses 工具支持。", 502) from None
+        except httpx.ConnectError:
+            raise WorkflowError("X Search 无法连接 Provider；请检查 Base URL 与网络。", 502) from None
+        except httpx.HTTPError:
+            raise WorkflowError("X Search 请求失败；请检查 Provider 兼容性与网络。", 502) from None
+        except (ValueError, TypeError):
+            raise WorkflowError("X Search 返回了无法解析的响应。", 502) from None
         return {"text": _extract_response_text(data), "raw": data,
                 "provider_id": cfg["provider_id"], "model": cfg["model"]}

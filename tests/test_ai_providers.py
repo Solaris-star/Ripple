@@ -124,6 +124,32 @@ def test_x_search_probe_timeout_reports_specific_error(tmp_path, monkeypatch):
     assert service.public_state()["providers"][0]["capabilities"]["x_search"] == "failed"
 
 
+def test_x_search_runtime_timeout_reports_specific_error(tmp_path, monkeypatch):
+    from ripple import ai_providers
+    monkeypatch.setattr(ai_providers, "protect", fake_protect)
+    service = AIProviderService(tmp_path / "private")
+    state = service.upsert(
+        name="Slow Search Gateway", kind="openai-compatible", base_url="https://slow.example/v1",
+        api_key="secret", models=["grok-4.5-search"], default_model="grok-4.5-search",
+    )
+    provider = state["providers"][0]
+    service.set_route("x_campaign_discovery", provider["id"], "grok-4.5-search")
+    service._update_capability(provider["id"], "x_search", "verified")
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def post(self, url, headers=None, json=None):
+            request = ai_providers.httpx.Request("POST", url)
+            raise ai_providers.httpx.ReadTimeout("slow", request=request)
+
+    monkeypatch.setattr(ai_providers.httpx, "Client", Client)
+    with pytest.raises(WorkflowError, match="X Search 请求超时（60 秒）") as exc:
+        service.x_search("creator challenge")
+    assert exc.value.status == 504
+
+
 def test_discover_existing_provider_prefers_current_editor_base_url(tmp_path, monkeypatch):
     from ripple import ai_providers
     monkeypatch.setattr(ai_providers, "protect", fake_protect)
