@@ -408,7 +408,7 @@ class AIProviderService:
                 tool = "x_search" if capability == "x_search" else "web_search"
                 payload = {"model": model_id, "input": [{"role": "user", "content": "返回一句简短测试结果。"}],
                            "tools": [{"type": tool}]}
-                with httpx.Client(timeout=httpx.Timeout(45, connect=8), trust_env=False,
+                with httpx.Client(timeout=httpx.Timeout(60, connect=8), trust_env=False,
                                   follow_redirects=False) as client:
                     response = client.post(provider["base_url"].rstrip("/") + "/responses",
                                            headers={"Authorization": "Bearer " + key}, json=payload)
@@ -417,9 +417,21 @@ class AIProviderService:
                     ok = bool(_extract_response_text(body) or body.get("output"))
         except WorkflowError:
             raise
-        except (httpx.HTTPError, ValueError, TypeError):
+        except httpx.TimeoutException:
             self._update_capability(provider_id, capability, "failed")
-            raise WorkflowError("Provider 能力测试失败，请检查模型权限、API 兼容性和额度。", 502) from None
+            raise WorkflowError("Provider 能力测试超时（60 秒）；该模型或网关没有在探测窗口内完成工具调用。", 504) from None
+        except httpx.HTTPStatusError as exc:
+            self._update_capability(provider_id, capability, "failed")
+            raise WorkflowError(f"Provider 能力测试返回 HTTP {exc.response.status_code}；请检查 /responses、模型权限和工具兼容性。", 502) from None
+        except httpx.ConnectError:
+            self._update_capability(provider_id, capability, "failed")
+            raise WorkflowError("Provider 能力测试无法建立连接；请检查 Base URL 与网络。", 502) from None
+        except httpx.HTTPError:
+            self._update_capability(provider_id, capability, "failed")
+            raise WorkflowError("Provider 能力测试请求失败；请检查接口兼容性与网络。", 502) from None
+        except (ValueError, TypeError):
+            self._update_capability(provider_id, capability, "failed")
+            raise WorkflowError("Provider 能力测试返回了无法解析的响应。", 502) from None
         self._update_capability(provider_id, capability, "verified" if ok else "failed")
         return {"ok": bool(ok), "capability": capability, "provider_id": provider_id, "model_id": model_id}
 
