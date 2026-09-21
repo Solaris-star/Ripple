@@ -509,7 +509,19 @@ export default function CampaignsPage({
         {sources.map((source) => {
           const sync = source.last_sync;
           const configurable = ['x', 'xiaohongshu', 'douyin'].includes(source.platform);
-          return <article key={source.id || source.platform} className={`campaign-source-status source-${source.status || 'unknown'}`}>
+          const selectedSource = platformFilter === source.platform;
+          const toggleSource = () => setPlatformFilter(selectedSource ? 'all' : source.platform);
+          return <article
+            key={source.id || source.platform}
+            className={`campaign-source-status source-${source.status || 'unknown'} ${selectedSource ? 'selected' : ''}`.trim()}
+          >
+            <button
+              type="button"
+              className="campaign-source-hit"
+              aria-pressed={selectedSource}
+              aria-label={`${source.label}活动筛选`}
+              onClick={toggleSource}
+            />
             <div className="campaign-source-status-head">
               <div className="campaign-source-brand"><PlatformIcon platform={source.platform} size={18} /><strong>{source.label}</strong></div>
               <span>{SOURCE_HEALTH[source.status || ''] || source.status || (source.automatic ? '自动同步' : '支持导入')}</span>
@@ -591,7 +603,7 @@ export default function CampaignsPage({
               return (
                 <article className="card campaign-card" key={campaign.id}>
                   <div className="campaign-card-top">
-                    <div className={`campaign-platform platform-${campaign.platform}`}><PlatformIcon platform={campaign.platform} size={24} /><span>{campaign.platform_label}</span></div>
+                    <div className={`campaign-platform platform-${campaign.platform}`} title={campaign.platform_label} aria-label={campaign.platform_label}><PlatformIcon platform={campaign.platform} size={30} /></div>
                     <div>
                       <h3>{campaign.title}</h3>
                       <p>主办方 · {campaign.organizer || '未说明'}</p>
