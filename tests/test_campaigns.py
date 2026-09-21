@@ -204,6 +204,113 @@ def test_list_discovery_and_rule_verification_use_separate_timestamps(tmp_path, 
     assert cleared["rule_version"] == first_version + 2
 
 
+def test_evidence_fingerprint_change_alone_does_not_bump_rule_version(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    first = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:fp",
+        "title": "指纹测试", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/fp.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+        "prizes": ["瓜分5000元"], "winning_conditions": ["播放量≥100"],
+        "rule_evidence_fingerprint": "fp-1",
+    })
+    version = first["rule_version"]
+    second = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:fp",
+        "title": "指纹测试", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/fp.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+        "prizes": ["瓜分5000元"], "winning_conditions": ["播放量≥100"],
+        "rule_evidence_fingerprint": "fp-2",
+    })
+    assert second["rule_evidence_fingerprint"] == "fp-2"
+    assert second["rule_version"] == version
+
+
+def test_campaign_agent_does_not_repeat_same_evidence_but_reacts_to_changed_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    item = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:agent",
+        "title": "Agent 测试", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/agent.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+        "rule_evidence_fingerprint": "seed",
+    })
+    upstream._write_campaigns(items)
+    monkeypatch.setattr(upstream, "_campaign_agent_model", lambda: "fake-model")
+    evidence = {"value": {
+        "platform": "bilibili", "source_url": item["source_url"],
+        "evidence_text": "参加活动前必须报名。视频作品需带指定话题。",
+        "evidence_fingerprint": "fp-a", "structured": {},
+    }}
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "bilibili_page_evidence", lambda url, force=False: dict(evidence["value"]))
+    calls = []
+    def fake_agent(*args, **kwargs):
+        calls.append((args, kwargs))
+        return json.dumps({
+            "summary": "", "eligibility": ["必须报名"], "content_requirements": [], "prizes": [],
+            "winning_conditions": [], "reward_rules": [], "required_topics": [], "submission_spec": {},
+            "field_evidence": {"eligibility": ["参加活动前必须报名"]},
+        }, ensure_ascii=False)
+    monkeypatch.setattr(upstream, "run_agent_sync", fake_agent)
+
+    first = upstream._campaign_enrich_one(item["id"], force=False)
+    assert first["called"] is True
+    assert len(calls) == 1
+    second = upstream._campaign_enrich_one(item["id"], force=False)
+    assert second["called"] is False and second["reason"] == "already_analyzed"
+    assert len(calls) == 1
+
+    evidence["value"]["evidence_fingerprint"] = "fp-b"
+    third = upstream._campaign_enrich_one(item["id"], force=False)
+    assert third["called"] is True
+    assert len(calls) == 2
+
+
+def test_campaign_agent_fetch_failure_does_not_call_model(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    item = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:offline",
+        "title": "网络失败", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/offline.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+    })
+    upstream._write_campaigns(items)
+    monkeypatch.setattr(upstream, "_campaign_agent_model", lambda: "fake-model")
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "bilibili_page_evidence", lambda *a, **k: (_ for _ in ()).throw(upstream.WorkflowError("network", 502)))
+    calls = []
+    monkeypatch.setattr(upstream, "run_agent_sync", lambda *a, **k: calls.append(1) or "{}")
+    try:
+        upstream._campaign_enrich_one(item["id"], force=False)
+        assert False, "expected WorkflowError"
+    except upstream.WorkflowError:
+        pass
+    assert calls == []
+
+
+def test_bilibili_url_preview_does_not_create_campaign(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    monkeypatch.setattr(upstream, "_campaign_agent_model", lambda: "")
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "preview_bilibili_url", lambda url: {
+        "title": "预览活动", "platform": "bilibili", "organizer": "B站", "activity_type": "创作活动",
+        "source_url": url, "source_type": "user_import", "eligibility": [], "content_requirements": [],
+        "prizes": [], "winning_conditions": [], "reward_rules": [], "required_topics": [], "submission_spec": {},
+        "_agent_evidence": {"evidence_fingerprint": "fp", "evidence_text": "投稿活动"},
+    })
+    result = asyncio.run(upstream.api_campaign_import_preview(upstream.CampaignImportPreviewInput(url="https://www.bilibili.com/blackboard/import.html")))
+    assert result["draft"]["title"] == "预览活动"
+    assert result["agent_used"] is False
+    assert upstream._read_campaigns() == []
+
+
+def test_blank_manual_fields_are_not_locked_against_future_enrichment(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    created = asyncio.run(upstream.api_campaign_create(upstream.CampaignInput(
+        title="空规则活动", platform="bilibili", source_url="https://www.bilibili.com/blackboard/manual.html",
+    )))
+    assert created["user_confirmed_fields"] == []
+    assert "submission_spec" in created["missing_fields"]
+
+
 def test_single_bilibili_rule_verify_enriches_existing_campaign(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     items = []

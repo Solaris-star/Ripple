@@ -249,6 +249,27 @@ export function deleteSchedule(id: string): Promise<{ ok: boolean }> {
 // ---- 创作活动 ----
 export type CampaignPlatform = 'x' | 'xiaohongshu' | 'douyin' | 'bilibili' | 'wechat' | 'weixin-channels';
 export type CampaignQualification = 'eligible' | 'ineligible' | 'unknown';
+export interface CampaignSubmissionSpec {
+  formats: string[];
+  content_directions: string[];
+  style_requirements: string[];
+  duration_seconds: { min: number | null; max: number | null };
+  aspect_ratios: string[];
+  resolutions: string[];
+  orientation: 'vertical' | 'horizontal' | 'square' | null;
+  image_count: { min: number | null; max: number | null };
+  text_length: { min: number | null; max: number | null };
+  live: { min_duration_seconds: number | null; required_category: string; title_keywords: string[] };
+  original_required: boolean | null;
+  first_publish_required: boolean | null;
+  exclusive_required: boolean | null;
+  min_entries: number | null;
+  max_entries: number | null;
+  submission_method: string;
+  required_mentions: string[];
+  required_music: string[];
+}
+
 export interface CampaignRuleSnapshot {
   version: number;
   archived_at?: number;
@@ -272,6 +293,7 @@ export interface CampaignRuleSnapshot {
   winning_conditions?: string[];
   reward_rules?: string[];
   required_topics?: string[];
+  submission_spec?: CampaignSubmissionSpec;
   ai_policy?: string;
   source_url?: string;
   source_status?: string;
@@ -302,6 +324,7 @@ export interface Campaign {
   winning_conditions: string[];
   reward_rules: string[];
   required_topics: string[];
+  submission_spec: CampaignSubmissionSpec;
   ai_policy: string;
   source_url: string;
   source_type: string;
@@ -320,14 +343,23 @@ export interface Campaign {
   external_ids?: Record<string, string>;
   source_evidence?: { provider_id?: string; external_id?: string; source_url?: string; fetched_at?: number; status?: string; evidence?: Record<string, unknown> }[];
   account_states?: Record<string, { visible?: boolean; qualification_state?: CampaignQualification; last_seen_at?: number; provider_id?: string }>;
+  rule_evidence_fingerprint?: string;
+  last_agent_fingerprint?: string;
+  last_agent_enriched_at?: number;
+  agent_model?: string;
+  agent_run_id?: string;
+  enrichment_status?: 'incomplete' | 'running' | 'partial' | 'complete' | 'failed' | string;
+  missing_fields?: string[];
+  agent_error?: string;
 }
 export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<Campaign,
   'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' | 'summary' |
   'starts_at' | 'signup_deadline' | 'submit_deadline' | 'stats_deadline' | 'timezone' |
   'eligibility' | 'qualification_state' | 'content_requirements' | 'prizes' | 'winning_conditions' | 'reward_rules' |
-  'required_topics' | 'ai_policy' | 'source_url' | 'note' | 'status' | 'account_id'>>;
+  'required_topics' | 'submission_spec' | 'ai_policy' | 'source_url' | 'note' | 'status' | 'account_id'>>;
 export interface CampaignSourceSyncState {
-  at?: number; status?: string; count?: number; error?: string; provider?: string; fallback_used?: boolean;
+  at?: number; last_attempt_at?: number; last_success_at?: number; last_success_count?: number; next_run_at?: number;
+  status?: string; count?: number; error?: string; provider?: string; fallback_used?: boolean;
 }
 export interface CampaignSourceCapability {
   id?: string;
@@ -350,7 +382,7 @@ export interface CampaignSourceCapability {
   sync_interval_seconds?: number;
   next_sync_at?: number;
 }
-export interface CampaignSourceState { items: CampaignSourceCapability[]; automatic_count: number; revision?: number; }
+export interface CampaignSourceState { items: CampaignSourceCapability[]; automatic_count: number; revision?: number; server_now?: number; }
 export interface CampaignRefreshResult {
   results: { platform: CampaignPlatform; status: string; count: number; provider?: string; fallback_used?: boolean; error?: string }[];
   sources: CampaignSourceState;
@@ -369,6 +401,13 @@ function normalizeCampaign(item: Campaign): Campaign {
     winning_conditions: Array.isArray(item.winning_conditions) ? item.winning_conditions : [],
     reward_rules: Array.isArray(item.reward_rules) ? item.reward_rules : [],
     required_topics: Array.isArray(item.required_topics) ? item.required_topics : [],
+    submission_spec: item.submission_spec || {
+      formats: [], content_directions: [], style_requirements: [], duration_seconds: { min: null, max: null },
+      aspect_ratios: [], resolutions: [], orientation: null, image_count: { min: null, max: null },
+      text_length: { min: null, max: null }, live: { min_duration_seconds: null, required_category: '', title_keywords: [] },
+      original_required: null, first_publish_required: null, exclusive_required: null,
+      min_entries: null, max_entries: null, submission_method: '', required_mentions: [], required_music: [],
+    },
   };
 }
 export function fetchCampaigns(): Promise<Campaign[]> {
@@ -379,6 +418,20 @@ export function fetchCampaign(id: string): Promise<Campaign> {
 }
 export function verifyCampaign(id: string): Promise<Campaign> {
   return request<Campaign>(`/api/campaigns/${encodeURIComponent(id)}/verify`, { method: 'POST' }).then(normalizeCampaign);
+}
+export function enrichCampaign(id: string, force = true): Promise<{ called: boolean; reason: string; changed_fields: string[]; item: Campaign }> {
+  return request<{ called: boolean; reason: string; changed_fields: string[]; item: Campaign }>(`/api/campaigns/${encodeURIComponent(id)}/enrich`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ force }),
+  }).then((value) => ({ ...value, item: normalizeCampaign(value.item) }));
+}
+export interface CampaignEnrichmentPreview { platform: string; count: number; items: { id: string; title: string; missing_fields: string[]; reason: string }[]; model: string; ready: boolean; note: string; }
+export interface CampaignEnrichmentStatus { status: string; id?: string; total: number; done: number; failed: number; current?: string; items?: string[]; }
+export function fetchCampaignEnrichmentPreview(): Promise<CampaignEnrichmentPreview> { return request('/api/campaigns/enrichment/preview'); }
+export function runCampaignEnrichment(): Promise<{ started: boolean; reason?: string; status: CampaignEnrichmentStatus }> { return request('/api/campaigns/enrichment/run', { method: 'POST' }); }
+export function fetchCampaignEnrichmentStatus(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/enrichment/status'); }
+export function cancelCampaignEnrichment(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/enrichment/cancel', { method: 'POST' }); }
+export function previewCampaignImport(url: string): Promise<{ draft: CampaignInput & Partial<Campaign>; agent_used: boolean; model: string; warning: string; evidence_fingerprint: string }> {
+  return request('/api/campaigns/import/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
 }
 export function fetchCampaignSources(): Promise<CampaignSourceState> { return request('/api/campaigns/sources'); }
 export function configureCampaignSource(platform: CampaignPlatform, input: {

@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  configureCampaignSource, createCampaign, createIdea, createSchedule, fetchCampaigns, fetchCampaignSources,
-  fetchStatus, fetchTrends, recommendIdeas, refreshCampaigns, saveCampaign, updateCampaign, verifyCampaign,
+  cancelCampaignEnrichment, configureCampaignSource, createCampaign, createIdea, createSchedule, enrichCampaign,
+  fetchCampaignEnrichmentPreview, fetchCampaignEnrichmentStatus, fetchCampaigns, fetchCampaignSources,
+  fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, runCampaignEnrichment,
+  saveCampaign, updateCampaign, verifyCampaign,
 } from '../lib/api';
 import type {
-  Campaign, CampaignInput, CampaignPlatform, CampaignSourceCapability, IdeaRecommendation,
-  IdeaRecommendResponse, PersonaItem, TopicUseContext, TrendGroup,
+  Campaign, CampaignEnrichmentPreview, CampaignEnrichmentStatus, CampaignInput, CampaignPlatform,
+  CampaignSourceCapability, CampaignSubmissionSpec, IdeaRecommendation, IdeaRecommendResponse,
+  PersonaItem, TopicUseContext, TrendGroup,
 } from '../lib/api';
 import { loadTrendSelection } from '../lib/trendPrefs';
 import { api as rippleApi } from '../lib/ripple';
@@ -60,6 +63,20 @@ type SourceDraft = {
   account_id: string; tikhub_enabled: boolean; tikhub_api_key: string;
 };
 
+const emptySubmissionSpec = (): CampaignSubmissionSpec => ({
+  formats: [], content_directions: [], style_requirements: [], duration_seconds: { min: null, max: null },
+  aspect_ratios: [], resolutions: [], orientation: null, image_count: { min: null, max: null },
+  text_length: { min: null, max: null }, live: { min_duration_seconds: null, required_category: '', title_keywords: [] },
+  original_required: null, first_publish_required: null, exclusive_required: null,
+  min_entries: null, max_entries: null, submission_method: '', required_mentions: [], required_music: [],
+});
+
+const FORMAT_LABELS: Record<string, string> = {
+  video: '视频', short_video: '短视频', long_video: '长视频', image_text: '图文', text: '文字',
+  image: '图片', live: '直播', audio: '音频', any: '不限形式',
+};
+const MISSING_LABELS: Record<string, string> = { eligibility: '参与条件', submission_spec: '参赛作品', prizes: '奖品', winning_conditions: '获奖条件' };
+
 const emptyCampaign = (): CampaignInput => ({
   title: '',
   platform: 'xiaohongshu',
@@ -81,6 +98,7 @@ const emptyCampaign = (): CampaignInput => ({
   winning_conditions: [],
   reward_rules: [],
   required_topics: [],
+  submission_spec: emptySubmissionSpec(),
   ai_policy: 'unknown',
   source_url: '',
   note: '',
@@ -151,6 +169,40 @@ function syncIntervalLabel(seconds?: number): string {
   return `${Math.round(seconds / 60)} 分钟`;
 }
 
+function formatSeconds(value: number | null | undefined): string {
+  if (value == null) return '';
+  return value >= 60 && value % 60 === 0 ? `${value / 60} 分钟` : `${value} 秒`;
+}
+
+function submissionSummary(campaign: Campaign): string {
+  const spec = campaign.submission_spec || emptySubmissionSpec();
+  const formats = (spec.formats || []).map((key) => FORMAT_LABELS[key] || key).join(' / ');
+  const min = formatSeconds(spec.duration_seconds?.min); const max = formatSeconds(spec.duration_seconds?.max);
+  const duration = min && max ? `${min}～${max}` : min ? `≥ ${min}` : max ? `≤ ${max}` : '';
+  return [formats, duration].filter(Boolean).join(' · ');
+}
+
+function hasSubmissionSpec(campaign: Campaign): boolean {
+  const spec = campaign.submission_spec || emptySubmissionSpec();
+  return Boolean(
+    spec.formats.length || spec.content_directions.length || spec.style_requirements.length
+    || spec.duration_seconds.min != null || spec.duration_seconds.max != null
+    || spec.aspect_ratios.length || spec.resolutions.length || spec.orientation
+    || spec.image_count.min != null || spec.image_count.max != null
+    || spec.text_length.min != null || spec.text_length.max != null
+    || spec.live.min_duration_seconds != null || spec.live.required_category || spec.live.title_keywords.length
+    || spec.original_required != null || spec.first_publish_required != null || spec.exclusive_required != null
+    || spec.min_entries != null || spec.max_entries != null || spec.submission_method
+    || spec.required_mentions.length || spec.required_music.length
+  );
+}
+
+function formatCountdown(seconds: number): string {
+  if (seconds <= 0) return '即将自动检查';
+  const h = Math.floor(seconds / 3600); const m = Math.floor((seconds % 3600) / 60); const s = seconds % 60;
+  return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}` : `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 function platformLabel(key: string): string {
   return platformDisplayName(key);
 }
@@ -169,6 +221,13 @@ export default function CampaignsPage({
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [verifying, setVerifying] = useState(false);
+  const [enrichingId, setEnrichingId] = useState('');
+  const [enrichmentPreview, setEnrichmentPreview] = useState<CampaignEnrichmentPreview | null>(null);
+  const [enrichmentStatus, setEnrichmentStatus] = useState<CampaignEnrichmentStatus | null>(null);
+  const enrichmentPhase = enrichmentStatus?.status || '';
+  const agentBatchActive = ['running', 'queued', 'cancelling'].includes(enrichmentPhase);
+  const [serverOffset, setServerOffset] = useState(0);
+  const [clock, setClock] = useState(() => Math.floor(Date.now() / 1000));
   const [sourceEditor, setSourceEditor] = useState<CampaignSourceCapability | null>(null);
   const [sourceDraft, setSourceDraft] = useState<SourceDraft>({
     method: '', x_api_account_id: '', fallback_method: '', fallback_enabled: false,
@@ -193,6 +252,10 @@ export default function CampaignsPage({
   const [winningConditionsText, setWinningConditionsText] = useState('');
   const [rewardRulesText, setRewardRulesText] = useState('');
   const [topicsText, setTopicsText] = useState('');
+  const [importUrlOpen, setImportUrlOpen] = useState(false);
+  const [importUrl, setImportUrl] = useState('');
+  const [importParsing, setImportParsing] = useState(false);
+  const [importWarning, setImportWarning] = useState('');
 
   const [recommendOpen, setRecommendOpen] = useState(false);
   const [recommending, setRecommending] = useState(false);
@@ -206,8 +269,8 @@ export default function CampaignsPage({
     window.setTimeout(() => setToast(''), 2300);
   };
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (initial = false) => {
+    if (initial) setLoading(true);
     try {
       const runtime = await fetchStatus();
       if (!runtime.features?.campaigns || !runtime.features?.campaign_sources_v2) {
@@ -215,13 +278,16 @@ export default function CampaignsPage({
         setError('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
         return;
       }
-      const [campaignRows, sourceState, accountRows] = await Promise.all([
+      const [campaignRows, sourceState, accountRows, agentState] = await Promise.all([
         fetchCampaigns(), fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
+        fetchCampaignEnrichmentStatus().catch(() => null),
       ]);
       setAccounts(accountRows);
       setCampaigns(campaignRows);
       setSources(sourceState.items || []);
       setAutomaticCount(sourceState.automatic_count || 0);
+      if (agentState) setEnrichmentStatus(agentState);
+      if (sourceState.server_now) setServerOffset(sourceState.server_now - Math.floor(Date.now() / 1000));
       setSelected((current) => current ? campaignRows.find((x) => x.id === current.id) || null : null);
       setError('');
     } catch (e) {
@@ -230,15 +296,27 @@ export default function CampaignsPage({
         ? '当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。'
         : message);
     } finally {
-      setLoading(false);
+      if (initial) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    void load();
-    const timer = window.setInterval(() => { void load(); }, 60 * 1000);
-    return () => window.clearInterval(timer);
+    void load(true);
+    const refreshTimer = window.setInterval(() => { void load(false); }, 60 * 1000);
+    const clockTimer = window.setInterval(() => setClock(Math.floor(Date.now() / 1000)), 1000);
+    return () => { window.clearInterval(refreshTimer); window.clearInterval(clockTimer); };
   }, [load]);
+
+  useEffect(() => {
+    if (!['running', 'queued', 'cancelling'].includes(enrichmentPhase)) return;
+    const timer = window.setInterval(() => {
+      fetchCampaignEnrichmentStatus().then((status) => {
+        setEnrichmentStatus(status);
+        if (!['running', 'queued', 'cancelling'].includes(status.status)) void load(false);
+      }).catch(() => undefined);
+    }, 1800);
+    return () => window.clearInterval(timer);
+  }, [enrichmentPhase, load]);
 
   useEffect(() => {
     const selectedTrends = loadTrendSelection();
@@ -279,6 +357,36 @@ export default function CampaignsPage({
     } finally {
       setVerifying(false);
     }
+  };
+
+  const enrichOne = async (campaign: Campaign) => {
+    if (enrichingId) return;
+    setEnrichingId(campaign.id); setError('');
+    try {
+      const result = await enrichCampaign(campaign.id, true);
+      setCampaigns((rows) => rows.map((row) => row.id === result.item.id ? result.item : row));
+      setSelected((current) => current?.id === result.item.id ? result.item : current);
+      showToast(result.called ? 'Agent 已完成规则补全' : '当前证据无需重复调用 Agent');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Agent 补全失败');
+    } finally { setEnrichingId(''); }
+  };
+
+  const openEnrichmentPreview = async () => {
+    try { setEnrichmentPreview(await fetchCampaignEnrichmentPreview()); }
+    catch (e) { setError(e instanceof Error ? e.message : '无法读取 Agent 补全预览'); }
+  };
+
+  const startGlobalEnrichment = async () => {
+    try {
+      const result = await runCampaignEnrichment(); setEnrichmentStatus(result.status); setEnrichmentPreview(null);
+      if (!result.started) showToast('当前没有需要 Agent 补全的 B站活动');
+    } catch (e) { setError(e instanceof Error ? e.message : '无法启动 Agent 补全'); }
+  };
+
+  const cancelGlobalEnrichment = async () => {
+    try { setEnrichmentStatus(await cancelCampaignEnrichment()); }
+    catch (e) { setError(e instanceof Error ? e.message : '取消失败'); }
   };
 
   const openSourceEditor = (source: CampaignSourceCapability) => {
@@ -354,15 +462,30 @@ export default function CampaignsPage({
   const trends = useMemo(() => trendGroups.flatMap((group) =>
     group.items.slice(0, 4).map((item) => ({ ...item, platform: group.label, platformKey: group.platform, status: group.status }))).slice(0, 10), [trendGroups]);
 
-  const openNew = () => {
+  const fillDraft = (draft: CampaignInput) => {
     setEditId(null);
-    setForm(emptyCampaign());
-    setEligibilityText('');
-    setRequirementsText('');
-    setPrizesText('');
-    setWinningConditionsText('');
-    setRewardRulesText('');
-    setTopicsText('');
+    setForm({ ...emptyCampaign(), ...draft, submission_spec: draft.submission_spec || emptySubmissionSpec() });
+    setEligibilityText(joined(draft.eligibility)); setRequirementsText(joined(draft.content_requirements));
+    setPrizesText(joined(draft.prizes)); setWinningConditionsText(joined(draft.winning_conditions));
+    setRewardRulesText(joined(draft.reward_rules)); setTopicsText((draft.required_topics || []).join('，'));
+  };
+
+  const openNew = () => { setImportWarning(''); fillDraft(emptyCampaign()); };
+  const updateSubmissionSpec = (patch: Partial<CampaignSubmissionSpec>) => {
+    setForm((current) => current ? { ...current, submission_spec: { ...(current.submission_spec || emptySubmissionSpec()), ...patch } } : current);
+  };
+  const openImport = () => { setImportUrl(''); setImportWarning(''); setImportUrlOpen(true); };
+
+  const parseImport = async () => {
+    if (!importUrl.trim() || importParsing) return;
+    setImportParsing(true); setError(''); setImportWarning('');
+    try {
+      const result = await previewCampaignImport(importUrl.trim());
+      fillDraft({ ...result.draft, platform: 'bilibili' } as CampaignInput);
+      setImportWarning(result.warning || (result.agent_used ? `脚本解析后已由 ${result.model} 补全草稿；请确认后再导入。` : '脚本已生成草稿；请确认后再导入。'));
+      setImportUrlOpen(false);
+    } catch (e) { setError(e instanceof Error ? e.message : '活动 URL 解析失败'); }
+    finally { setImportParsing(false); }
   };
 
   const openEdit = (campaign: Campaign) => {
@@ -379,6 +502,7 @@ export default function CampaignsPage({
       eligibility: campaign.eligibility, content_requirements: campaign.content_requirements,
       prizes: campaign.prizes, winning_conditions: campaign.winning_conditions,
       reward_rules: campaign.reward_rules, required_topics: campaign.required_topics,
+      submission_spec: campaign.submission_spec || emptySubmissionSpec(),
     });
     setEligibilityText(joined(campaign.eligibility));
     setRequirementsText(joined(campaign.content_requirements));
@@ -401,6 +525,7 @@ export default function CampaignsPage({
         winning_conditions: splitLines(winningConditionsText),
         reward_rules: splitLines(rewardRulesText),
         required_topics: splitLines(topicsText),
+        submission_spec: form.submission_spec || emptySubmissionSpec(),
       };
       const saved = editId ? await updateCampaign(editId, payload) : await createCampaign(payload);
       setForm(null);
@@ -523,6 +648,8 @@ export default function CampaignsPage({
     });
   };
 
+  const formSpec = form?.submission_spec || emptySubmissionSpec();
+
   return (
     <div className="page-scroll campaign-page">
       <div className="page-head campaign-head">
@@ -534,7 +661,8 @@ export default function CampaignsPage({
           <button className="btn btn-sm btn-primary" title="立即重新检查已启用的活动源；单个活动规则可在详情中单独重新核验" disabled={refreshing || loading} onClick={() => void refreshNow()}>
             <IconRefresh size={13} /> {refreshing ? '刷新中…' : '刷新活动'}
           </button>
-          <button className="btn btn-sm" onClick={openNew}>+ 补充导入</button>
+          <button className="btn btn-sm" onClick={() => void openEnrichmentPreview()} disabled={agentBatchActive}>✦ Agent 补全缺失规则</button>
+          <button className="btn btn-sm" onClick={openImport}>+ 补充导入</button>
         </div>
       </div>
 
@@ -550,10 +678,16 @@ export default function CampaignsPage({
           <strong>已就绪 {automaticCount} 个自动活动源</strong>
           <span>活动源由 Ripple 后端定时同步，页面无需保持打开；右上角“刷新活动”可随时手动重新检查。收费备用源未经显式启用不会调用。</span>
         </div>
+        {enrichmentStatus && ['running', 'queued', 'cancelling'].includes(enrichmentStatus.status) && <div className="campaign-agent-progress"><strong>Agent 补全 {enrichmentStatus.done}/{enrichmentStatus.total}</strong><span>{enrichmentStatus.failed ? `失败 ${enrichmentStatus.failed} · ` : ''}按活动串行处理，避免重复 Token 消耗</span><button className="r2-text-button" onClick={() => void cancelGlobalEnrichment()}>取消</button></div>}
       </div>
       <section className="campaign-source-status-grid">
         {sources.map((source) => {
           const sync = source.last_sync;
+          const now = clock + serverOffset;
+          const lastSuccess = sync?.last_success_at || (sync?.status === 'fresh' ? sync.at : 0) || 0;
+          const lastAttempt = sync?.last_attempt_at || sync?.at || 0;
+          const nextRun = sync?.next_run_at || source.next_sync_at || 0;
+          const remaining = nextRun ? Math.max(0, nextRun - now) : 0;
           const configurable = ['x', 'xiaohongshu', 'douyin'].includes(source.platform);
           const selectedSource = platformFilter === source.platform;
           const toggleSource = () => setPlatformFilter(selectedSource ? 'all' : source.platform);
@@ -575,9 +709,9 @@ export default function CampaignsPage({
             <p>{source.detail}</p>
             {source.automatic && source.sync_interval_seconds ? <small>自动频率：{syncIntervalLabel(source.sync_interval_seconds)}</small> : null}
             {source.cost_note && <small>{source.cost_note}</small>}
-            {sync?.at && <small>最近同步：{new Date(sync.at * 1000).toLocaleString('zh-CN')} · {sync.status}{sync.count != null ? ` · ${sync.count} 条` : ''}{sync.fallback_used ? ' · 使用备用源' : ''}</small>}
-            {source.automatic && source.next_sync_at ? <small>下次自动检查约：{new Date(source.next_sync_at * 1000).toLocaleString('zh-CN')}</small> : null}
-            {sync?.error && <small className="error">{sync.error}</small>}
+            {lastSuccess > 0 && <small>最近成功采集：{new Date(lastSuccess * 1000).toLocaleString('zh-CN')}{sync?.last_success_count != null ? ` · ${sync.last_success_count} 条` : ''}</small>}
+            {source.automatic && nextRun > 0 ? <small>距离下次采集：<b className="campaign-sync-countdown">{formatCountdown(remaining)}</b></small> : null}
+            {sync?.error && <small className="error">上次尝试：{lastAttempt ? new Date(lastAttempt * 1000).toLocaleString('zh-CN') : '未知'} · {sync.error}</small>}
             <div className="campaign-source-status-actions">
               {configurable && <button className="r2-text-button" onClick={() => openSourceEditor(source)}>配置</button>}
             </div>
@@ -641,13 +775,16 @@ export default function CampaignsPage({
               <IconCompass size={28} />
               <strong>{campaigns.length ? '当前筛选条件没有匹配活动' : '还没有已确认的创作活动'}</strong>
               <p>{campaigns.length ? '调整筛选条件继续查看。' : '可点击“刷新活动”从已就绪的数据源自动获取；手动导入用于补充遗漏活动。Ripple 不会用虚构活动填充这里。'}</p>
-              {!campaigns.length && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openNew}>补充导入</button></div>}
+              {!campaigns.length && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openImport}>补充导入</button></div>}
             </div>
           )}
           <div className="campaign-grid">
             {visible.map((campaign) => {
               const qualification = qualificationBadge(campaign);
               const sourceText = sourceName(campaign) + ' · ' + sourceLabel(campaign);
+              const specText = submissionSummary(campaign);
+              const missing = campaign.missing_fields || [];
+              const incomplete = campaign.platform === 'bilibili' && missing.length > 0;
               return (
                 <article className="card campaign-card" key={campaign.id}>
                   <div className="campaign-card-top">
@@ -668,12 +805,15 @@ export default function CampaignsPage({
                   <div className="campaign-card-facts">
                     <div><small>活动时间</small><strong>{campaignTime(campaign)}</strong></div>
                     <div><small>来源</small><strong>{sourceText}</strong></div>
-                    <div><small>参与条件</small><span>{concise(campaign.eligibility, '原活动页暂未解析到明确前置条件')}</span></div>
-                    <div><small>奖品 / 奖励</small><span>{concise(campaign.prizes, campaign.reward_summary || '原活动页暂未解析到明确奖品')}</span></div>
-                    <div><small>获奖条件</small><span>{concise(campaign.winning_conditions, '原活动页暂未解析到明确获奖门槛')}</span></div>
+                    {specText && <div><small>参赛作品</small><span>{specText}</span></div>}
+                    {!!campaign.eligibility?.length && <div><small>参与条件</small><span>{concise(campaign.eligibility, '')}</span></div>}
+                    {(campaign.prizes?.length || campaign.reward_summary) && <div><small>奖品 / 奖励</small><span>{concise(campaign.prizes, campaign.reward_summary || '')}</span></div>}
+                    {!!campaign.winning_conditions?.length && <div><small>获奖条件</small><span>{concise(campaign.winning_conditions, '')}</span></div>}
+                    {incomplete && <div className="campaign-missing"><small>规则信息</small><span>待补充：{missing.map((key) => MISSING_LABELS[key] || key).join('、')}</span></div>}
                   </div>
                   <div className="campaign-actions">
                     <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看详情</button>
+                    {incomplete && <button className="btn btn-sm campaign-agent-button" disabled={!!enrichingId || agentBatchActive || campaign.enrichment_status === 'running'} onClick={() => void enrichOne(campaign)}>✦ {enrichingId === campaign.id || campaign.enrichment_status === 'running' ? 'Agent 补全中…' : 'Agent 补全'}</button>}
                     <button className="btn btn-sm btn-primary" disabled={campaign.status === 'ended' || campaign.status === 'cancelled'}
                       onClick={() => void generateIdeas(campaign)}><IconSkills size={13} /> 生成选题</button>
                   </div>
@@ -719,6 +859,26 @@ export default function CampaignsPage({
                 <span><small>统计截止</small>{dateOnly(selected.stats_deadline) || '未说明'}</span>
               </div>
             </section>
+            <section><h4>参赛作品</h4>{hasSubmissionSpec(selected) ? <div className="campaign-submission-spec">
+              <span><small>作品形式</small>{(selected.submission_spec?.formats || []).map((key) => FORMAT_LABELS[key] || key).join(' / ') || '未说明'}</span>
+              {(selected.submission_spec?.content_directions || []).length > 0 && <span><small>内容方向</small>{selected.submission_spec.content_directions.join('、')}</span>}
+              {(selected.submission_spec?.style_requirements || []).length > 0 && <span><small>风格要求</small>{selected.submission_spec.style_requirements.join('、')}</span>}
+              {(selected.submission_spec?.duration_seconds?.min != null || selected.submission_spec?.duration_seconds?.max != null) && <span><small>视频时长</small>{submissionSummary(selected).split(' · ').slice(1).join(' · ') || '已说明'}</span>}
+              {(selected.submission_spec?.aspect_ratios || []).length > 0 && <span><small>画面比例</small>{selected.submission_spec.aspect_ratios.join(' / ')}</span>}
+              {(selected.submission_spec?.resolutions || []).length > 0 && <span><small>分辨率</small>{selected.submission_spec.resolutions.join(' / ')}</span>}
+              {(selected.submission_spec?.image_count?.min != null || selected.submission_spec?.image_count?.max != null) && <span><small>图片数量</small>{selected.submission_spec.image_count.min ?? '未说明'} ～ {selected.submission_spec.image_count.max ?? '未说明'}</span>}
+              {(selected.submission_spec?.text_length?.min != null || selected.submission_spec?.text_length?.max != null) && <span><small>文字长度</small>{selected.submission_spec.text_length.min ?? '未说明'} ～ {selected.submission_spec.text_length.max ?? '未说明'} 字</span>}
+              {selected.submission_spec?.live?.min_duration_seconds != null && <span><small>直播时长</small>≥ {formatSeconds(selected.submission_spec.live.min_duration_seconds)}</span>}
+              {selected.submission_spec?.live?.required_category && <span><small>直播分区</small>{selected.submission_spec.live.required_category}</span>}
+              {(selected.submission_spec?.live?.title_keywords || []).length > 0 && <span><small>直播标题关键词</small>{selected.submission_spec.live.title_keywords.join('、')}</span>}
+              {selected.submission_spec?.original_required != null && <span><small>原创</small>{selected.submission_spec.original_required ? '必须原创' : '明确不要求'}</span>}
+              {selected.submission_spec?.first_publish_required != null && <span><small>首发</small>{selected.submission_spec.first_publish_required ? '要求首发' : '明确不要求'}</span>}
+              {selected.submission_spec?.exclusive_required != null && <span><small>独家</small>{selected.submission_spec.exclusive_required ? '要求独家' : '明确不要求'}</span>}
+              {(selected.submission_spec?.min_entries != null || selected.submission_spec?.max_entries != null) && <span><small>投稿数量</small>{selected.submission_spec.min_entries ?? '未说明'} ～ {selected.submission_spec.max_entries ?? '未说明'}</span>}
+              {selected.submission_spec?.submission_method && <span><small>投稿方式</small>{selected.submission_spec.submission_method}</span>}
+              {(selected.submission_spec?.required_mentions || []).length > 0 && <span><small>指定 @</small>{selected.submission_spec.required_mentions.join('、')}</span>}
+              {(selected.submission_spec?.required_music || []).length > 0 && <span><small>指定音乐</small>{selected.submission_spec.required_music.join('、')}</span>}
+            </div> : <p className="campaign-unknown">原活动页暂未解析到明确参赛作品格式与规格。</p>}</section>
             <section><h4>参与条件</h4>{selected.eligibility?.length ? <ul>{selected.eligibility.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确参与条件。</p>}</section>
             <section><h4>内容要求</h4>{selected.content_requirements?.length ? <ul>{selected.content_requirements.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确内容要求。</p>}</section>
             <section><h4>奖品 / 奖励</h4>{selected.prizes?.length ? <ul>{selected.prizes.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{selected.reward_summary || '原活动页暂未解析到明确奖品。'}</p>}</section>
@@ -739,6 +899,7 @@ export default function CampaignsPage({
                 <button className="btn btn-sm" onClick={() => void addCalendar(selected)}><IconCalendar size={13} /> 加入选题日历</button>
                 {selected.source_url && <a className="btn btn-sm" href={selected.source_url} target="_blank" rel="noreferrer">打开原活动页</a>}
                 {selected.platform === 'bilibili' && <button className="btn btn-sm" disabled={verifying} onClick={() => void verifySelected()}><IconRefresh size={13} /> {verifying ? '核验中…' : '重新核验规则'}</button>}
+                {selected.platform === 'bilibili' && (selected.missing_fields || []).length > 0 && <button className="btn btn-sm campaign-agent-button" disabled={!!enrichingId || agentBatchActive} onClick={() => void enrichOne(selected)}>✦ {enrichingId === selected.id ? 'Agent 补全中…' : 'Agent 补全'}</button>}
                 {selected.source_type === 'user_import' && <button className="btn btn-sm" onClick={() => openEdit(selected)}>编辑规则</button>}
               </div>
             </footer>
@@ -808,10 +969,33 @@ export default function CampaignsPage({
         </div>
       )}
 
+      {importUrlOpen && (
+        <div className="overlay">
+          <div className="modal campaign-import-url-modal">
+            <div className="campaign-modal-head"><div><h3>从活动链接导入</h3><p>当前智能解析先支持 B站。Ripple 会先脚本解析，缺规则时再调用默认 Agent；确认前不会创建活动。</p></div><button onClick={() => setImportUrlOpen(false)}>×</button></div>
+            <label className="field-label">B站活动 URL</label>
+            <input className="field" type="url" value={importUrl} onChange={(e) => setImportUrl(e.target.value)} placeholder="https://www.bilibili.com/blackboard/..." autoFocus />
+            <div className="campaign-import-foot"><span>其他平台本轮仍可手动填写。</span><div><button className="btn btn-sm" onClick={() => { setImportUrlOpen(false); openNew(); }}>手动填写</button><button className="btn btn-sm btn-primary" disabled={importParsing || !importUrl.trim()} onClick={() => void parseImport()}>{importParsing ? '解析中…' : '解析活动'}</button></div></div>
+          </div>
+        </div>
+      )}
+
+      {enrichmentPreview && (
+        <div className="overlay">
+          <div className="modal campaign-agent-preview-modal">
+            <div className="campaign-modal-head"><div><h3>Agent 补全 B站缺失规则</h3><p>只处理从未分析或规则证据已变化的活动；同一页面证据不会自动重复消耗 Token。</p></div><button onClick={() => setEnrichmentPreview(null)}>×</button></div>
+            <div className="campaign-agent-preview-summary"><strong>{enrichmentPreview.count} 个活动待补全</strong><span>模型：{enrichmentPreview.model || '未配置默认 Ripple Agent'}</span></div>
+            <div className="campaign-agent-preview-list">{enrichmentPreview.items.slice(0, 20).map((item) => <div key={item.id}><strong>{item.title}</strong><span>{item.missing_fields.map((key) => MISSING_LABELS[key] || key).join('、')}</span></div>)}</div>
+            <div className="campaign-import-foot"><span>{enrichmentPreview.note}</span><div>{!enrichmentPreview.ready && <button className="btn btn-sm" onClick={onOpenSettings}>配置默认 Agent</button>}<button className="btn btn-sm btn-primary" disabled={!enrichmentPreview.ready || enrichmentPreview.count === 0} onClick={() => void startGlobalEnrichment()}>开始补全</button></div></div>
+          </div>
+        </div>
+      )}
+
       {form && (
         <div className="overlay">
           <div className="modal campaign-import-modal">
             <div className="campaign-modal-head"><div><h3>{editId ? '编辑活动规则' : '导入创作活动'}</h3><p>保存真实来源和已知规则；未说明的信息可以留空。</p></div><button onClick={() => setForm(null)}>×</button></div>
+            {importWarning && !editId && <div className="campaign-import-preview-note">{importWarning}</div>}
             <div className="campaign-import-grid">
               <label><span>活动名称 *</span><input className="field" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label>
               <label><span>平台 *</span><select className="field" value={form.platform} onChange={(e) => setForm({ ...form, platform: e.target.value as CampaignPlatform })}>{PLATFORMS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}</select></label>
@@ -827,6 +1011,28 @@ export default function CampaignsPage({
               <label className="wide"><span>来源链接</span><input className="field" type="url" value={form.source_url || ''} onChange={(e) => setForm({ ...form, source_url: e.target.value })} placeholder="https://…" /></label>
               <label className="wide"><span>参与条件（每行一条）</span><textarea className="field" value={eligibilityText} onChange={(e) => setEligibilityText(e.target.value)} /></label>
               <label className="wide"><span>内容要求（每行一条）</span><textarea className="field" value={requirementsText} onChange={(e) => setRequirementsText(e.target.value)} /></label>
+              <div className="wide campaign-spec-editor"><strong>参赛作品规格</strong><small>没有明确规则的项目保持为空，不会解释成“不限”。</small></div>
+              <div className="wide campaign-format-picker"><span>作品形式</span>{['video','short_video','long_video','image_text','text','live','audio'].map((key) => <label key={key}><input type="checkbox" checked={formSpec.formats.includes(key)} onChange={(e) => updateSubmissionSpec({ formats: e.target.checked ? Array.from(new Set([...formSpec.formats, key])) : formSpec.formats.filter((x) => x !== key) })} />{FORMAT_LABELS[key]}</label>)}</div>
+              <label className="wide"><span>内容方向（每行一条）</span><textarea className="field" value={joined(formSpec.content_directions)} onChange={(e) => updateSubmissionSpec({ content_directions: splitLines(e.target.value) })} placeholder="攻略 / 实机体验 / 剧情二创…" /></label>
+              <label className="wide"><span>风格要求（每行一条）</span><textarea className="field" value={joined(formSpec.style_requirements)} onChange={(e) => updateSubmissionSpec({ style_requirements: splitLines(e.target.value) })} placeholder="轻松搞笑 / 专业讲解 / 真实体验…" /></label>
+              <label><span>视频最短时长（秒）</span><input className="field" type="number" min="0" value={formSpec.duration_seconds.min ?? ''} onChange={(e) => updateSubmissionSpec({ duration_seconds: { ...formSpec.duration_seconds, min: e.target.value ? Number(e.target.value) : null } })} /></label>
+              <label><span>视频最长时长（秒）</span><input className="field" type="number" min="0" value={formSpec.duration_seconds.max ?? ''} onChange={(e) => updateSubmissionSpec({ duration_seconds: { ...formSpec.duration_seconds, max: e.target.value ? Number(e.target.value) : null } })} /></label>
+              <label><span>画面比例</span><input className="field" value={formSpec.aspect_ratios.join('，')} onChange={(e) => updateSubmissionSpec({ aspect_ratios: splitLines(e.target.value) })} placeholder="16:9，9:16" /></label>
+              <label><span>分辨率</span><input className="field" value={formSpec.resolutions.join('，')} onChange={(e) => updateSubmissionSpec({ resolutions: splitLines(e.target.value) })} placeholder="1080P，4K" /></label>
+              <label><span>画面方向</span><select className="field" value={formSpec.orientation || ''} onChange={(e) => updateSubmissionSpec({ orientation: (e.target.value || null) as CampaignSubmissionSpec['orientation'] })}><option value="">未说明</option><option value="vertical">竖屏</option><option value="horizontal">横屏</option><option value="square">方形</option></select></label>
+              <label><span>最少图片数</span><input className="field" type="number" min="0" value={formSpec.image_count.min ?? ''} onChange={(e) => updateSubmissionSpec({ image_count: { ...formSpec.image_count, min: e.target.value ? Number(e.target.value) : null } })} /></label>
+              <label><span>最多图片数</span><input className="field" type="number" min="0" value={formSpec.image_count.max ?? ''} onChange={(e) => updateSubmissionSpec({ image_count: { ...formSpec.image_count, max: e.target.value ? Number(e.target.value) : null } })} /></label>
+              <label><span>最少字数</span><input className="field" type="number" min="0" value={formSpec.text_length.min ?? ''} onChange={(e) => updateSubmissionSpec({ text_length: { ...formSpec.text_length, min: e.target.value ? Number(e.target.value) : null } })} /></label>
+              <label><span>最多字数</span><input className="field" type="number" min="0" value={formSpec.text_length.max ?? ''} onChange={(e) => updateSubmissionSpec({ text_length: { ...formSpec.text_length, max: e.target.value ? Number(e.target.value) : null } })} /></label>
+              <label><span>直播最短时长（秒）</span><input className="field" type="number" min="0" value={formSpec.live.min_duration_seconds ?? ''} onChange={(e) => updateSubmissionSpec({ live: { ...formSpec.live, min_duration_seconds: e.target.value ? Number(e.target.value) : null } })} /></label>
+              <label><span>直播分区</span><input className="field" value={formSpec.live.required_category} onChange={(e) => updateSubmissionSpec({ live: { ...formSpec.live, required_category: e.target.value } })} /></label>
+              <label className="wide"><span>直播标题关键词</span><input className="field" value={formSpec.live.title_keywords.join('，')} onChange={(e) => updateSubmissionSpec({ live: { ...formSpec.live, title_keywords: splitLines(e.target.value) } })} /></label>
+              {([['original_required','原创'],['first_publish_required','首发'],['exclusive_required','独家']] as const).map(([key,label]) => <label key={key}><span>{label}要求</span><select className="field" value={formSpec[key] == null ? 'unknown' : formSpec[key] ? 'yes' : 'no'} onChange={(e) => updateSubmissionSpec({ [key]: e.target.value === 'unknown' ? null : e.target.value === 'yes' } as Partial<CampaignSubmissionSpec>)}><option value="unknown">未说明</option><option value="yes">必须</option><option value="no">明确不要求</option></select></label>)}
+              <label><span>最少投稿数</span><input className="field" type="number" min="0" value={formSpec.min_entries ?? ''} onChange={(e) => updateSubmissionSpec({ min_entries: e.target.value ? Number(e.target.value) : null })} /></label>
+              <label><span>最多投稿数</span><input className="field" type="number" min="0" value={formSpec.max_entries ?? ''} onChange={(e) => updateSubmissionSpec({ max_entries: e.target.value ? Number(e.target.value) : null })} /></label>
+              <label className="wide"><span>投稿方式</span><input className="field" value={formSpec.submission_method} onChange={(e) => updateSubmissionSpec({ submission_method: e.target.value })} placeholder="活动页报名 / 指定分区投稿 / 话题页投稿…" /></label>
+              <label className="wide"><span>指定 @账号（逗号或换行分隔）</span><input className="field" value={formSpec.required_mentions.join('，')} onChange={(e) => updateSubmissionSpec({ required_mentions: splitLines(e.target.value) })} /></label>
+              <label className="wide"><span>指定音乐（逗号或换行分隔）</span><input className="field" value={formSpec.required_music.join('，')} onChange={(e) => updateSubmissionSpec({ required_music: splitLines(e.target.value) })} /></label>
               <label className="wide"><span>奖品 / 奖励（每行一条）</span><textarea className="field" value={prizesText} onChange={(e) => setPrizesText(e.target.value)} placeholder="例如：瓜分 5 万元奖金池 / 流量扶持 / 实物奖品" /></label>
               <label className="wide"><span>获奖条件（每行一条）</span><textarea className="field" value={winningConditionsText} onChange={(e) => setWinningConditionsText(e.target.value)} placeholder="例如：单稿播放量 ≥ 20 万；进入评审 TOP 10" /></label>
               <label className="wide"><span>奖励规则（每行一条）</span><textarea className="field" value={rewardRulesText} onChange={(e) => setRewardRulesText(e.target.value)} /></label>
@@ -834,7 +1040,7 @@ export default function CampaignsPage({
               <label className="wide"><span>AI 使用要求</span><input className="field" value={form.ai_policy || ''} onChange={(e) => setForm({ ...form, ai_policy: e.target.value || 'unknown' })} placeholder="未说明 / 允许辅助 / 禁止自动生成…" /></label>
               <label className="wide"><span>来源原文 / 补充备注</span><textarea className="field" value={form.note || ''} onChange={(e) => setForm({ ...form, note: e.target.value })} /></label>
             </div>
-            <div className="campaign-import-foot"><span>导入内容默认标记为“用户导入”，不会冒充官方核验。</span><div><button className="btn btn-sm" onClick={() => setForm(null)}>取消</button><button className="btn btn-sm btn-primary" disabled={saving || !form.title.trim()} onClick={() => void submitCampaign()}>{saving ? '保存中…' : editId ? '保存新规则版本' : '导入活动'}</button></div></div>
+            <div className="campaign-import-foot"><span>保存前请确认解析结果；用户确认后的规则不会被后续自动采集静默覆盖。</span><div><button className="btn btn-sm" onClick={() => setForm(null)}>取消</button><button className="btn btn-sm btn-primary" disabled={saving || !form.title.trim()} onClick={() => void submitCampaign()}>{saving ? '保存中…' : editId ? '保存新规则版本' : '确认并导入'}</button></div></div>
           </div>
         </div>
       )}

@@ -175,6 +175,7 @@ export default function ModelSettings() {
               {routeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
             {purpose.id === 'x_campaign_discovery' && <small className="r2-muted">使用 Grok/xAI 时需绑定 xAI Provider，并单独通过 X Search 能力测试。X Developer API 在活动数据源中配置。</small>}
+            {purpose.id === 'default_agent' && <small className="r2-muted">B站活动规则补全默认跟随这里的模型；脚本能解析完整时不会调用模型。</small>}
           </label>;
         })}
       </div>

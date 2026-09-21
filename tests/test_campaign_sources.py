@@ -8,7 +8,10 @@ import pytest
 
 from ripple.accounts import AccountInput
 from ripple.ai_providers import AIProviderService
-from ripple.campaign_sources import CampaignSourceService, _bili_reward_summary, _bilibili_detail_from_html
+from ripple.campaign_sources import (
+    CampaignSourceService, _bili_reward_summary, _bilibili_detail_from_html,
+    _bilibili_rule_fingerprint_text,
+)
 from ripple.publishing import WorkflowError
 from ripple.workspace import WorkspaceService
 from ripple.xhs_browser import _campaign_candidates as xhs_candidates
@@ -55,6 +58,30 @@ def test_campaign_scheduler_intervals_and_failed_attempt_backoff(source_service)
     state["last_sync"]["bilibili"]["at"] = now - 31 * 60
     service._write(state)
     assert "bilibili" in service.due_platforms()
+
+
+def test_sync_state_preserves_last_success_time_and_count_after_failure(source_service):
+    _, service = source_service
+    service._record_sync("bilibili", status="fresh", count=15, provider="fixture")
+    first = next(row for row in service.public_state()["items"] if row["platform"] == "bilibili")["last_sync"]
+    assert first["last_success_at"] > 0
+    assert first["last_success_count"] == 15
+
+    service._record_sync("bilibili", status="error", count=0, error="temporary", provider="fixture")
+    second = next(row for row in service.public_state()["items"] if row["platform"] == "bilibili")["last_sync"]
+    assert second["status"] == "error"
+    assert second["count"] == 0
+    assert second["last_success_at"] == first["last_success_at"]
+    assert second["last_success_count"] == 15
+    assert second["last_attempt_at"] >= first["last_attempt_at"]
+    assert second["next_run_at"] == second["last_attempt_at"] + 30 * 60
+
+
+def test_rule_fingerprint_text_ignores_dynamic_metrics():
+    first = _bilibili_rule_fingerprint_text(["投稿要求：原创视频至少30秒", "浏览量：1000", "热度 20万"])
+    second = _bilibili_rule_fingerprint_text(["投稿要求：原创视频至少30秒", "浏览量：9999", "热度 99万"])
+    assert first == second
+    assert "浏览量" not in first and "热度" not in first
 
 
 def test_bilibili_priority_detail_rules_cover_saved_linked_and_near_deadline(source_service):
@@ -112,6 +139,25 @@ def test_bilibili_detail_parser_does_not_invent_image_only_rules():
     assert result["prizes"] == []
     assert result["winning_conditions"] == []
     assert result["reward_rules"] == []
+
+
+def test_bilibili_detail_rejects_off_domain_redirect(source_service):
+    _, service = source_service
+
+    class Response:
+        status_code = 302
+        headers = {"location": "https://example.com/steal"}
+        content = b""
+        text = ""
+        def raise_for_status(self):
+            return None
+
+    class Client:
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+    with pytest.raises(WorkflowError, match="非 B站"):
+        service._bilibili_detail(Client(), "https://www.bilibili.com/blackboard/a.html", {}, force=True, strict=True, ttl=0)
 
 
 def test_bilibili_list_description_is_only_used_as_reward_when_it_is_reward_like():

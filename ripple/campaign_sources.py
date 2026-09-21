@@ -6,6 +6,7 @@ because a free/self-hosted source is missing.
 from __future__ import annotations
 
 import base64
+import html as html_lib
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
@@ -15,12 +16,13 @@ import re
 import threading
 import time
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 import uuid
 
 import httpx
 
 from .ai_providers import AIProviderService
+from .campaign_enrichment import evidence_fingerprint, infer_submission_spec
 from .publishing import WorkflowError
 from .secrets import protect
 
@@ -206,6 +208,38 @@ def _bili_reward_summary(value: str) -> str:
     return text[:600]
 
 
+def _bilibili_rule_fingerprint_text(lines: list[str]) -> str:
+    signals = ("规则", "投稿", "作品", "奖励", "奖金", "奖池", "奖品", "参与", "报名", "要求", "条件", "门槛", "原创", "首发", "视频", "图文", "直播", "时长", "话题", "分区", "风格", "方向", "比例", "分辨率", "至少", "不超过", "≥", "≤")
+    dynamic = re.compile(r"^(?:浏览|播放|点赞|评论|收藏|排名|热度|人气)(?:量|数)?\s*[:：]?\s*[\d.,万wW亿]+$")
+    kept: list[str] = []
+    for raw in lines:
+        text = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not text or dynamic.fullmatch(text):
+            continue
+        if any(token in text for token in signals):
+            kept.append(text)
+    return "\n".join(dict.fromkeys(kept))[:24000]
+
+
+def _bilibili_fallback_evidence_text(html: str) -> str:
+    raw = str(html or "")[:MAX_RESPONSE]
+    pieces: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(r"[\"']([^\"'<>]{2,420}[\u4e00-\u9fff][^\"'<>]{0,180})[\"']", raw):
+        text = html_lib.unescape(match.group(1)).replace("\\n", " ").replace("\\t", " ")
+        text = re.sub(r"\\s+", " ", text).strip()
+        if len(text) > 500 or text.startswith(("http://", "https://", "//")):
+            continue
+        if not any(word in text for word in ("活动", "投稿", "作品", "奖励", "奖金", "视频", "图文", "直播", "原创", "首发", "话题", "报名", "播放", "粉丝", "时长")):
+            continue
+        key = text.casefold()
+        if key not in seen:
+            seen.add(key); pieces.append(text)
+        if len(pieces) >= 180:
+            break
+    return "\n".join(pieces)[:24000]
+
+
 def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
     """Extract only explicit, machine-readable rule data from Bilibili EVA pages.
 
@@ -236,6 +270,33 @@ def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
                 walk(child, depth + 1)
 
     walk(data)
+    evidence_strings: list[str] = []
+    evidence_seen: set[str] = set()
+
+    def collect_strings(node: Any, depth: int = 0) -> None:
+        if depth > 18 or len(evidence_strings) >= 240:
+            return
+        if isinstance(node, dict):
+            for value in node.values():
+                collect_strings(value, depth + 1)
+        elif isinstance(node, list):
+            for value in node[:500]:
+                collect_strings(value, depth + 1)
+        elif isinstance(node, str):
+            text = re.sub(r"\s+", " ", node).strip()
+            if not (2 <= len(text) <= 500):
+                return
+            if text.startswith(("http://", "https://", "//", "data:")) or re.fullmatch(r"[0-9A-Fa-f_-]{16,}", text):
+                return
+            if not (re.search(r"[\u4e00-\u9fff]", text) or re.search(r"(?:投稿|活动|奖励|奖金|视频|图文|直播|原创|首发|时长|话题|播放|粉丝|报名|作品)", text)):
+                return
+            key = text.casefold()
+            if key not in evidence_seen:
+                evidence_seen.add(key); evidence_strings.append(text)
+
+    collect_strings(data)
+    evidence_text = "\n".join(evidence_strings)[:24000]
+    fingerprint_text = _bilibili_rule_fingerprint_text(evidence_strings)
     topics: list[str] = []
     eligibility: list[str] = []
     content_requirements: list[str] = []
@@ -311,6 +372,9 @@ def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
         "winning_conditions": winning_conditions,
         "reward_rules": reward_rules,
         "required_topics": required_topics,
+        "submission_spec": infer_submission_spec(evidence_text),
+        "_agent_evidence_text": evidence_text,
+        "rule_evidence_fingerprint": evidence_fingerprint({"text": fingerprint_text, "topics": required_topics, "prizes": prizes, "winning_conditions": winning_conditions, "submission_spec": infer_submission_spec(fingerprint_text)}),
     }
 
 
@@ -435,7 +499,7 @@ class CampaignSourceService:
 
     def next_sync_at(self, platform: str) -> int:
         row = self._state()["last_sync"].get(platform, {})
-        at = int(row.get("at") or 0)
+        at = int(row.get("last_attempt_at") or row.get("at") or 0)
         return at + self.sync_interval(platform) if at else 0
 
     def public_state(self) -> dict[str, Any]:
@@ -507,15 +571,19 @@ class CampaignSourceService:
             row["sync_interval_seconds"] = self.sync_interval(platform)
             row["next_sync_at"] = self.next_sync_at(platform) if row.get("automatic") else 0
         return {"items": rows, "automatic_count": sum(1 for row in rows if row["automatic"]),
-                "revision": state["revision"]}
+                "revision": state["revision"], "server_now": int(time.time())}
 
     def _record_sync(self, platform: str, *, status: str, count: int = 0, error: str = "",
                      provider: str = "", fallback_used: bool = False) -> None:
-        state = self._state()
+        state = self._state(); previous = state["last_sync"].get(platform, {})
+        now = int(time.time())
+        success_at = now if status == "fresh" else int(previous.get("last_success_at") or (previous.get("at") if previous.get("status") == "fresh" else 0) or 0)
+        success_count = int(count) if status == "fresh" else int(previous.get("last_success_count") or (previous.get("count") if previous.get("status") == "fresh" else 0) or 0)
         state["last_sync"][platform] = {
-            "at": int(time.time()), "status": status, "count": int(count),
-            "error": str(error or "")[:300], "provider": provider,
-            "fallback_used": bool(fallback_used),
+            "at": now, "last_attempt_at": now, "last_success_at": success_at,
+            "last_success_count": success_count, "next_run_at": now + self.sync_interval(platform),
+            "status": status, "count": int(count), "error": str(error or "")[:300],
+            "provider": provider, "fallback_used": bool(fallback_used),
         }
         self._write(state)
 
@@ -525,8 +593,8 @@ class CampaignSourceService:
         # Manual force refresh is the explicit bypass; the background scheduler
         # must never hammer a broken or paid provider every two seconds.
         return bool(
-            float(row.get("at") or 0) > 0
-            and time.time() - float(row.get("at") or 0) < self.sync_interval(platform)
+            float(row.get("last_attempt_at") or row.get("at") or 0) > 0
+            and time.time() - float(row.get("last_attempt_at") or row.get("at") or 0) < self.sync_interval(platform)
         )
 
     def due_platforms(self) -> list[str]:
@@ -572,15 +640,43 @@ class CampaignSourceService:
         cached = cache.get(url) if isinstance(cache.get(url), dict) else {}
         if not force and cached and now - int(cached.get("fetched_at") or 0) < max(0, int(ttl)):
             detail = cached.get("detail")
-            return detail if isinstance(detail, dict) else {}
+            # Pre-enrichment cache rows did not carry a rule fingerprint. Re-fetch
+            # them once so script-first Agent fallback can start immediately after upgrade.
+            if isinstance(detail, dict) and "rule_evidence_fingerprint" in detail:
+                return detail
         try:
-            response = client.get(url, headers={"Accept": "text/html,application/xhtml+xml"})
+            current = url
+            response = None
+            for _hop in range(4):
+                response = client.get(current, headers={"Accept": "text/html,application/xhtml+xml"}, follow_redirects=False)
+                if response.status_code not in {301, 302, 303, 307, 308}:
+                    break
+                location = str(response.headers.get("location") or "").strip()
+                target = _safe_url(urljoin(current, location), ("bilibili.com", "www.bilibili.com"))
+                if not target:
+                    raise WorkflowError("B站活动页重定向到了非 B站地址，已拒绝继续读取。", 422)
+                current = target
+            else:
+                raise WorkflowError("B站活动页重定向次数过多。", 502)
+            if response is None:
+                raise WorkflowError("B站活动详情暂时无法读取。", 502)
             response.raise_for_status()
             if len(response.content) > MAX_RESPONSE:
                 if strict:
                     raise WorkflowError("B站活动详情响应超过安全上限。", 502)
                 return {}
             detail = _bilibili_detail_from_html(response.text)
+            if not isinstance(detail, dict):
+                detail = {}
+            if not str(detail.get("_agent_evidence_text") or "").strip():
+                evidence_text = _bilibili_fallback_evidence_text(response.text)
+                detail["_agent_evidence_text"] = evidence_text
+                detail["submission_spec"] = infer_submission_spec(evidence_text)
+                fp_text = _bilibili_rule_fingerprint_text(evidence_text.splitlines())
+                detail["rule_evidence_fingerprint"] = evidence_fingerprint({"text": fp_text, "submission_spec": infer_submission_spec(fp_text)}) if fp_text else ""
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", response.text, flags=re.I | re.S)
+            if title_match:
+                detail["_page_title"] = re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"<[^>]+>", " ", title_match.group(1)))).strip()[:240]
         except WorkflowError:
             raise
         except (httpx.HTTPError, ValueError, TypeError):
@@ -590,6 +686,53 @@ class CampaignSourceService:
         cache[url] = {"fetched_at": now, "detail": detail}
         return detail
 
+
+    def bilibili_page_evidence(self, url: str, *, force: bool = False) -> dict[str, Any]:
+        safe = _safe_url(str(url or ""), ("bilibili.com", "www.bilibili.com"))
+        if not safe:
+            raise WorkflowError("仅支持读取 B站官方活动 URL。", 422)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
+            "Referer": "https://www.bilibili.com/blackboard/activity-list.html",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        with self._lock:
+            cache = _read(self.bilibili_detail_cache_path, 4 * 1024 * 1024)
+            with httpx.Client(timeout=httpx.Timeout(20, connect=8), trust_env=False, follow_redirects=True, headers=headers) as client:
+                detail = self._bilibili_detail(client, safe, cache, force=force, strict=True, ttl=0 if force else BILI_DETAIL_TTL)
+            _atomic(self.bilibili_detail_cache_path, dict(list(cache.items())[-200:]))
+        return {
+            "platform": "bilibili", "source_url": safe,
+            "page_title": str(detail.get("_page_title") or "")[:240],
+            "evidence_text": str(detail.get("_agent_evidence_text") or "")[:24000],
+            "evidence_fingerprint": str(detail.get("rule_evidence_fingerprint") or ""),
+            "structured": {
+                key: deepcopy(detail.get(key)) for key in (
+                    "eligibility", "content_requirements", "prizes", "winning_conditions",
+                    "reward_rules", "required_topics", "submission_spec", "summary_hint",
+                ) if detail.get(key)
+            },
+        }
+
+    def preview_bilibili_url(self, url: str) -> dict[str, Any]:
+        evidence = self.bilibili_page_evidence(url, force=True)
+        title = re.sub(r"(?:[-_]?(?:哔哩哔哩|bilibili).*)$", "", str(evidence.get("page_title") or ""), flags=re.I).strip(" -_|·")
+        structured = evidence.get("structured") if isinstance(evidence.get("structured"), dict) else {}
+        return {
+            "title": title or "B站创作活动", "platform": "bilibili", "platform_label": "B站",
+            "organizer": "B站", "organizer_type": "platform", "activity_type": "创作活动",
+            "summary": str(structured.get("summary_hint") or "")[:1200],
+            "eligibility": structured.get("eligibility", []),
+            "content_requirements": structured.get("content_requirements", []),
+            "prizes": structured.get("prizes", []),
+            "winning_conditions": structured.get("winning_conditions", []),
+            "reward_rules": structured.get("reward_rules", []),
+            "required_topics": structured.get("required_topics", []),
+            "submission_spec": structured.get("submission_spec", {}),
+            "source_url": evidence["source_url"], "source_type": "user_import",
+            "rule_evidence_fingerprint": evidence.get("evidence_fingerprint", ""),
+            "_agent_evidence": evidence,
+        }
 
     def verify_bilibili_campaign(self, campaign: dict[str, Any]) -> dict[str, Any]:
         url = _safe_url(str(campaign.get("source_url") or ""), ("bilibili.com", "www.bilibili.com"))
@@ -629,6 +772,8 @@ class CampaignSourceService:
             "winning_conditions": detail.get("winning_conditions", []),
             "reward_rules": detail.get("reward_rules", []),
             "required_topics": detail.get("required_topics", []),
+            "submission_spec": detail.get("submission_spec", {}),
+            "rule_evidence_fingerprint": str(detail.get("rule_evidence_fingerprint") or ""),
             "source_url": url,
             "source_type": "platform_public",
             "source_status": "verified",
@@ -685,6 +830,8 @@ class CampaignSourceService:
                             "winning_conditions": detail.get("winning_conditions", []),
                             "reward_rules": detail.get("reward_rules", []),
                             "required_topics": detail.get("required_topics", []),
+                            "submission_spec": detail.get("submission_spec", {}),
+                            "rule_evidence_fingerprint": str(detail.get("rule_evidence_fingerprint") or ""),
                             "source_url": url, "source_type": "platform_public",
                             "source_status": "verified", "note": desc[:3000],
                             "evidence": {"kind": "platform_public_detail" if detail else "platform_public_list", "url": url,

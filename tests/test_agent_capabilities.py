@@ -118,6 +118,16 @@ def test_skill_injection_grants_only_manifest_bound_tools_and_raw_tool_stays_int
         reg.resolve_turn("s", state, skills(), turn_tools=["bash"])
 
 
+def test_campaign_enrichment_skill_grants_only_managed_campaign_fetch(tmp_path):
+    reg = AgentCapabilityRegistry(tmp_path); state = models(reg)
+    rows = skills() + [{"name": "skill-campaign-enrichment", "description": "bilibili rules", "layer": "plan", "apiConfigured": True}]
+    reg.update_session("campaign", {"enabled_tools": []}, state, rows)
+    turn = reg.resolve_turn("campaign", state, rows, turn_skills=["skill-campaign-enrichment"])
+    assert turn["skills"] == ["skill-campaign-enrichment"]
+    assert turn["tools"] == ["ripple_campaign_fetch"]
+    assert "webfetch" not in turn["tools"] and "websearch" not in turn["tools"]
+
+
 def test_plugin_expands_only_registered_bundle_capabilities(tmp_path):
     reg = AgentCapabilityRegistry(tmp_path); state = models(reg)
     reg.update_session("s", {"enabled_plugins": ["xiaohongshu_ops"], "enabled_tools": []}, state, skills())

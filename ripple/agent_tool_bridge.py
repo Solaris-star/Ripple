@@ -246,6 +246,10 @@ class RippleAgentToolBridge:
             return await self._call("ripple_operation", {"operation": operation, "input": input, "source": source or {}})
         add(ripple_operation, name="ripple_operation", description=INTERNAL_TOOLS["ripple_operation"]["description"])
 
+        async def ripple_campaign_fetch(campaign_id: str = "", url: str = ""):
+            return await self._call("ripple_campaign_fetch", {"campaign_id": campaign_id, "url": url})
+        add(ripple_campaign_fetch, name="ripple_campaign_fetch", description=INTERNAL_TOOLS["ripple_campaign_fetch"]["description"])
+
         async def ripple_content_draft(title: str | None = None, body: str | None = None, tags: str | None = None,
                                        media: list[str] | None = None, content_id: str | None = None,
                                        expected_version: str | None = None):
