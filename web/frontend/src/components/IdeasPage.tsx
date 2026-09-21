@@ -5,6 +5,8 @@ import { IconIdea, IconEdit, IconTrash, IconChat, IconCalendar, IconChevron, Ico
 import { loadTrendSelection, TREND_PLATFORMS } from '../lib/trendPrefs';
 import { executeStructuredOperation, fetchStructuredOperations } from '../lib/ripple';
 import type { OperationResult, TopicEvaluationOutput } from '../lib/ripple';
+import { PlatformIcon } from './PlatformBrand';
+import { platformDisplayName } from '../lib/platforms';
 
 interface IdeasPageProps {
   onUseTopic: (input: string | TopicUseContext) => void;
@@ -254,7 +256,7 @@ export default function IdeasPage({ onUseTopic, persona, aiReady, personas, onPe
                       <p className="idea-rec-angle">{rec.angle}</p>
                       <p className="idea-rec-reason">{rec.reason}</p>
                       <div className="idea-rec-tags">
-                        {rec.platforms.map((p) => <span key={p}>{p}</span>)}
+                        {rec.platforms.map((p) => <span className="idea-platform-tag" key={p}><PlatformIcon platform={p} size={12} />{platformDisplayName(p)}</span>)}
                         {rec.trend_refs.map((p) => <span className="trend-ref" key={p}>热点 · {p}</span>)}
                       </div>
                     </div>

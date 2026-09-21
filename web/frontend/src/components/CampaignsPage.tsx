@@ -13,6 +13,8 @@ import type { Account } from '../lib/ripple';
 import {
   IconBookmark, IconCalendar, IconCheck, IconCompass, IconIdea, IconRefresh, IconSkills,
 } from './icons';
+import { PlatformBadge, PlatformIcon } from './PlatformBrand';
+import { platformDisplayName } from '../lib/platforms';
 
 interface CampaignsPageProps {
   onUseTopic: (input: string | TopicUseContext) => void;
@@ -116,7 +118,7 @@ function sourceLabel(campaign: Campaign): string {
 }
 
 function platformLabel(key: string): string {
-  return PLATFORMS.find((p) => p.key === key)?.label || key;
+  return platformDisplayName(key);
 }
 
 export default function CampaignsPage({
@@ -311,7 +313,7 @@ export default function CampaignsPage({
   }), [campaigns]);
 
   const trends = useMemo(() => trendGroups.flatMap((group) =>
-    group.items.slice(0, 4).map((item) => ({ ...item, platform: group.label, status: group.status }))).slice(0, 10), [trendGroups]);
+    group.items.slice(0, 4).map((item) => ({ ...item, platform: group.label, platformKey: group.platform, status: group.status }))).slice(0, 10), [trendGroups]);
 
   const openNew = () => {
     setEditId(null);
@@ -509,7 +511,7 @@ export default function CampaignsPage({
           const configurable = ['x', 'xiaohongshu', 'douyin'].includes(source.platform);
           return <article key={source.id || source.platform} className={`campaign-source-status source-${source.status || 'unknown'}`}>
             <div className="campaign-source-status-head">
-              <strong>{source.label}</strong>
+              <div className="campaign-source-brand"><PlatformIcon platform={source.platform} size={18} /><strong>{source.label}</strong></div>
               <span>{SOURCE_HEALTH[source.status || ''] || source.status || (source.automatic ? '自动同步' : '支持导入')}</span>
             </div>
             <p>{source.detail}</p>
@@ -589,7 +591,7 @@ export default function CampaignsPage({
               return (
                 <article className="card campaign-card" key={campaign.id}>
                   <div className="campaign-card-top">
-                    <div className={`campaign-platform platform-${campaign.platform}`}>{campaign.platform_label}</div>
+                    <div className={`campaign-platform platform-${campaign.platform}`}><PlatformIcon platform={campaign.platform} size={24} /><span>{campaign.platform_label}</span></div>
                     <div>
                       <h3>{campaign.title}</h3>
                       <p>主办方 · {campaign.organizer || '未说明'}</p>
@@ -626,7 +628,7 @@ export default function CampaignsPage({
           {trends.length === 0 && <p className="campaign-trends-empty">当前没有可用热点。活动仍可单独生成选题。</p>}
           {trends.map((item, index) => (
             <a key={`${item.platform}-${item.title}-${index}`} href={item.url || undefined} target="_blank" rel="noreferrer">
-              <b>{index + 1}</b><span><strong>{item.title}</strong><small>{item.platform}{item.hot ? ` · ${item.hot}` : ''}</small></span>
+              <b>{index + 1}</b><span><strong>{item.title}</strong><small><PlatformIcon platform={item.platformKey} size={12} /> {item.platform}{item.hot ? ` · ${item.hot}` : ''}</small></span>
             </a>
           ))}
           <p className="campaign-trends-note">AI 只会引用实际读取到的热点；没有自然关联时允许不绑定热点。</p>
@@ -636,7 +638,7 @@ export default function CampaignsPage({
       {selected && (
         <div className="campaign-drawer-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setSelected(null); }}>
           <aside className="campaign-drawer">
-            <header><div><span>{selected.platform_label}</span><h2>活动详情</h2></div><button onClick={() => setSelected(null)}>×</button></header>
+            <header><div><PlatformBadge platform={selected.platform} label={selected.platform_label} size="xs" /><h2>活动详情</h2></div><button onClick={() => setSelected(null)}>×</button></header>
             <div className="campaign-drawer-title">
               <h3>{selected.title}</h3>
               <p>主办方 · {selected.organizer || '未说明'} · {STATUS[selected.status] || selected.status}</p>

@@ -5,6 +5,7 @@ import { IconFire, IconRefresh, IconBookmark, IconCheck, IconSkills } from './ic
 import { api as rippleApi, xhsFeed, xhsSearch } from '../lib/ripple';
 import type { Account, XhsNoteSummary, XhsMetrics } from '../lib/ripple';
 import { TREND_PLATFORMS, ALL_TREND_KEYS, loadTrendSelection, saveTrendSelection } from '../lib/trendPrefs';
+import { PlatformIcon } from './PlatformBrand';
 
 interface TrendsPageProps {
   onUseTopic: (title: string) => void;
@@ -127,14 +128,14 @@ export default function TrendsPage({ onUseTopic, onBreakdown }: TrendsPageProps)
             const next = prev.length === ALL_TREND_KEYS.length ? [] : [...ALL_TREND_KEYS];
             saveTrendSelection(next); return next;
           })}>全部</button>
-        {TREND_PLATFORMS.map((p) => <button key={p.key} className={`chip ${selected.includes(p.key) ? 'active' : ''}`} onClick={() => toggle(p.key)}>{p.label}</button>)}
+        {TREND_PLATFORMS.map((p) => <button key={p.key} className={`chip trend-platform-chip ${selected.includes(p.key) ? 'active' : ''}`} onClick={() => toggle(p.key)}><PlatformIcon platform={p.key} size={13} />{p.label}</button>)}
       </div>
 
       {error && <div className="notice-error">{error}</div>}
 
       <section className="xhs-radar-panel card">
         <div className="xhs-radar-head">
-          <div><strong>小红书运营采样</strong><small>使用所选已连接账号的独立登录 Profile，只读推荐流或关键词结果；不会点赞、收藏、评论或发布。</small></div>
+          <div className="xhs-radar-brand"><PlatformIcon platform="xiaohongshu" size={18} /><div><strong>小红书运营采样</strong><small>使用所选已连接账号的独立登录 Profile，只读推荐流或关键词结果；不会点赞、收藏、评论或发布。</small></div></div>
           <select aria-label="小红书运营采样账号" value={xhsCandidate} onChange={(e) => { setXhsCandidate(e.target.value); setXhsOpsItems([]); setXhsOpsScope(''); }}>
             <option value="">选择已连接小红书账号</option>
             {xhsAccounts.map((a) => <option value={a.id} key={a.id}>{a.label}{a.identity?.name ? ` · @${a.identity.name}` : ''}</option>)}
@@ -160,7 +161,7 @@ export default function TrendsPage({ onUseTopic, onBreakdown }: TrendsPageProps)
       <div className="trend-grid">
         {groups.map((g) => (
           <div key={g.platform} className="card trend-col">
-            <div className="trend-col-head"><span>{g.label}<span className="trend-count">{g.items.length}</span></span><span className={`trend-source ${g.status === 'error' && g.attempts.some((a) => a.status === 'on_demand') ? 'trend-source-stale' : `trend-source-${g.status}`}`} title={g.attempts.map((a) => `${a.provider}: ${a.status}`).join('\n')}>{g.status === 'fresh' ? g.source : g.status === 'stale' ? `缓存 · ${g.source}` : g.attempts.some((a) => a.status === 'on_demand') ? '按需读取' : '数据源异常'}</span></div>
+            <div className="trend-col-head"><span className="trend-platform-brand"><PlatformIcon platform={g.platform} size={16} />{g.label}<span className="trend-count">{g.items.length}</span></span><span className={`trend-source ${g.status === 'error' && g.attempts.some((a) => a.status === 'on_demand') ? 'trend-source-stale' : `trend-source-${g.status}`}`} title={g.attempts.map((a) => `${a.provider}: ${a.status}`).join('\n')}>{g.status === 'fresh' ? g.source : g.status === 'stale' ? `缓存 · ${g.source}` : g.attempts.some((a) => a.status === 'on_demand') ? '按需读取' : '数据源异常'}</span></div>
             {g.status === 'stale' && <div className="trend-state-note">当前源刷新失败，显示 {new Date(g.fetched_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 的缓存。</div>}
             <div className="trend-list">
               {g.items.length === 0 && !loading && <div className="trend-empty"><div>{g.error || '当前没有可用数据。'}</div>{g.platform === 'xiaohongshu' && <div className="trend-xhs-auth"><button className="btn btn-sm" disabled={xhsLoading} onClick={() => void readXiaohongshu()}>{xhsLoading ? '读取中…' : '重新获取公开热点'}</button>{xhsAccounts.length > 0 && <button className="btn btn-sm" disabled={xhsLoading || !xhsCandidate} onClick={() => void readXiaohongshu(xhsCandidate)}>使用所选账号只读获取</button>}</div>}{g.platform === 'xiaohongshu' && <div className="trend-empty-hint">公开聚合源失败时会保留最近成功缓存；已连接账号只用于你明确发起的只读读取。</div>}</div>}

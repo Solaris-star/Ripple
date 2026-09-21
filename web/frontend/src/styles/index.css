@@ -296,6 +296,17 @@ body {
 }
 .chip:hover { border-color: var(--border-strong); }
 .chip.active { background: var(--accent-gradient); color: #fff; border-color: transparent; }
+.trend-platform-chip { display: inline-flex; align-items: center; gap: 5px; }
+.trend-platform-chip.active .platform-brand-icon { color: currentColor !important; }
+.trend-platform-brand { display: inline-flex; align-items: center; gap: 5px; }
+.idea-platform-tag { display: inline-flex !important; align-items: center; gap: 4px; }
+.onboarding-platform-chip { display: inline-flex; align-items: center; gap: 5px; }
+.onboarding-platform-chip.active .platform-brand-icon { color: currentColor !important; }
+.onboarding-platform-label { display: flex !important; align-items: center; gap: 5px; }
+
+.xhs-radar-brand { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.xhs-radar-brand > div { min-width: 0; }
+
 
 .field {
   width: 100%; padding: 10px 13px;
@@ -843,6 +854,10 @@ textarea.field { resize: vertical; min-height: 90px; }
 .cal-event { display: flex; align-items: center; gap: 5px; font-size: 14px; padding: 2px 6px; border-radius: 5px; background: color-mix(in srgb, var(--ev) 13%, transparent); cursor: pointer; }
 .cal-event-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ev); flex-shrink: 0; }
 .cal-event-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); }
+.cal-event .platform-brand-icon { flex-shrink: 0; }
+.cal-platform-chip { display: inline-flex; align-items: center; gap: 5px; }
+.cal-platform-chip.active .platform-brand-icon { color: currentColor !important; }
+
 
 /* ============ 工作台 ============ */
 .dash-hero { max-width: 1100px; margin: 0 auto 8px; }
@@ -1029,12 +1044,42 @@ textarea.field { resize: vertical; min-height: 90px; }
 .r2-topic-handoff header strong { display: block; font-size: 14px; color: var(--text); }
 .r2-topic-handoff header span { display: block; margin-top: 2px; font-size: 12px; color: var(--text-secondary); }
 .r2-topic-handoff-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
-.r2-topic-handoff-tags > span { padding: 2px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-end); font-size: 11px; }
+.r2-topic-handoff-tags > span { display: inline-flex; align-items: center; gap: 4px; padding: 2px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-end); font-size: 11px; }
 .r2-topic-handoff-row { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 7px; margin-top: 7px; font-size: 12px; line-height: 1.5; }
 .r2-topic-handoff-row b { color: var(--text-secondary); }
 .r2-topic-handoff-row span { color: var(--text); }
 .r2-topic-handoff-row.pending { padding: 6px 8px; border-radius: 7px; background: #fff8e9; }
 [data-theme="dark"] .r2-topic-handoff-row.pending { background: color-mix(in srgb, #d7912c 13%, transparent); }
+
+/* ============ 平台品牌标识 ============ */
+.platform-brand-icon { display: inline-flex; align-items: center; justify-content: center; object-fit: contain; flex: 0 0 auto; vertical-align: middle; }
+.platform-brand-fallback { font-size: 11px; font-weight: 750; line-height: 1; }
+.platform-brand-badge { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); color: var(--text-secondary); white-space: nowrap; line-height: 1; vertical-align: middle; }
+.platform-brand-badge > span:last-child { overflow: hidden; text-overflow: ellipsis; }
+.platform-brand-badge-xs { min-height: 20px; padding: 2px 6px; font-size: 11px; }
+.platform-brand-badge-sm { min-height: 24px; padding: 3px 8px; font-size: 12px; }
+.platform-brand-badge-md { min-height: 30px; padding: 5px 10px; font-size: 13px; font-weight: 600; }
+.platform-brand-badge.compact { width: 26px; height: 26px; padding: 0; justify-content: center; border-radius: 7px; }
+.platform-brand-surface-x { background: #fff; color: #111; border-color: #dfe1e5; }
+.platform-brand-surface-xiaohongshu { background: #fff1f3; color: #ff2442; border-color: #ffd8df; }
+.platform-brand-surface-douyin,.platform-brand-surface-tiktok { background: #f5f6f7; color: #161823; border-color: #e1e4e8; }
+.platform-brand-surface-bilibili { background: #eef9fe; color: #00aeec; border-color: #d6f1fb; }
+.platform-brand-surface-wechat { background: #eefaf2; color: #07c160; border-color: #d7f1df; }
+.platform-brand-surface-weixin-channels { background: #f1f9f4; color: #078d4d; border-color: #d8eee0; }
+.platform-brand-surface-zhihu { background: #eef5ff; color: #1772f6; border-color: #d8e8ff; }
+.platform-brand-surface-kuaishou { background: #fff3ed; color: #ff4906; border-color: #ffe0d1; }
+.platform-brand-surface-weibo { background: #fff1f1; color: #e6162d; border-color: #ffd8db; }
+.platform-brand-surface-blog { background: var(--accent-soft); color: var(--accent-end); }
+:root[data-theme='dark'] .platform-brand-x,
+:root[data-theme='dark'] .platform-brand-douyin,
+:root[data-theme='dark'] .platform-brand-tiktok { color: #fff !important; }
+:root[data-theme='dark'] .platform-brand-surface-x { background: #17191d; color: #fff; border-color: #373b43; }
+:root[data-theme='dark'] .platform-brand-surface-douyin,
+:root[data-theme='dark'] .platform-brand-surface-tiktok { background: #1b1e23; color: #fff; border-color: #373b43; }
+:root[data-theme='dark'] .platform-brand-surface-xiaohongshu { background: #2a1b20; border-color: #4d2932; }
+:root[data-theme='dark'] .platform-brand-surface-bilibili { background: #16252d; border-color: #24404e; }
+:root[data-theme='dark'] .platform-brand-surface-wechat,
+:root[data-theme='dark'] .platform-brand-surface-weixin-channels { background: #17281f; border-color: #284636; }
 
 /* ============ 创作活动广场 ============ */
 .campaign-page { padding: 26px 30px 70px; }
@@ -1058,6 +1103,8 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-source-status.source-needs_config,.campaign-source-status.source-needs_login { border-color: #eadfca; }
 .campaign-source-status.source-stale,.campaign-source-status.source-error { border-color: color-mix(in srgb, var(--red) 25%, var(--border)); }
 .campaign-source-status-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.campaign-source-brand { min-width: 0; display: inline-flex; align-items: center; gap: 7px; }
+.campaign-source-brand .platform-brand-icon { flex-shrink: 0; }
 .campaign-source-status-head strong { font-size: 13px; color: var(--text); }
 .campaign-source-status-head span { padding: 2px 6px; border-radius: 999px; background: var(--surface-2); color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
 .campaign-source-status.source-ready .campaign-source-status-head span,.campaign-source-status.source-ready_fallback .campaign-source-status-head span { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
@@ -1087,13 +1134,15 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-card-top { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: start; }
 .campaign-card-top h3 { font-size: 16px; line-height: 1.45; margin: 0; }
 .campaign-card-top p { margin-top: 3px; font-size: 13px; color: var(--text-tertiary); }
-.campaign-platform { width: 58px; height: 46px; border-radius: 9px; display: flex; align-items: center; justify-content: center; text-align: center; font-weight: 750; font-size: 13px; background: var(--accent-soft); color: var(--accent-end); flex-shrink: 0; }
-.platform-x { background: #151515; color: #fff; }
-.platform-xiaohongshu { background: #fff0f2; color: #e52b46; }
-.platform-douyin { background: #eef7f8; color: #172d32; }
-.platform-bilibili { background: #eef8ff; color: #2681b8; }
-.platform-wechat { background: #effaf2; color: #16883c; }
-.platform-weixin-channels { background: #fff5e9; color: #d86f14; }
+.campaign-platform { width: 60px; height: 54px; border-radius: 9px; display: flex; flex-direction: column; gap: 3px; align-items: center; justify-content: center; text-align: center; font-weight: 700; font-size: 11px; background: var(--accent-soft); color: var(--accent-end); border: 1px solid transparent; flex-shrink: 0; }
+.campaign-platform > span { line-height: 1; }
+.platform-x { background: #fff; color: #111; border-color: #dfe1e5; }
+.platform-xiaohongshu { background: #fff1f3; color: #ff2442; border-color: #ffd8df; }
+.platform-douyin { background: #f5f6f7; color: #161823; border-color: #e1e4e8; }
+.platform-bilibili { background: #eef9fe; color: #00aeec; border-color: #d6f1fb; }
+.platform-wechat { background: #eefaf2; color: #07c160; border-color: #d7f1df; }
+.platform-weixin-channels { background: #f1f9f4; color: #078d4d; border-color: #d8eee0; }
+:root[data-theme='dark'] .campaign-platform.platform-x,:root[data-theme='dark'] .campaign-platform.platform-douyin { background: #191c21; color: #fff; border-color: #383d45; }
 .campaign-save { border: 1px solid var(--border); background: var(--surface); color: var(--text-tertiary); width: 30px; height: 30px; border-radius: 7px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
 .campaign-save:hover, .campaign-save.saved { border-color: transparent; background: var(--accent-soft); color: var(--accent-end); }
 .campaign-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
@@ -1119,7 +1168,7 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-trends > a > b { color: var(--accent-end); font-size: 13px; padding-top: 1px; }
 .campaign-trends > a span { min-width: 0; }
 .campaign-trends > a strong { display: block; font-size: 13px; font-weight: 550; line-height: 1.4; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.campaign-trends > a small { display: block; margin-top: 2px; font-size: 11px; color: var(--text-tertiary); }
+.campaign-trends > a small { display: flex; align-items: center; gap: 4px; margin-top: 2px; font-size: 11px; color: var(--text-tertiary); }
 .campaign-trends-empty, .campaign-trends-note { font-size: 12px; color: var(--text-tertiary); line-height: 1.55; padding: 10px 0; }
 .campaign-trends-note { margin-top: 6px; padding: 8px; background: var(--surface-2); border-radius: 7px; }
 .campaign-source-grid { margin-top: 14px; }
@@ -1134,7 +1183,7 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-drawer { height: 100%; width: min(500px, 94vw); background: var(--surface); border-left: 1px solid var(--border); box-shadow: -10px 0 30px rgba(0,0,0,.12); overflow-y: auto; padding: 0 20px 24px; }
 .campaign-drawer > header { position: sticky; top: 0; z-index: 2; background: var(--surface); display: flex; align-items: center; justify-content: space-between; padding: 16px 0 12px; border-bottom: 1px solid var(--border); }
 .campaign-drawer > header div { display: flex; align-items: center; gap: 8px; }
-.campaign-drawer > header span { font-size: 12px; padding: 2px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent-end); }
+.campaign-drawer > header .platform-brand-badge { margin: 0; }
 .campaign-drawer > header h2 { font-size: 18px; margin: 0; }
 .campaign-drawer > header button, .campaign-modal-head > button { width: 30px; height: 30px; border: 0; border-radius: 7px; background: transparent; color: var(--text-secondary); font-size: 22px; cursor: pointer; }
 .campaign-drawer-title { padding: 16px 0 4px; }

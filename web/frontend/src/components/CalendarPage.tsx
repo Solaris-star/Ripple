@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { fetchSchedule, createSchedule, updateSchedule, deleteSchedule, fetchScheduleContext } from '../lib/api';
 import type { ScheduleItem, ScheduleInput, ScheduleContext } from '../lib/api';
 import { IconCalendar, IconTrash, IconChevron } from './icons';
+import { PlatformIcon } from './PlatformBrand';
 
 const STATUS_META: Record<string, { label: string; color: string }> = {
   idea: { label: '选题', color: 'var(--text-tertiary)' },
@@ -87,7 +88,8 @@ export default function CalendarPage() {
           style={{ ['--ev' as string]: EVENT_COLOR }}
           onClick={(e) => { e.stopPropagation(); openEdit(it); }}>
           <span className="cal-event-dot" />
-          <span className="cal-event-title">{it.platform ? `[${it.platform}] ` : ''}{it.title}</span>
+          {it.platform && <PlatformIcon platform={it.platform} size={12} />}
+          <span className="cal-event-title">{it.title}</span>
           {it.campaign_id && <span className="cal-src">活动广场 · v{it.campaign_rule_version || 1}</span>}
         </div>
       );
@@ -97,7 +99,8 @@ export default function CalendarPage() {
         style={{ ['--ev' as string]: STATUS_META[it.status]?.color || 'var(--text-tertiary)' }}
         onClick={(e) => { e.stopPropagation(); openEdit(it); }}>
         <span className="cal-event-dot" />
-        <span className="cal-event-title">{it.platform ? `[${it.platform}] ` : ''}{it.title}</span>
+        {it.platform && <PlatformIcon platform={it.platform} size={12} />}
+        <span className="cal-event-title">{it.title}</span>
         {it.status === 'published' && it.source && SOURCE_LABEL[it.source]
           && <span className="cal-src">{SOURCE_LABEL[it.source]}</span>}
       </div>
@@ -266,8 +269,8 @@ export default function CalendarPage() {
                 <label className="field-label">关联平台（可选）</label>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
                   {PLATFORMS.map((p) => (
-                    <button key={p} className={`chip ${form.platform === p ? 'active' : ''}`}
-                      onClick={() => setForm({ ...form, platform: form.platform === p ? '' : p })}>{p}</button>
+                    <button key={p} className={`chip cal-platform-chip ${form.platform === p ? 'active' : ''}`}
+                      onClick={() => setForm({ ...form, platform: form.platform === p ? '' : p })}><PlatformIcon platform={p} size={13} />{p}</button>
                   ))}
                 </div>
               </>
@@ -276,8 +279,8 @@ export default function CalendarPage() {
                 <label className="field-label">平台</label>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 7 }}>
                   {PLATFORMS.map((p) => (
-                    <button key={p} className={`chip ${form.platform === p ? 'active' : ''}`}
-                      onClick={() => setForm({ ...form, platform: form.platform === p ? '' : p })}>{p}</button>
+                    <button key={p} className={`chip cal-platform-chip ${form.platform === p ? 'active' : ''}`}
+                      onClick={() => setForm({ ...form, platform: form.platform === p ? '' : p })}><PlatformIcon platform={p} size={13} />{p}</button>
                   ))}
                 </div>
                 <label className="field-label">状态</label>

@@ -7,6 +7,7 @@ import type { WatermarkCleanResult, WatermarkInspection } from '../lib/ripple';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconOutputs, IconImage, IconVideo, IconMusic, IconFile, IconFolder, IconRefresh, IconChevron, IconTrash } from './icons';
 import { Modal } from './workspace/Common';
+import { PlatformBadge } from './PlatformBrand';
 
 const FILTERS: { key: string; label: string }[] = [
   { key: 'all', label: '全部' },
@@ -224,7 +225,7 @@ export default function OutputsPage() {
             {!m && <IconFolder size={13} />} {m?.title || d.name}
           </div>
           <div className="gcard-sub" style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-            {m?.platform && <span style={badge}>{m.platform}</span>}
+            {m?.platform && <PlatformBadge platform={m.platform} size="xs" />}
             {m?.status && <span style={statusBadge(m.status)}>{STATUS_LABEL[m.status] || m.status}</span>}
             <span>{d.fileCount ?? 0} 个文件</span>
           </div>

@@ -11,6 +11,8 @@ import { Empty, Feedback, Mark } from './Common';
 import ContentAssistant from './ContentAssistant';
 import ContentVariantPublisher from './ContentVariantPublisher';
 import VariantBatch from './VariantBatch';
+import { PlatformIcon } from '../PlatformBrand';
+import { platformDisplayName } from '../../lib/platforms';
 
 const blank = (): Mother['content'] => ({ title: '', body: '', media: [], tags: '', project_id: 'local' });
 
@@ -316,7 +318,7 @@ export default function Contents({
         {topicContext.campaignId && <button className="r2-text-button" type="button" onClick={() => onNavigate('campaigns')}>活动广场</button>}
       </header>
       <div className="r2-topic-handoff-tags">
-        {topicContext.targetPlatforms?.map((platform) => <span key={platform}>目标平台 · {platform}</span>)}
+        {topicContext.targetPlatforms?.map((platform) => <span key={platform}><PlatformIcon platform={platform} size={12} />目标平台 · {platformDisplayName(platform)}</span>)}
         {topicContext.campaignSubmitDeadline && <span>投稿截止 · {topicContext.campaignSubmitDeadline.slice(0, 10)}</span>}
         {topicContext.campaignCurrentRuleVersion && <span>当前规则 · v{topicContext.campaignCurrentRuleVersion}</span>}
         {topicContext.trendRefs?.slice(0, 3).map((ref) => <span key={ref}>热点 · {ref}</span>)}
@@ -352,7 +354,7 @@ export default function Contents({
         <div className="r2-media-chips">{draft.media.map((path) => <span key={path}>{path.split('/').at(-1)}<button aria-label={`移除 ${path}`} disabled={editorLocked} onClick={() => patch('media', draft.media.filter((item) => item !== path))}>×</button></span>)}</div>
 
         <div className="r2-section-heading r2-variants-heading"><h2>平台版本</h2><div className="r2-toolbar"><button className="r2-button" disabled={busy || !!stream || !draft.title.trim()} onClick={() => void openVariantBatch()}>创建平台版本</button></div></div>
-        {selected && (records.find((record) => record.id === selected.id)?.variants || []).map((variant) => <button className={`r2-variant-row ${selectedVariantId === variant.id ? 'active' : ''}`} key={variant.id} onClick={() => setSelectedVariantId(variant.id)}><Mark platform={variant.platform} /><span>{variant.platform} · 平台版本 V{variant.version}</span><small>{variant.delivery === 'export' ? 'Markdown 导出' : variant.target_id ? '已选择发布目标' : '待选择发布目标'}</small>{variant.stale && <small className="r2-warning">基于旧母稿</small>}</button>)}
+        {selected && (records.find((record) => record.id === selected.id)?.variants || []).map((variant) => <button className={`r2-variant-row ${selectedVariantId === variant.id ? 'active' : ''}`} key={variant.id} onClick={() => setSelectedVariantId(variant.id)}><Mark platform={variant.platform} /><span>{platformDisplayName(variant.platform)} · 平台版本 V{variant.version}</span><small>{variant.delivery === 'export' ? 'Markdown 导出' : variant.target_id ? '已选择发布目标' : '待选择发布目标'}</small>{variant.stale && <small className="r2-warning">基于旧母稿</small>}</button>)}
         {selected && !(records.find((record) => record.id === selected.id)?.variants || []).length && <p className="r2-muted">先选择平台建立独立版本。账号、Blog 连接、排期和发布方式都在平台版本中再选择。</p>}
         {selected && selectedVariantId && <ContentVariantPublisher key={selectedVariantId} variantId={selectedVariantId} source={selected} onNavigate={onNavigate} onUpdated={() => void refresh().catch((e) => setError(errorText(e)))} />}
         <p className="r2-muted">母稿负责通用内容；平台版本负责平台改写和目标配置；发布任务只保存一次审核与执行快照。更新母稿不会自动覆盖已有平台版本。</p>

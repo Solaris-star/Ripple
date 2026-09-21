@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, errorText, xhsNotes } from '../../lib/ripple';
 import type { Account, Task, XhsNoteSummary } from '../../lib/ripple';
 import { Header, Feedback, Empty, Mark } from './Common';
+import { platformDisplayName } from '../../lib/platforms';
 
 function noteIdFromUrl(value?: string | null): string {
   const match = String(value || '').match(/\/(?:explore|discovery\/item|item)\/([0-9A-Za-z]+)/);
@@ -57,7 +58,7 @@ export default function Analytics() {
     <Header title="发布记录" subtitle="真实发布回执与平台读取到的作品指标分开记录；未读取到的指标显示为 —，不会补零。" />
     <Feedback error={error} />
     <div className="r2-metrics"><div><span>已人工核对发布</span><strong>{counts.published || 0}</strong></div><div><span>提交后待核对</span><strong>{counts.accepted || 0}</strong></div><div><span>结果未知</span><strong>{counts.unknown_result || 0}</strong></div></div>
-    <section className="r2-section"><div className="r2-section-heading"><h2>渠道执行记录</h2></div>{platforms.length === 0 ? <Empty title="暂无真实账号发布任务" description="创建真实发布任务后，会在这里汇总。" /> : <table className="r2-table"><thead><tr><th>渠道</th><th>本页任务数</th><th>已核对发布</th><th>待核对</th></tr></thead><tbody>{platforms.map((platform) => { const rows = tasks.filter((task) => task.content.platform === platform && task.content.mode === 'real'); return <tr key={platform}><td><Mark platform={platform} /> {platform}</td><td>{rows.length}</td><td>{rows.filter((task) => task.status === 'published').length}</td><td>{rows.filter((task) => ['accepted', 'unknown_result'].includes(task.status)).length}</td></tr>; })}</tbody></table>}</section>
+    <section className="r2-section"><div className="r2-section-heading"><h2>渠道执行记录</h2></div>{platforms.length === 0 ? <Empty title="暂无真实账号发布任务" description="创建真实发布任务后，会在这里汇总。" /> : <table className="r2-table"><thead><tr><th>渠道</th><th>本页任务数</th><th>已核对发布</th><th>待核对</th></tr></thead><tbody>{platforms.map((platform) => { const rows = tasks.filter((task) => task.content.platform === platform && task.content.mode === 'real'); return <tr key={platform}><td><Mark platform={platform} /> {platformDisplayName(platform)}</td><td>{rows.length}</td><td>{rows.filter((task) => task.status === 'published').length}</td><td>{rows.filter((task) => ['accepted', 'unknown_result'].includes(task.status)).length}</td></tr>; })}</tbody></table>}</section>
 
     <section className="r2-section"><div className="r2-section-heading"><div><h2>小红书作品表现</h2><p className="r2-muted">从所选已连接账号的创作者作品页按需读取。关联发布任务优先使用作品 ID，标题只作兜底。</p></div><div className="r2-analytics-xhs-tools"><select value={xhsAccountId} onChange={(e) => { setXhsAccountId(e.target.value); setXhsNotesData([]); setXhsFetchedAt(''); }}><option value="">选择小红书账号</option>{accounts.map((row) => <option key={row.id} value={row.id}>{row.label}{row.identity?.name ? ` · @${row.identity.name}` : ''}</option>)}</select><button className="r2-button" disabled={!xhsAccountId || xhsLoading} onClick={() => void refreshXhs()}>{xhsLoading ? '读取中…' : '刷新作品数据'}</button></div></div>
       {!xhsAccountId && <Empty title="暂无已连接小红书账号" description="先在「账号与平台」完成小红书账号连接。" />}

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { buildProfile, profileBuildStatus } from '../lib/api';
+import { PlatformIcon } from './PlatformBrand';
 
 const PLATFORMS = ['小红书', '抖音', 'B站', '视频号', '公众号', '微博', '知乎'];
 const TONES = ['专业严谨', '轻松幽默', '亲切日常', '犀利吐槽', '治愈温暖', '干货实用'];
@@ -153,7 +154,7 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
                 <label style={label}>运营平台（可多选）</label>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 6 }}>
                   {PLATFORMS.map((p) => (
-                    <button key={p} onClick={() => togglePlatform(p)} style={chip(form.platforms.includes(p))}>{p}</button>
+                    <button className={`onboarding-platform-chip ${form.platforms.includes(p) ? 'active' : ''}`} key={p} onClick={() => togglePlatform(p)} style={chip(form.platforms.includes(p))}><PlatformIcon platform={p} size={13} />{p}</button>
                   ))}
                 </div>
                 <label style={label}>起号状态</label>
@@ -175,7 +176,7 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
                 )}
                 {form.platforms.map((p) => (
                   <div key={p}>
-                    <label style={label}>{p} 主页链接</label>
+                    <label className="onboarding-platform-label" style={label}><PlatformIcon platform={p} size={13} />{p} 主页链接</label>
                     <input style={box} value={form.links[p] || ''} placeholder={`https://…`}
                       onChange={(e) => set('links', { ...form.links, [p]: e.target.value })} />
                   </div>
