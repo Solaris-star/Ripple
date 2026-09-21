@@ -3791,7 +3791,14 @@ def _normalize_campaign(item: dict) -> dict:
     item["agent_attempt_count"] = max(0, int(item.get("agent_attempt_count") or 0))
     item["agent_next_retry_at"] = int(item.get("agent_next_retry_at") or 0)
     item["missing_fields"] = campaign_missing_fields(item)
-    if not item.get("enrichment_status"):
+    status = str(item.get("enrichment_status") or "")
+    if status in {"running", "queued"}:
+        same_completed_evidence = bool(
+            item["last_agent_fingerprint"]
+            and item["last_agent_fingerprint"] == item["rule_evidence_fingerprint"]
+        )
+        item["enrichment_status"] = "partial" if same_completed_evidence and item["missing_fields"] else ("complete" if not item["missing_fields"] else "incomplete")
+    elif not status:
         item["enrichment_status"] = "complete" if not item["missing_fields"] else "incomplete"
     return item
 

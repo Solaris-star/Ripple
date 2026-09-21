@@ -46,6 +46,20 @@ def test_legacy_campaign_rows_are_normalized_for_new_detail_fields(tmp_path, mon
     assert row["last_seen_at"] == 120
 
 
+def test_running_agent_status_is_recovered_after_server_restart(tmp_path, monkeypatch):
+    path = tmp_path / "campaigns.json"
+    path.write_text(json.dumps([{
+        "id": "stale-running", "title": "中断活动", "platform": "bilibili",
+        "created_at": 100, "updated_at": 120, "enrichment_status": "running",
+        "rule_evidence_fingerprint": "fp-new", "last_agent_fingerprint": "",
+        "eligibility": [], "prizes": [], "winning_conditions": [],
+    }], ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", path)
+    row = upstream._read_campaigns()[0]
+    assert row["enrichment_status"] == "incomplete"
+    assert row["missing_fields"]
+
+
 def test_campaign_import_is_not_presented_as_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     created = asyncio.run(upstream.api_campaign_create(_campaign()))
