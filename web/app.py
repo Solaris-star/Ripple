@@ -3731,7 +3731,15 @@ def _read_campaigns() -> list[dict]:
         return []
     try:
         data = json.loads(CAMPAIGNS_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        if not isinstance(data, list):
+            return []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            item.setdefault("summary", "")
+            item.setdefault("prizes", [])
+            item.setdefault("winning_conditions", [])
+        return data
     except Exception:
         return []
 
@@ -3778,6 +3786,7 @@ class CampaignInput(BaseModel):
     activity_type: str = Field(default="征稿/活动", max_length=80)
     reward_type: str = Field(default="", max_length=120)
     reward_summary: str = Field(default="", max_length=600)
+    summary: str = Field(default="", max_length=3000)
     starts_at: str = Field(default="", max_length=40)
     signup_deadline: str = Field(default="", max_length=40)
     submit_deadline: str = Field(default="", max_length=40)
@@ -3787,6 +3796,8 @@ class CampaignInput(BaseModel):
     qualification_state: str = "unknown"
     content_requirements: list[str] = Field(default_factory=list, max_length=30)
     reward_rules: list[str] = Field(default_factory=list, max_length=30)
+    prizes: list[str] = Field(default_factory=list, max_length=30)
+    winning_conditions: list[str] = Field(default_factory=list, max_length=30)
     required_topics: list[str] = Field(default_factory=list, max_length=20)
     ai_policy: str = Field(default="unknown", max_length=80)
     source_url: str = Field(default="", max_length=2000)
@@ -3818,9 +3829,9 @@ class CampaignRefreshInput(BaseModel):
 
 CAMPAIGN_RULE_SNAPSHOT_FIELDS = (
     "title", "platform", "platform_label", "organizer", "organizer_type", "activity_type",
-    "reward_type", "reward_summary", "starts_at", "signup_deadline", "submit_deadline",
+    "reward_type", "reward_summary", "summary", "starts_at", "signup_deadline", "submit_deadline",
     "stats_deadline", "timezone", "eligibility", "qualification_state", "qualification_basis",
-    "content_requirements", "reward_rules", "required_topics", "ai_policy", "source_url",
+    "content_requirements", "prizes", "winning_conditions", "reward_rules", "required_topics", "ai_policy", "source_url",
     "source_type", "source_status", "last_verified_at", "note", "status", "account_id",
 )
 
@@ -3864,6 +3875,7 @@ def _campaign_from_request(req: CampaignInput, previous: dict | None = None) -> 
         "activity_type": req.activity_type,
         "reward_type": req.reward_type,
         "reward_summary": req.reward_summary,
+        "summary": req.summary,
         "starts_at": req.starts_at,
         "signup_deadline": req.signup_deadline,
         "submit_deadline": req.submit_deadline,
@@ -3874,6 +3886,8 @@ def _campaign_from_request(req: CampaignInput, previous: dict | None = None) -> 
         "qualification_basis": "user_confirmed" if qualification != "unknown" else "unknown",
         "content_requirements": req.content_requirements,
         "reward_rules": req.reward_rules,
+        "prizes": req.prizes,
+        "winning_conditions": req.winning_conditions,
         "required_topics": req.required_topics,
         "ai_policy": req.ai_policy,
         "source_url": _campaign_url(req.source_url),
@@ -3941,16 +3955,19 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "activity_type": str(candidate.get("activity_type") or "创作活动")[:80],
             "reward_type": str(candidate.get("reward_type") or "")[:120],
             "reward_summary": str(candidate.get("reward_summary") or "")[:600],
+            "summary": str(candidate.get("summary") or "")[:3000],
             "starts_at": str(candidate.get("starts_at") or "")[:40],
             "signup_deadline": "",
             "submit_deadline": str(candidate.get("submit_deadline") or "")[:40],
             "stats_deadline": "",
             "timezone": "",
-            "eligibility": [],
+            "eligibility": [str(x)[:240] for x in candidate.get("eligibility", []) if str(x).strip()][:20],
             "qualification_state": "unknown",
             "qualification_basis": "unknown",
             "content_requirements": [str(x)[:240] for x in candidate.get("content_requirements", []) if str(x).strip()][:30],
-            "reward_rules": [],
+            "prizes": [str(x)[:240] for x in candidate.get("prizes", []) if str(x).strip()][:30],
+            "winning_conditions": [str(x)[:240] for x in candidate.get("winning_conditions", []) if str(x).strip()][:30],
+            "reward_rules": [str(x)[:240] for x in candidate.get("reward_rules", []) if str(x).strip()][:30],
             "required_topics": [str(x)[:120] for x in candidate.get("required_topics", []) if str(x).strip()][:20],
             "ai_policy": "unknown",
             "source_url": str(candidate.get("source_url") or "")[:2000],
@@ -3974,13 +3991,19 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
         item = existing
         manual = item.get("source_type") == "user_import"
         rule_fields = ("title", "organizer", "organizer_type", "activity_type", "reward_type",
-                       "reward_summary", "starts_at", "submit_deadline", "source_url", "note")
+                       "reward_summary", "summary", "starts_at", "submit_deadline", "source_url", "note")
         proposed = {}
         for field in rule_fields:
             incoming = str(candidate.get(field) or "").strip()
             if incoming and (not manual or not str(item.get(field) or "").strip()):
-                proposed[field] = incoming[:6000 if field == "note" else 2000 if field == "source_url" else 600]
-        changed = any(str(item.get(k) or "") != str(v) for k, v in proposed.items())
+                proposed[field] = incoming[:6000 if field == "note" else 3000 if field == "summary" else 2000 if field == "source_url" else 600]
+        list_fields = ("eligibility", "content_requirements", "prizes", "winning_conditions", "reward_rules", "required_topics")
+        for field in list_fields:
+            incoming = [str(x)[:240] for x in candidate.get(field, []) if str(x).strip()][:30]
+            current = item.get(field) if isinstance(item.get(field), list) else []
+            if incoming and (not manual or not current):
+                proposed[field] = incoming
+        changed = any(item.get(k) != v for k, v in proposed.items())
         if changed and int(item.get("rule_version") or 0) > 0:
             history = [x for x in (item.get("rule_history") or []) if isinstance(x, dict)]
             history.append(_campaign_rule_snapshot(item, archived_at=now))

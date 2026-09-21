@@ -259,6 +259,7 @@ export interface CampaignRuleSnapshot {
   activity_type?: string;
   reward_type?: string;
   reward_summary?: string;
+  summary?: string;
   starts_at?: string;
   signup_deadline?: string;
   submit_deadline?: string;
@@ -267,6 +268,8 @@ export interface CampaignRuleSnapshot {
   eligibility?: string[];
   qualification_state?: CampaignQualification;
   content_requirements?: string[];
+  prizes?: string[];
+  winning_conditions?: string[];
   reward_rules?: string[];
   required_topics?: string[];
   ai_policy?: string;
@@ -285,6 +288,7 @@ export interface Campaign {
   activity_type: string;
   reward_type: string;
   reward_summary: string;
+  summary: string;
   starts_at: string;
   signup_deadline: string;
   submit_deadline: string;
@@ -294,6 +298,8 @@ export interface Campaign {
   qualification_state: CampaignQualification;
   qualification_basis?: string;
   content_requirements: string[];
+  prizes: string[];
+  winning_conditions: string[];
   reward_rules: string[];
   required_topics: string[];
   ai_policy: string;
@@ -314,9 +320,9 @@ export interface Campaign {
   account_states?: Record<string, { visible?: boolean; qualification_state?: CampaignQualification; last_seen_at?: number; provider_id?: string }>;
 }
 export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<Campaign,
-  'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' |
+  'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' | 'summary' |
   'starts_at' | 'signup_deadline' | 'submit_deadline' | 'stats_deadline' | 'timezone' |
-  'eligibility' | 'qualification_state' | 'content_requirements' | 'reward_rules' |
+  'eligibility' | 'qualification_state' | 'content_requirements' | 'prizes' | 'winning_conditions' | 'reward_rules' |
   'required_topics' | 'ai_policy' | 'source_url' | 'note' | 'status' | 'account_id'>>;
 export interface CampaignSourceSyncState {
   at?: number; status?: string; count?: number; error?: string; provider?: string; fallback_used?: boolean;

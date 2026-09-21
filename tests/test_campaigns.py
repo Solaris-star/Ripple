@@ -14,6 +14,9 @@ def _campaign(**overrides):
         "activity_type": "征稿",
         "reward_type": "流量扶持",
         "reward_summary": "以活动原文为准",
+        "summary": "面向用户的活动摘要",
+        "prizes": ["奖金池 5 万元"],
+        "winning_conditions": ["播放量达到活动门槛"],
         "qualification_state": "unknown",
         "content_requirements": ["原创图文"],
         "eligibility": ["账号状态正常"],
@@ -35,6 +38,9 @@ def test_campaign_import_is_not_presented_as_verified(tmp_path, monkeypatch):
     assert created["last_verified_at"] == 0
     assert created["rule_version"] == 1
     assert created["qualification_state"] == "unknown"
+    assert created["summary"] == "面向用户的活动摘要"
+    assert created["prizes"] == ["奖金池 5 万元"]
+    assert created["winning_conditions"] == ["播放量达到活动门槛"]
 
     rows = asyncio.run(upstream.api_campaign_list())
     assert rows[0]["id"] == created["id"]
@@ -53,6 +59,8 @@ def test_campaign_edit_bumps_rule_version_and_keeps_import_provenance(tmp_path, 
     assert updated["qualification_state"] == "eligible"
     assert updated["qualification_basis"] == "user_confirmed"
     assert updated["content_requirements"] == ["原创视频", "需带指定话题"]
+    assert updated["prizes"] == ["奖金池 5 万元"]
+    assert updated["winning_conditions"] == ["播放量达到活动门槛"]
     assert len(updated["rule_history"]) == 1
     assert updated["rule_history"][0]["version"] == 1
     assert updated["rule_history"][0]["content_requirements"] == ["原创图文"]
@@ -133,12 +141,18 @@ def test_automatic_candidate_merges_evidence_without_overwriting_manual_rules(tm
         "source_type": "creator_events_api",
         "evidence": {"kind": "creator_account"},
         "account_id": "account-1",
+        "summary": "自动来源摘要",
+        "prizes": ["流量扶持"],
+        "winning_conditions": ["官方评审入选"],
     })
     assert merged["id"] == manual["id"]
     assert merged["reward_summary"] == "人工确认奖励"
     assert merged["external_ids"]["xiaohongshu_creator_events"] == "xhs:a1"
     assert merged["source_evidence"][-1]["evidence"]["kind"] == "creator_account"
     assert merged["account_states"]["account-1"]["visible"] is True
+    assert merged["summary"] == "面向用户的活动摘要"
+    assert merged["prizes"] == ["奖金池 5 万元"]
+    assert merged["winning_conditions"] == ["播放量达到活动门槛"]
 
 
 def test_campaign_recommendation_uses_campaign_as_data_and_returns_rule_version(tmp_path, monkeypatch):

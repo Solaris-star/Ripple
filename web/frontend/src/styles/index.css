@@ -1157,9 +1157,11 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-tags span.warn { color: #a16b13; background: #fff7e8; border-color: transparent; }
 .campaign-tags span.bad { color: var(--red); background: color-mix(in srgb, var(--red) 9%, transparent); border-color: transparent; }
 .campaign-reward { margin-top: 9px; color: var(--text); font-size: 14px; line-height: 1.5; }
-.campaign-meta { margin-top: 11px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }
-.campaign-meta span { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.campaign-meta small { display: block; font-size: 11px; color: var(--text-tertiary); margin-bottom: 1px; }
+.campaign-card-facts { margin-top: 11px; display: flex; flex-direction: column; gap: 0; border-top: 1px solid var(--border); }
+.campaign-card-facts > div { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); align-items: start; }
+.campaign-card-facts small { color: var(--text-tertiary); font-size: 11px; line-height: 1.55; }
+.campaign-card-facts strong,.campaign-card-facts span { min-width: 0; color: var(--text); font-size: 12px; line-height: 1.55; font-weight: 500; overflow-wrap: anywhere; }
+.campaign-card-facts strong { font-weight: 600; }
 .campaign-actions { margin-top: 12px; display: flex; gap: 7px; }
 .campaign-actions .btn-primary { flex: 1; }
 .campaign-empty { min-height: 220px; border: 1px dashed var(--border-strong); border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; color: var(--text-tertiary); text-align: center; padding: 24px; }
@@ -1199,6 +1201,10 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-drawer section h4 { font-size: 14px; margin-bottom: 7px; }
 .campaign-drawer section ul { margin: 0; padding-left: 19px; color: var(--text-secondary); font-size: 13px; line-height: 1.7; }
 .campaign-copy, .campaign-unknown { font-size: 13px; line-height: 1.7; color: var(--text-secondary); white-space: pre-wrap; }
+.campaign-summary-section { margin-top: 8px; padding: 12px !important; border: 1px solid var(--border) !important; border-radius: 9px; background: var(--surface-2); }
+.campaign-summary-section h4 { color: var(--text); }
+.campaign-source-name { margin-bottom: 6px; font-size: 13px; color: var(--text-secondary); }
+.campaign-source-name strong { color: var(--text); font-weight: 600; }
 .campaign-unknown { color: var(--text-tertiary); }
 .campaign-topic-tags { display: flex; flex-wrap: wrap; gap: 5px; }
 .campaign-topic-tags span { font-size: 12px; border: 1px solid var(--border); padding: 3px 7px; border-radius: 999px; color: var(--accent-end); background: var(--accent-soft); }

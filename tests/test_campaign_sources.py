@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
 from ripple.accounts import AccountInput
 from ripple.ai_providers import AIProviderService
-from ripple.campaign_sources import CampaignSourceService
+from ripple.campaign_sources import CampaignSourceService, _bili_reward_summary, _bilibili_detail_from_html
 from ripple.publishing import WorkflowError
 from ripple.workspace import WorkspaceService
 from ripple.xhs_browser import _campaign_candidates as xhs_candidates
@@ -29,6 +30,52 @@ def test_public_source_state_has_bilibili_ready_without_configuration(source_ser
     assert bili["automatic"] is True
     assert bili["billing"] == "free"
     assert state["automatic_count"] == 1
+
+
+def test_bilibili_detail_parser_separates_prizes_winning_conditions_and_entry_requirements():
+    payload = {
+        "layerTree": [
+            {
+                "name": "EraVideoSourcePc",
+                "props": {"config": {
+                    "topic_name": "九月创作激励",
+                    "poolList": [
+                        {"bonus": "瓜分5000元", "label": "起始粉丝量＜1w，累计投币≥30个", "rule": "总投币数≥30,起始粉丝量＜10000"},
+                        {"bonus": "瓜分1元", "label": "瓜分奖", "rule": ""},
+                        {"bonus": "瓜分0元", "label": "筛选用", "rule": "单稿播放量≥1"},
+                    ],
+                }},
+            },
+            {"name": "EvaLinkButton", "alias": "报名", "props": {"jumpAddress": "https://example.invalid/form"}},
+        ]
+    }
+    html = '<script>window.__BILIACT_EVAPAGEDATA__ = ' + json.dumps(payload, ensure_ascii=False) + ';</script>'
+    result = _bilibili_detail_from_html(html)
+    assert result["prizes"] == ["瓜分5000元"]
+    assert result["winning_conditions"] == ["总投币数≥30、起始粉丝量＜10000"]
+    assert result["reward_rules"] == ["瓜分5000元：总投币数≥30、起始粉丝量＜10000"]
+    assert result["eligibility"] == ["需通过活动页面完成报名"]
+    assert result["required_topics"] == ["九月创作激励"]
+    assert result["content_requirements"] == ["投稿需关联活动话题：#九月创作激励"]
+    assert "页面明确的奖励包括：瓜分5000元" in result["summary_hint"]
+
+
+def test_bilibili_detail_parser_does_not_invent_image_only_rules():
+    payload = {"layerTree": [{"name": "EvaModal", "alias": "活动规则弹窗", "props": {
+        "modalContentLayoutContainerProps": {"background": {"src": "//i0.hdslb.com/rules.png"}}
+    }}]}
+    html = '<script>window.__BILIACT_EVAPAGEDATA__ = ' + json.dumps(payload, ensure_ascii=False) + ';</script>'
+    result = _bilibili_detail_from_html(html)
+    assert result["eligibility"] == []
+    assert result["prizes"] == []
+    assert result["winning_conditions"] == []
+    assert result["reward_rules"] == []
+
+
+def test_bilibili_list_description_is_only_used_as_reward_when_it_is_reward_like():
+    assert _bili_reward_summary("32万奖励等你瓜分") == "32万奖励等你瓜分"
+    assert _bili_reward_summary("参与活动可获流量扶持") == "参与活动可获流量扶持"
+    assert _bili_reward_summary("从零开始的 bilibili only 特辑") == ""
 
 
 def test_x_fallback_is_never_used_until_explicitly_enabled(source_service, monkeypatch):

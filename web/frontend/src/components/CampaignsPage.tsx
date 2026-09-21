@@ -35,12 +35,6 @@ const PLATFORMS: { key: CampaignPlatform; label: string }[] = [
   { key: 'weixin-channels', label: '微信视频号' },
 ];
 
-const QUALIFICATION: Record<string, { label: string; cls: string }> = {
-  eligible: { label: '已知符合', cls: 'ok' },
-  ineligible: { label: '已知不符合', cls: 'bad' },
-  unknown: { label: '待确认', cls: 'warn' },
-};
-
 const STATUS: Record<string, string> = {
   active: '进行中',
   upcoming: '即将开始',
@@ -50,9 +44,9 @@ const STATUS: Record<string, string> = {
 };
 
 const SOURCE_STATUS: Record<string, string> = {
-  imported: '用户导入',
-  verified: '来源已核验',
-  stale: '缓存/待复核',
+  imported: '未核验',
+  verified: '已核验',
+  stale: '待复核',
   unavailable: '来源不可用',
 };
 
@@ -74,6 +68,7 @@ const emptyCampaign = (): CampaignInput => ({
   activity_type: '征稿/活动',
   reward_type: '',
   reward_summary: '',
+  summary: '',
   starts_at: '',
   signup_deadline: '',
   submit_deadline: '',
@@ -82,6 +77,8 @@ const emptyCampaign = (): CampaignInput => ({
   eligibility: [],
   qualification_state: 'unknown',
   content_requirements: [],
+  prizes: [],
+  winning_conditions: [],
   reward_rules: [],
   required_topics: [],
   ai_policy: 'unknown',
@@ -115,6 +112,37 @@ function daysUntil(value?: string): number | null {
 
 function sourceLabel(campaign: Campaign): string {
   return SOURCE_STATUS[campaign.source_status] || campaign.source_status || '来源未知';
+}
+
+function sourceName(campaign: Campaign): string {
+  if (campaign.source_type === 'user_import') return '用户导入';
+  if (campaign.platform === 'bilibili' && campaign.source_type === 'platform_public') return 'B站官方活动页';
+  if (campaign.source_type === 'x_search') return 'xAI · X Search';
+  if (campaign.source_type === 'x_developer_api') return 'X Developer API';
+  if (campaign.platform === 'xiaohongshu' && campaign.source_type.includes('creator')) return '小红书创作服务平台';
+  if (campaign.platform === 'douyin' && campaign.source_type.includes('creator')) return '抖音创作者中心';
+  if (campaign.source_type === 'third_party_api') return 'TikHub';
+  return (campaign.platform_label || platformDisplayName(campaign.platform)) + '活动来源';
+}
+
+function qualificationBadge(campaign: Campaign): { label: string; cls: string } | null {
+  if (campaign.qualification_state === 'eligible') return { label: '可参与', cls: 'ok' };
+  if (campaign.qualification_state === 'ineligible') return { label: '暂不符合', cls: 'bad' };
+  if (campaign.eligibility?.length) return { label: '资格待核验', cls: 'warn' };
+  return null;
+}
+
+function concise(values: string[] | undefined, fallback: string, limit = 2): string {
+  const rows = (values || []).map((x) => x.trim()).filter(Boolean);
+  return rows.length ? rows.slice(0, limit).join('；') + (rows.length > limit ? ' 等 ' + rows.length + ' 条' : '') : fallback;
+}
+
+function campaignTime(campaign: Campaign): string {
+  const start = dateOnly(campaign.starts_at) || '开始时间未说明';
+  const end = dateOnly(campaign.submit_deadline) || '截止时间未说明';
+  const left = daysUntil(campaign.submit_deadline);
+  const countdown = left !== null && left >= 0 && left <= 7 ? ' · 剩 ' + left + ' 天' : '';
+  return start + ' → ' + end + countdown;
 }
 
 function platformLabel(key: string): string {
@@ -154,6 +182,8 @@ export default function CampaignsPage({
   const [saving, setSaving] = useState(false);
   const [eligibilityText, setEligibilityText] = useState('');
   const [requirementsText, setRequirementsText] = useState('');
+  const [prizesText, setPrizesText] = useState('');
+  const [winningConditionsText, setWinningConditionsText] = useState('');
   const [rewardRulesText, setRewardRulesText] = useState('');
   const [topicsText, setTopicsText] = useState('');
 
@@ -320,6 +350,8 @@ export default function CampaignsPage({
     setForm(emptyCampaign());
     setEligibilityText('');
     setRequirementsText('');
+    setPrizesText('');
+    setWinningConditionsText('');
     setRewardRulesText('');
     setTopicsText('');
   };
@@ -329,17 +361,20 @@ export default function CampaignsPage({
     setForm({
       title: campaign.title, platform: campaign.platform, organizer: campaign.organizer,
       organizer_type: campaign.organizer_type, activity_type: campaign.activity_type,
-      reward_type: campaign.reward_type, reward_summary: campaign.reward_summary,
+      reward_type: campaign.reward_type, reward_summary: campaign.reward_summary, summary: campaign.summary,
       starts_at: campaign.starts_at, signup_deadline: campaign.signup_deadline,
       submit_deadline: campaign.submit_deadline, stats_deadline: campaign.stats_deadline,
       timezone: campaign.timezone, qualification_state: campaign.qualification_state,
       ai_policy: campaign.ai_policy, source_url: campaign.source_url, note: campaign.note,
       status: campaign.status, account_id: campaign.account_id,
       eligibility: campaign.eligibility, content_requirements: campaign.content_requirements,
+      prizes: campaign.prizes, winning_conditions: campaign.winning_conditions,
       reward_rules: campaign.reward_rules, required_topics: campaign.required_topics,
     });
     setEligibilityText(joined(campaign.eligibility));
     setRequirementsText(joined(campaign.content_requirements));
+    setPrizesText(joined(campaign.prizes));
+    setWinningConditionsText(joined(campaign.winning_conditions));
     setRewardRulesText(joined(campaign.reward_rules));
     setTopicsText((campaign.required_topics || []).join('，'));
   };
@@ -353,6 +388,8 @@ export default function CampaignsPage({
         ...form,
         eligibility: splitLines(eligibilityText),
         content_requirements: splitLines(requirementsText),
+        prizes: splitLines(prizesText),
+        winning_conditions: splitLines(winningConditionsText),
         reward_rules: splitLines(rewardRulesText),
         required_topics: splitLines(topicsText),
       };
@@ -559,7 +596,7 @@ export default function CampaignsPage({
         <select className="field" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}>
           <option value="all">全部资格状态</option>
           <option value="eligible">已知符合</option>
-          <option value="unknown">待确认</option>
+          <option value="unknown">资格信息不足</option>
           <option value="ineligible">已知不符合</option>
         </select>
         <select className="field" value={persona} onChange={(e) => {
@@ -598,8 +635,8 @@ export default function CampaignsPage({
           )}
           <div className="campaign-grid">
             {visible.map((campaign) => {
-              const qualification = QUALIFICATION[campaign.qualification_state] || QUALIFICATION.unknown;
-              const deadlineDays = daysUntil(campaign.submit_deadline);
+              const qualification = qualificationBadge(campaign);
+              const sourceText = sourceName(campaign) + ' · ' + sourceLabel(campaign);
               return (
                 <article className="card campaign-card" key={campaign.id}>
                   <div className="campaign-card-top">
@@ -614,17 +651,18 @@ export default function CampaignsPage({
                   <div className="campaign-tags">
                     <span>{campaign.activity_type || '活动'}</span>
                     {campaign.reward_type && <span>{campaign.reward_type}</span>}
-                    <span className={qualification.cls}>{qualification.label}</span>
+                    {qualification && <span className={qualification.cls}>{qualification.label}</span>}
+                    {campaign.status === 'cancelled' && <span className="bad">已取消</span>}
                   </div>
-                  {campaign.reward_summary && <div className="campaign-reward">{campaign.reward_summary}</div>}
-                  <div className="campaign-meta">
-                    <span><small>投稿截止</small>{dateOnly(campaign.submit_deadline) || '未说明'}{deadlineDays !== null && deadlineDays >= 0 && deadlineDays <= 7 ? ` · 剩 ${deadlineDays} 天` : ''}</span>
-                    <span><small>活动状态</small>{STATUS[campaign.status] || campaign.status}</span>
-                    <span><small>来源状态</small>{sourceLabel(campaign)}</span>
-                    <span><small>规则版本</small>v{campaign.rule_version}</span>
+                  <div className="campaign-card-facts">
+                    <div><small>活动时间</small><strong>{campaignTime(campaign)}</strong></div>
+                    <div><small>来源</small><strong>{sourceText}</strong></div>
+                    <div><small>参与条件</small><span>{concise(campaign.eligibility, '原活动页暂未解析到明确前置条件')}</span></div>
+                    <div><small>奖品 / 奖励</small><span>{concise(campaign.prizes, campaign.reward_summary || '原活动页暂未解析到明确奖品')}</span></div>
+                    <div><small>获奖条件</small><span>{concise(campaign.winning_conditions, '原活动页暂未解析到明确获奖门槛')}</span></div>
                   </div>
                   <div className="campaign-actions">
-                    <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看规则</button>
+                    <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看详情</button>
                     <button className="btn btn-sm btn-primary" disabled={campaign.status === 'ended' || campaign.status === 'cancelled'}
                       onClick={() => void generateIdeas(campaign)}><IconSkills size={13} /> 生成选题</button>
                   </div>
@@ -654,15 +692,13 @@ export default function CampaignsPage({
             <div className="campaign-drawer-title">
               <h3>{selected.title}</h3>
               <p>主办方 · {selected.organizer || '未说明'} · {STATUS[selected.status] || selected.status}</p>
-              <div className="campaign-tags"><span className={(QUALIFICATION[selected.qualification_state] || QUALIFICATION.unknown).cls}>{(QUALIFICATION[selected.qualification_state] || QUALIFICATION.unknown).label}</span><span>{sourceLabel(selected)}</span><span>规则 v{selected.rule_version}</span></div>
+              <div className="campaign-tags">
+                {qualificationBadge(selected) && <span className={qualificationBadge(selected)?.cls}>{qualificationBadge(selected)?.label}</span>}
+                <span>{sourceName(selected)}</span><span>规则 v{selected.rule_version}</span>
+              </div>
             </div>
 
-            {selected.note && <section><h4>活动简介</h4><p className="campaign-copy">{selected.note}</p></section>}
-            <section><h4>参与条件</h4>{selected.eligibility.length ? <ul>{selected.eligibility.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">未说明，参与前需要确认。</p>}</section>
-            <section><h4>内容要求</h4>{selected.content_requirements.length ? <ul>{selected.content_requirements.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">未说明。</p>}</section>
-            <section><h4>奖励规则</h4>{selected.reward_rules.length ? <ul>{selected.reward_rules.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{selected.reward_summary || '未说明。'}</p>}</section>
-            <section><h4>指定话题 / 标签</h4>{selected.required_topics.length ? <div className="campaign-topic-tags">{selected.required_topics.map((x) => <span key={x}>{x.startsWith('#') ? x : `# ${x}`}</span>)}</div> : <p className="campaign-unknown">未说明。</p>}</section>
-            <section><h4>AI 使用要求</h4><p className="campaign-copy">{selected.ai_policy === 'unknown' || !selected.ai_policy ? '未说明；AI 辅助创作前需要确认活动规则。' : selected.ai_policy}</p></section>
+            <section className="campaign-summary-section"><h4>活动摘要</h4><p className={selected.summary || selected.note ? 'campaign-copy' : 'campaign-unknown'}>{selected.summary || selected.note || '当前来源没有提供可结构化的活动摘要，建议打开原活动页查看。'}</p></section>
             <section>
               <h4>时间节点</h4>
               <div className="campaign-timeline">
@@ -672,9 +708,17 @@ export default function CampaignsPage({
                 <span><small>统计截止</small>{dateOnly(selected.stats_deadline) || '未说明'}</span>
               </div>
             </section>
+            <section><h4>参与条件</h4>{selected.eligibility.length ? <ul>{selected.eligibility.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确参与条件。</p>}</section>
+            <section><h4>内容要求</h4>{selected.content_requirements.length ? <ul>{selected.content_requirements.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确内容要求。</p>}</section>
+            <section><h4>奖品 / 奖励</h4>{selected.prizes.length ? <ul>{selected.prizes.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{selected.reward_summary || '原活动页暂未解析到明确奖品。'}</p>}</section>
+            <section><h4>获奖条件</h4>{selected.winning_conditions.length ? <ul>{selected.winning_conditions.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确获奖门槛。</p>}</section>
+            <section><h4>奖励规则</h4>{selected.reward_rules.length ? <ul>{selected.reward_rules.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">未解析到额外的奖励计算或发放规则。</p>}</section>
+            <section><h4>指定话题 / 标签</h4>{selected.required_topics.length ? <div className="campaign-topic-tags">{selected.required_topics.map((x) => <span key={x}>{x.startsWith('#') ? x : `# ${x}`}</span>)}</div> : <p className="campaign-unknown">未解析到指定话题。</p>}</section>
+            <section><h4>AI 使用要求</h4><p className="campaign-copy">{selected.ai_policy === 'unknown' || !selected.ai_policy ? '原活动规则未说明 AI 使用要求。' : selected.ai_policy}</p></section>
             <section><h4>来源与核验</h4>
+              <p className="campaign-source-name"><strong>{sourceName(selected)}</strong> · {sourceLabel(selected)}</p>
               {selected.source_url ? <a className="campaign-source-link" href={selected.source_url} target="_blank" rel="noreferrer">{selected.source_url}</a> : <p className="campaign-unknown">没有保存来源链接。</p>}
-              <p className="campaign-verify">来源状态：{sourceLabel(selected)} · 最近核验：{selected.last_verified_at ? new Date(selected.last_verified_at * 1000).toLocaleString('zh-CN') : '未由 Ripple 核验'}</p>
+              <p className="campaign-verify">最近核验：{selected.last_verified_at ? new Date(selected.last_verified_at * 1000).toLocaleString('zh-CN') : '未由 Ripple 核验'} · 规则版本 v{selected.rule_version}</p>
             </section>
             <footer>
               <button className="btn btn-primary campaign-generate" disabled={selected.status === 'ended' || selected.status === 'cancelled'}
@@ -762,17 +806,20 @@ export default function CampaignsPage({
               <label><span>活动类型</span><input className="field" value={form.activity_type || ''} onChange={(e) => setForm({ ...form, activity_type: e.target.value })} placeholder="征稿 / 激励 / 挑战…" /></label>
               <label><span>奖励类型</span><input className="field" value={form.reward_type || ''} onChange={(e) => setForm({ ...form, reward_type: e.target.value })} placeholder="现金 / 流量扶持 / 实物…" /></label>
               <label><span>奖励摘要</span><input className="field" value={form.reward_summary || ''} onChange={(e) => setForm({ ...form, reward_summary: e.target.value })} /></label>
+              <label className="wide"><span>活动摘要</span><textarea className="field" value={form.summary || ''} onChange={(e) => setForm({ ...form, summary: e.target.value })} placeholder="面向用户的一段活动概览；没有可靠信息可以留空。" /></label>
               <label><span>活动开始</span><input className="field" type="date" value={dateOnly(form.starts_at)} onChange={(e) => setForm({ ...form, starts_at: e.target.value })} /></label>
               <label><span>投稿截止</span><input className="field" type="date" value={dateOnly(form.submit_deadline)} onChange={(e) => setForm({ ...form, submit_deadline: e.target.value })} /></label>
-              <label><span>资格状态</span><select className="field" value={form.qualification_state || 'unknown'} onChange={(e) => setForm({ ...form, qualification_state: e.target.value as Campaign['qualification_state'] })}><option value="unknown">待确认</option><option value="eligible">已知符合</option><option value="ineligible">已知不符合</option></select></label>
+              <label><span>资格状态</span><select className="field" value={form.qualification_state || 'unknown'} onChange={(e) => setForm({ ...form, qualification_state: e.target.value as Campaign['qualification_state'] })}><option value="unknown">资格信息不足</option><option value="eligible">可参与</option><option value="ineligible">暂不符合</option></select></label>
               <label><span>参与账号</span><select className="field" value={form.account_id || ''} onChange={(e) => setForm({ ...form, account_id: e.target.value })}><option value="">未绑定账号</option>{accounts.filter((a) => a.platform === form.platform).map((a) => <option key={a.id} value={a.id}>{a.label}</option>)}</select></label>
               <label className="wide"><span>来源链接</span><input className="field" type="url" value={form.source_url || ''} onChange={(e) => setForm({ ...form, source_url: e.target.value })} placeholder="https://…" /></label>
               <label className="wide"><span>参与条件（每行一条）</span><textarea className="field" value={eligibilityText} onChange={(e) => setEligibilityText(e.target.value)} /></label>
               <label className="wide"><span>内容要求（每行一条）</span><textarea className="field" value={requirementsText} onChange={(e) => setRequirementsText(e.target.value)} /></label>
+              <label className="wide"><span>奖品 / 奖励（每行一条）</span><textarea className="field" value={prizesText} onChange={(e) => setPrizesText(e.target.value)} placeholder="例如：瓜分 5 万元奖金池 / 流量扶持 / 实物奖品" /></label>
+              <label className="wide"><span>获奖条件（每行一条）</span><textarea className="field" value={winningConditionsText} onChange={(e) => setWinningConditionsText(e.target.value)} placeholder="例如：单稿播放量 ≥ 20 万；进入评审 TOP 10" /></label>
               <label className="wide"><span>奖励规则（每行一条）</span><textarea className="field" value={rewardRulesText} onChange={(e) => setRewardRulesText(e.target.value)} /></label>
               <label className="wide"><span>指定话题 / 标签</span><input className="field" value={topicsText} onChange={(e) => setTopicsText(e.target.value)} placeholder="#开学季，#效率工具" /></label>
               <label className="wide"><span>AI 使用要求</span><input className="field" value={form.ai_policy || ''} onChange={(e) => setForm({ ...form, ai_policy: e.target.value || 'unknown' })} placeholder="未说明 / 允许辅助 / 禁止自动生成…" /></label>
-              <label className="wide"><span>活动简介 / 备注</span><textarea className="field" value={form.note || ''} onChange={(e) => setForm({ ...form, note: e.target.value })} /></label>
+              <label className="wide"><span>来源原文 / 补充备注</span><textarea className="field" value={form.note || ''} onChange={(e) => setForm({ ...form, note: e.target.value })} /></label>
             </div>
             <div className="campaign-import-foot"><span>导入内容默认标记为“用户导入”，不会冒充官方核验。</span><div><button className="btn btn-sm" onClick={() => setForm(null)}>取消</button><button className="btn btn-sm btn-primary" disabled={saving || !form.title.trim()} onClick={() => void submitCampaign()}>{saving ? '保存中…' : editId ? '保存新规则版本' : '导入活动'}</button></div></div>
           </div>

@@ -31,6 +31,8 @@ CREATOR_WORDS = ("创作", "创作者", "征稿", "投稿", "激励", "奖金", 
 X_QUERY = '("creator challenge" OR "creator rewards" OR "creator program" OR "creator incentive" OR "call for creators" OR "creator contest" OR "submissions open") -is:retweet'
 BILI_API = "https://api.bilibili.com/x/activity/page/list"
 TIKHUB_API = "https://api.tikhub.io"
+BILI_DETAIL_TTL = 24 * 60 * 60
+BILI_EVA_MARKER = re.compile(r"window\.__BILIACT_EVAPAGEDATA__\s*=\s*")
 
 
 def _now() -> str:
@@ -146,12 +148,163 @@ def _generic_activity_rows(value: Any, limit: int = 60) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
+def _unique_text(values: list[Any], limit: int = 20) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = re.sub(r"\s+", " ", str(value or "")).strip(" ，,；;")
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text[:600])
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _bili_nonzero_prize(value: str) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if re.fullmatch(r"(?:瓜分|奖励)?\s*0(?:\.0+)?\s*元", text):
+        return False
+    return True
+
+
+def _bili_condition_label(value: str) -> bool:
+    text = str(value or "")
+    if not text or any(token in text for token in ("筛选用", "发奖用")):
+        return False
+    return bool(re.search(r"(?:≥|≤|＜|＞|>=|<=|TOP|top|累计|单稿|播放|投币|点赞|评论|收藏|投稿|粉丝|时长|排名)", text))
+
+
+def _bili_reward_summary(value: str) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    if not re.search(r"(奖励|奖金|奖池|奖品|瓜分|现金|流量扶持|创作金|激励金|福利|\d+(?:\.\d+)?\s*(?:万)?元)", text):
+        return ""
+    return text[:600]
+
+
+def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
+    """Extract only explicit, machine-readable rule data from Bilibili EVA pages.
+
+    Image-only rule panels are intentionally ignored: Ripple must not infer text
+    that is not present in the page's structured payload.
+    """
+    match = BILI_EVA_MARKER.search(str(html or ""))
+    if not match:
+        return {}
+    try:
+        data, _ = json.JSONDecoder().raw_decode(html[match.end():])
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+    nodes: list[dict[str, Any]] = []
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if depth > 20:
+            return
+        if isinstance(node, dict):
+            if isinstance(node.get("name"), str) and isinstance(node.get("props"), dict):
+                nodes.append(node)
+            for child in node.values():
+                if isinstance(child, (dict, list)):
+                    walk(child, depth + 1)
+        elif isinstance(node, list):
+            for child in node[:1000]:
+                walk(child, depth + 1)
+
+    walk(data)
+    topics: list[str] = []
+    eligibility: list[str] = []
+    content_requirements: list[str] = []
+    prizes: list[str] = []
+    winning_conditions: list[str] = []
+    reward_rules: list[str] = []
+
+    for node in nodes:
+        name = str(node.get("name") or "")
+        alias = str(node.get("alias") or "").strip()
+        props = node.get("props") if isinstance(node.get("props"), dict) else {}
+
+        if name == "EraVideoSourcePc":
+            config = props.get("config") if isinstance(props.get("config"), dict) else {}
+            topic = str(config.get("topic_name") or "").strip()
+            if topic:
+                topics.append(topic)
+            pools = config.get("poolList") if isinstance(config.get("poolList"), list) else []
+            for pool in pools[:100]:
+                if not isinstance(pool, dict):
+                    continue
+                bonus = str(pool.get("bonus") or "").strip()
+                label = str(pool.get("label") or "").strip()
+                rule = str(pool.get("rule") or "").strip()
+                internal_pool = any(token in label for token in ("筛选用", "发奖用"))
+                if internal_pool:
+                    continue
+                placeholder_one_yuan = bool(
+                    re.fullmatch(r"瓜分\s*1(?:\.0+)?\s*元", bonus)
+                    and not rule and label in {"", "瓜分奖"}
+                )
+                if _bili_nonzero_prize(bonus) and not placeholder_one_yuan:
+                    prizes.append(bonus)
+                condition = rule or (label if _bili_condition_label(label) else "")
+                condition = re.sub(r"[,，]\s*", "、", condition).strip()
+                if condition:
+                    winning_conditions.append(condition)
+                    if _bili_nonzero_prize(bonus) and not placeholder_one_yuan:
+                        reward_rules.append(f"{bonus}：{condition}")
+
+        if name == "EvaLinkButton":
+            button_text = ""
+            button_props = props.get("buttonProps") if isinstance(props.get("buttonProps"), dict) else {}
+            for candidate in (alias, props.get("text"), props.get("content"), button_props.get("content")):
+                if str(candidate or "").strip():
+                    button_text = str(candidate).strip()
+                    break
+            if re.search(r"(报名|招募|申请)", button_text):
+                eligibility.append(f"需通过活动页面完成{re.search(r'(报名|招募|申请)', button_text).group(1)}")
+
+    required_topics = _unique_text(topics, 12)
+    for topic in required_topics:
+        content_requirements.append(f"投稿需关联活动话题：#{topic.lstrip('#')}")
+
+    prizes = _unique_text(prizes, 12)
+    winning_conditions = _unique_text(winning_conditions, 16)
+    reward_rules = _unique_text(reward_rules, 16)
+    eligibility = _unique_text(eligibility, 12)
+    content_requirements = _unique_text(content_requirements, 16)
+
+    summary_parts: list[str] = []
+    if required_topics:
+        summary_parts.append(f"围绕 #{required_topics[0].lstrip('#')} 参与投稿")
+    if prizes:
+        summary_parts.append(f"页面明确的奖励包括：{'、'.join(prizes[:3])}")
+    if winning_conditions:
+        summary_parts.append("奖励设置了明确的数据或创作门槛")
+    return {
+        "summary_hint": "；".join(summary_parts)[:1000],
+        "eligibility": eligibility,
+        "content_requirements": content_requirements,
+        "prizes": prizes,
+        "winning_conditions": winning_conditions,
+        "reward_rules": reward_rules,
+        "required_topics": required_topics,
+    }
+
+
 class CampaignSourceService:
     def __init__(self, workspace, ai_providers: AIProviderService):
         self.workspace = workspace
         self.ai = ai_providers
         self.path = workspace.private / "integrations" / "campaign-sources.json"
         self.secret_path = workspace.private / "integrations" / "campaign-source-tikhub.secret"
+        self.bilibili_detail_cache_path = workspace.private / "integrations" / "campaign-bilibili-details.json"
         self._lock = threading.Lock()
 
     def _empty(self) -> dict[str, Any]:
@@ -342,6 +495,24 @@ class CampaignSourceService:
         row = self._state()["last_sync"].get(platform, {})
         return bool(row.get("status") == "fresh" and time.time() - float(row.get("at") or 0) < SYNC_TTL)
 
+    def _bilibili_detail(self, client: httpx.Client, url: str, cache: dict[str, Any]) -> dict[str, Any]:
+        now = int(time.time())
+        cached = cache.get(url) if isinstance(cache.get(url), dict) else {}
+        if cached and now - int(cached.get("fetched_at") or 0) < BILI_DETAIL_TTL:
+            detail = cached.get("detail")
+            return detail if isinstance(detail, dict) else {}
+        try:
+            response = client.get(url, headers={"Accept": "text/html,application/xhtml+xml"})
+            response.raise_for_status()
+            if len(response.content) > MAX_RESPONSE:
+                return {}
+            detail = _bilibili_detail_from_html(response.text)
+        except (httpx.HTTPError, ValueError, TypeError):
+            return {}
+        cache[url] = {"fetched_at": now, "detail": detail}
+        return detail
+
+
     def _bilibili(self) -> list[dict[str, Any]]:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
@@ -349,9 +520,10 @@ class CampaignSourceService:
             "Accept": "application/json, text/plain, */*",
         }
         rows: list[dict[str, Any]] = []
+        detail_cache = _read(self.bilibili_detail_cache_path, 4 * 1024 * 1024)
         try:
             with httpx.Client(timeout=httpx.Timeout(20, connect=8), trust_env=False,
-                              follow_redirects=False, headers=headers) as client:
+                              follow_redirects=True, headers=headers) as client:
                 for page in (1, 2):
                     response = client.get(BILI_API, params={"plat": "1,3", "mold": 0, "http": 3, "pn": page, "ps": 50})
                     response.raise_for_status()
@@ -366,22 +538,41 @@ class CampaignSourceService:
                             continue
                         url = _safe_url(str(item.get("pc_url") or item.get("h5_url") or ""),
                                         ("bilibili.com", "www.bilibili.com"))
+                        detail = self._bilibili_detail(client, url, detail_cache) if url else {}
+                        detail_hint = str(detail.get("summary_hint") or "").strip()
+                        summary_parts = [part for part in (desc[:700], detail_hint[:700]) if part]
+                        summary = "；".join(dict.fromkeys(summary_parts))[:1200]
                         rows.append({
                             "provider_id": "bilibili_public", "platform": "bilibili",
                             "external_id": f"bilibili:{item.get('id')}", "title": title[:240],
                             "organizer": "B站", "organizer_type": "platform",
                             "activity_type": "创作活动", "reward_type": "",
-                            "reward_summary": desc[:600], "starts_at": _date_from_unix(item.get("stime")),
+                            "reward_summary": _bili_reward_summary(desc), "summary": summary,
+                            "starts_at": _date_from_unix(item.get("stime")),
                             "submit_deadline": _date_from_unix(item.get("etime")),
+                            "eligibility": detail.get("eligibility", []),
+                            "content_requirements": detail.get("content_requirements", []),
+                            "prizes": detail.get("prizes", []),
+                            "winning_conditions": detail.get("winning_conditions", []),
+                            "reward_rules": detail.get("reward_rules", []),
+                            "required_topics": detail.get("required_topics", []),
                             "source_url": url, "source_type": "platform_public",
                             "source_status": "verified", "note": desc[:3000],
-                            "evidence": {"kind": "platform_public_list", "url": url,
+                            "evidence": {"kind": "platform_public_detail" if detail else "platform_public_list", "url": url,
                                          "external_id": str(item.get("id") or "")[:160]},
                         })
                     if len(values) < 50:
                         break
         except (httpx.HTTPError, ValueError, TypeError):
             raise WorkflowError("B站公开活动源暂时无法读取。", 502) from None
+        if detail_cache:
+            # Bound the cache so long-running self-hosted instances do not grow forever.
+            bounded = dict(sorted(
+                ((key, value) for key, value in detail_cache.items() if isinstance(value, dict)),
+                key=lambda pair: int(pair[1].get("fetched_at") or 0),
+                reverse=True,
+            )[:200])
+            _atomic(self.bilibili_detail_cache_path, bounded)
         return rows[:100]
 
     def _x_xai(self) -> list[dict[str, Any]]:
@@ -413,6 +604,7 @@ class CampaignSourceService:
                 "title": title[:240], "organizer": str(item.get("organizer") or "")[:160],
                 "organizer_type": "unknown", "activity_type": "创作活动",
                 "reward_type": "", "reward_summary": str(item.get("reward_summary") or "")[:600],
+                "summary": str(item.get("description") or "")[:1200],
                 "starts_at": "", "submit_deadline": str(item.get("submit_deadline") or "")[:40],
                 "source_url": url, "source_type": "x_search", "source_status": "verified",
                 "note": str(item.get("description") or "")[:3000],
@@ -436,7 +628,8 @@ class CampaignSourceService:
                 "external_id": f"x:{item.get('id')}", "title": title[:240],
                 "organizer": ("@" + str(item.get("username") or ""))[:160],
                 "organizer_type": "unknown", "activity_type": "活动公告候选",
-                "reward_type": "", "reward_summary": "", "starts_at": str(item.get("created_at") or "")[:40],
+                "reward_type": "", "reward_summary": "", "summary": text[:1200],
+                "starts_at": str(item.get("created_at") or "")[:40],
                 "submit_deadline": "", "source_url": str(item.get("url") or "")[:2048],
                 "source_type": "x_developer_api", "source_status": "verified", "note": text[:3000],
                 "evidence": {"kind": "x_post", "url": str(item.get("url") or "")[:2048],
@@ -470,6 +663,7 @@ class CampaignSourceService:
                 "external_id": ("xhs:" + str(item.get("external_id"))) if item.get("external_id") else "",
                 "title": title[:240], "organizer": "小红书创作服务平台", "organizer_type": "platform",
                 "activity_type": "创作活动", "reward_type": "", "reward_summary": "",
+                "summary": str(item.get("description") or "")[:1200],
                 "starts_at": _date_from_unix(item.get("starts_at")),
                 "submit_deadline": _date_from_unix(item.get("ends_at")),
                 "source_url": url or "https://creator.xiaohongshu.com/new/events",
@@ -509,6 +703,7 @@ class CampaignSourceService:
                 "external_id": ("douyin:" + str(item.get("external_id"))) if item.get("external_id") else "",
                 "title": title[:240], "organizer": "抖音创作者中心", "organizer_type": "platform",
                 "activity_type": "创作活动", "reward_type": "", "reward_summary": "",
+                "summary": str(item.get("description") or "")[:1200],
                 "starts_at": _date_from_unix(item.get("starts_at")),
                 "submit_deadline": _date_from_unix(item.get("ends_at")),
                 "source_url": url or "https://creator.douyin.com/",
@@ -551,6 +746,7 @@ class CampaignSourceService:
                 "external_id": ("douyin:" + str(item.get("external_id"))) if item.get("external_id") else "",
                 "title": title[:240], "organizer": "抖音", "organizer_type": "platform",
                 "activity_type": "创作活动", "reward_type": "", "reward_summary": "",
+                "summary": str(item.get("description") or "")[:1200],
                 "starts_at": _date_from_unix(item.get("starts_at")),
                 "submit_deadline": _date_from_unix(item.get("ends_at")),
                 "source_url": url, "source_type": "third_party_api", "source_status": "verified",
