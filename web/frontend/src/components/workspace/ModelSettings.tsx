@@ -131,7 +131,7 @@ export default function ModelSettings() {
       <Feedback error={error} notice={notice} />
       <div className="r2-section-heading">
         <strong>{state?.providers.length || 0} 个 Provider</strong>
-        <span>默认 Agent、选题生成、联网核验与 X 活动发现可以分别绑定模型。</span>
+        <span>默认 Agent、选题生成与 X 活动发现可以分别绑定模型。</span>
       </div>
 
       <div className="r2-api-list">
@@ -166,7 +166,7 @@ export default function ModelSettings() {
 
       <div className="r2-ai-routes">
         <h3>用途路由</h3>
-        {(state?.purposes || []).map((purpose) => {
+        {(state?.purposes || []).filter((purpose) => purpose.id !== 'research').map((purpose) => {
           const route = state?.routes[purpose.id];
           const value = route ? `${route.provider_id}::${route.model_id}` : '';
           return <label className="r2-field" key={purpose.id}><span>{purpose.label}</span>

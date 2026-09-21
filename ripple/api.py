@@ -8,6 +8,7 @@ import hmac
 import os
 from pathlib import Path
 import re
+import time
 import uuid
 from typing import Any
 
@@ -797,11 +798,18 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
             stop = asyncio.Event()
 
             async def scheduler():
+                next_campaign_check = 0.0
                 while not stop.is_set():
                     try:
                         await asyncio.to_thread(service.tick)
+                        now = time.monotonic()
+                        if now >= next_campaign_check:
+                            next_campaign_check = now + 30
+                            campaign_tick = getattr(instance.state, "campaign_scheduler_tick", None)
+                            if callable(campaign_tick):
+                                await asyncio.to_thread(campaign_tick)
                     except Exception:
-                        logger.error("Ripple scheduler paused this tick; inspect local state integrity.")
+                        logger.exception("Ripple scheduler paused this tick; inspect local state integrity.")
                     try:
                         await asyncio.wait_for(stop.wait(), timeout=2)
                     except asyncio.TimeoutError:

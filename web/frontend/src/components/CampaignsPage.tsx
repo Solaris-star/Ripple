@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   configureCampaignSource, createCampaign, createIdea, createSchedule, fetchCampaigns, fetchCampaignSources,
-  fetchStatus, fetchTrends, recommendIdeas, refreshCampaigns, saveCampaign, updateCampaign,
+  fetchStatus, fetchTrends, recommendIdeas, refreshCampaigns, saveCampaign, updateCampaign, verifyCampaign,
 } from '../lib/api';
 import type {
   Campaign, CampaignInput, CampaignPlatform, CampaignSourceCapability, IdeaRecommendation,
@@ -145,6 +145,12 @@ function campaignTime(campaign: Campaign): string {
   return start + ' → ' + end + countdown;
 }
 
+function syncIntervalLabel(seconds?: number): string {
+  if (!seconds) return '';
+  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
+  return `${Math.round(seconds / 60)} 分钟`;
+}
+
 function platformLabel(key: string): string {
   return platformDisplayName(key);
 }
@@ -162,6 +168,7 @@ export default function CampaignsPage({
   const [selected, setSelected] = useState<Campaign | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [refreshing, setRefreshing] = useState(false);
+  const [verifying, setVerifying] = useState(false);
   const [sourceEditor, setSourceEditor] = useState<CampaignSourceCapability | null>(null);
   const [sourceDraft, setSourceDraft] = useState<SourceDraft>({
     method: '', x_api_account_id: '', fallback_method: '', fallback_enabled: false,
@@ -199,7 +206,7 @@ export default function CampaignsPage({
     window.setTimeout(() => setToast(''), 2300);
   };
 
-  const load = useCallback(async (autoRefresh = false) => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
       const runtime = await fetchStatus();
@@ -211,25 +218,11 @@ export default function CampaignsPage({
       const [campaignRows, sourceState, accountRows] = await Promise.all([
         fetchCampaigns(), fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
       ]);
-      let nextCampaigns = campaignRows;
-      let nextSources = sourceState;
       setAccounts(accountRows);
-      if (autoRefresh) {
-        const automaticPlatforms = Array.from(new Set(
-          sourceState.items.filter((source) => source.automatic).map((source) => source.platform),
-        ));
-        if (automaticPlatforms.length) {
-          try {
-            const refreshed = await refreshCampaigns(automaticPlatforms, false);
-            nextCampaigns = refreshed.campaigns;
-            nextSources = refreshed.sources;
-          } catch { /* initial sync failure is represented by the source state on next manual refresh */ }
-        }
-      }
-      setCampaigns(nextCampaigns);
-      setSources(nextSources.items || []);
-      setAutomaticCount(nextSources.automatic_count || 0);
-      setSelected((current) => current ? nextCampaigns.find((x) => x.id === current.id) || null : null);
+      setCampaigns(campaignRows);
+      setSources(sourceState.items || []);
+      setAutomaticCount(sourceState.automatic_count || 0);
+      setSelected((current) => current ? campaignRows.find((x) => x.id === current.id) || null : null);
       setError('');
     } catch (e) {
       const message = e instanceof Error ? e.message : '活动数据读取失败';
@@ -242,8 +235,8 @@ export default function CampaignsPage({
   }, []);
 
   useEffect(() => {
-    void load(true);
-    const timer = window.setInterval(() => { void load(true); }, 30 * 60 * 1000);
+    void load();
+    const timer = window.setInterval(() => { void load(); }, 60 * 1000);
     return () => window.clearInterval(timer);
   }, [load]);
 
@@ -263,6 +256,7 @@ export default function CampaignsPage({
     try {
       const result = await refreshCampaigns(platforms, true);
       setCampaigns(result.campaigns);
+      setSelected((current) => current ? result.campaigns.find((row) => row.id === current.id) || current : null);
       setSources(result.sources.items || []);
       setAutomaticCount(result.sources.automatic_count || 0);
       const fresh = result.results.filter((row) => row.status === 'fresh');
@@ -270,6 +264,21 @@ export default function CampaignsPage({
       showToast(`已刷新 ${fresh.length} 个来源${stale.length ? `，${stale.length} 个来源需要处理` : ''}`);
     } catch (e) { setError(e instanceof Error ? e.message : '活动刷新失败'); }
     finally { setRefreshing(false); }
+  };
+
+  const verifySelected = async () => {
+    if (!selected || verifying) return;
+    setVerifying(true); setError('');
+    try {
+      const updated = await verifyCampaign(selected.id);
+      setSelected(updated);
+      setCampaigns((rows) => rows.map((row) => row.id === updated.id ? updated : row));
+      showToast('活动规则已重新核验');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '活动规则核验失败');
+    } finally {
+      setVerifying(false);
+    }
   };
 
   const openSourceEditor = (source: CampaignSourceCapability) => {
@@ -522,7 +531,7 @@ export default function CampaignsPage({
           <p className="page-subtitle">聚合 X、小红书、抖音、B站、微信公众号、微信视频号的创作活动与激励活动，结合热点生成选题灵感。</p>
         </div>
         <div className="campaign-head-actions">
-          <button className="btn btn-sm btn-primary" disabled={refreshing || loading} onClick={() => void refreshNow()}>
+          <button className="btn btn-sm btn-primary" title="立即重新检查已启用的活动源；单个活动规则可在详情中单独重新核验" disabled={refreshing || loading} onClick={() => void refreshNow()}>
             <IconRefresh size={13} /> {refreshing ? '刷新中…' : '刷新活动'}
           </button>
           <button className="btn btn-sm" onClick={openNew}>+ 补充导入</button>
@@ -539,7 +548,7 @@ export default function CampaignsPage({
         <IconRefresh size={15} />
         <div>
           <strong>已就绪 {automaticCount} 个自动活动源</strong>
-          <span>B站零配置自动同步；X 可选 xAI X Search 或 X Developer API；小红书和抖音优先复用创作者后台登录态。收费备用源未经显式启用不会调用。</span>
+          <span>活动源由 Ripple 后端定时同步，页面无需保持打开；右上角“刷新活动”可随时手动重新检查。收费备用源未经显式启用不会调用。</span>
         </div>
       </div>
       <section className="campaign-source-status-grid">
@@ -564,8 +573,10 @@ export default function CampaignsPage({
               <span>{SOURCE_HEALTH[source.status || ''] || source.status || (source.automatic ? '自动同步' : '支持导入')}</span>
             </div>
             <p>{source.detail}</p>
+            {source.automatic && source.sync_interval_seconds ? <small>自动频率：{syncIntervalLabel(source.sync_interval_seconds)}</small> : null}
             {source.cost_note && <small>{source.cost_note}</small>}
             {sync?.at && <small>最近同步：{new Date(sync.at * 1000).toLocaleString('zh-CN')} · {sync.status}{sync.count != null ? ` · ${sync.count} 条` : ''}{sync.fallback_used ? ' · 使用备用源' : ''}</small>}
+            {source.automatic && source.next_sync_at ? <small>下次自动检查约：{new Date(source.next_sync_at * 1000).toLocaleString('zh-CN')}</small> : null}
             {sync?.error && <small className="error">{sync.error}</small>}
             <div className="campaign-source-status-actions">
               {configurable && <button className="r2-text-button" onClick={() => openSourceEditor(source)}>配置</button>}
@@ -708,17 +719,18 @@ export default function CampaignsPage({
                 <span><small>统计截止</small>{dateOnly(selected.stats_deadline) || '未说明'}</span>
               </div>
             </section>
-            <section><h4>参与条件</h4>{selected.eligibility.length ? <ul>{selected.eligibility.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确参与条件。</p>}</section>
-            <section><h4>内容要求</h4>{selected.content_requirements.length ? <ul>{selected.content_requirements.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确内容要求。</p>}</section>
-            <section><h4>奖品 / 奖励</h4>{selected.prizes.length ? <ul>{selected.prizes.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{selected.reward_summary || '原活动页暂未解析到明确奖品。'}</p>}</section>
-            <section><h4>获奖条件</h4>{selected.winning_conditions.length ? <ul>{selected.winning_conditions.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确获奖门槛。</p>}</section>
-            <section><h4>奖励规则</h4>{selected.reward_rules.length ? <ul>{selected.reward_rules.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">未解析到额外的奖励计算或发放规则。</p>}</section>
-            <section><h4>指定话题 / 标签</h4>{selected.required_topics.length ? <div className="campaign-topic-tags">{selected.required_topics.map((x) => <span key={x}>{x.startsWith('#') ? x : `# ${x}`}</span>)}</div> : <p className="campaign-unknown">未解析到指定话题。</p>}</section>
+            <section><h4>参与条件</h4>{selected.eligibility?.length ? <ul>{selected.eligibility.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确参与条件。</p>}</section>
+            <section><h4>内容要求</h4>{selected.content_requirements?.length ? <ul>{selected.content_requirements.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确内容要求。</p>}</section>
+            <section><h4>奖品 / 奖励</h4>{selected.prizes?.length ? <ul>{selected.prizes.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{selected.reward_summary || '原活动页暂未解析到明确奖品。'}</p>}</section>
+            <section><h4>获奖条件</h4>{selected.winning_conditions?.length ? <ul>{selected.winning_conditions.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确获奖门槛。</p>}</section>
+            <section><h4>奖励规则</h4>{selected.reward_rules?.length ? <ul>{selected.reward_rules.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">未解析到额外的奖励计算或发放规则。</p>}</section>
+            <section><h4>指定话题 / 标签</h4>{selected.required_topics?.length ? <div className="campaign-topic-tags">{selected.required_topics.map((x) => <span key={x}>{x.startsWith('#') ? x : `# ${x}`}</span>)}</div> : <p className="campaign-unknown">未解析到指定话题。</p>}</section>
             <section><h4>AI 使用要求</h4><p className="campaign-copy">{selected.ai_policy === 'unknown' || !selected.ai_policy ? '原活动规则未说明 AI 使用要求。' : selected.ai_policy}</p></section>
             <section><h4>来源与核验</h4>
               <p className="campaign-source-name"><strong>{sourceName(selected)}</strong> · {sourceLabel(selected)}</p>
               {selected.source_url ? <a className="campaign-source-link" href={selected.source_url} target="_blank" rel="noreferrer">{selected.source_url}</a> : <p className="campaign-unknown">没有保存来源链接。</p>}
-              <p className="campaign-verify">最近核验：{selected.last_verified_at ? new Date(selected.last_verified_at * 1000).toLocaleString('zh-CN') : '未由 Ripple 核验'} · 规则版本 v{selected.rule_version}</p>
+              <p className="campaign-verify">首次发现：{selected.discovered_at ? new Date(selected.discovered_at * 1000).toLocaleString('zh-CN') : '未知'} · 最后看到：{selected.last_seen_at ? new Date(selected.last_seen_at * 1000).toLocaleString('zh-CN') : '未知'}</p>
+              <p className="campaign-verify">规则最近核验：{selected.last_verified_at ? new Date(selected.last_verified_at * 1000).toLocaleString('zh-CN') : '尚未完整核验'} · 规则版本 v{selected.rule_version}</p>
             </section>
             <footer>
               <button className="btn btn-primary campaign-generate" disabled={selected.status === 'ended' || selected.status === 'cancelled'}
@@ -726,6 +738,7 @@ export default function CampaignsPage({
               <div>
                 <button className="btn btn-sm" onClick={() => void addCalendar(selected)}><IconCalendar size={13} /> 加入选题日历</button>
                 {selected.source_url && <a className="btn btn-sm" href={selected.source_url} target="_blank" rel="noreferrer">打开原活动页</a>}
+                {selected.platform === 'bilibili' && <button className="btn btn-sm" disabled={verifying} onClick={() => void verifySelected()}><IconRefresh size={13} /> {verifying ? '核验中…' : '重新核验规则'}</button>}
                 {selected.source_type === 'user_import' && <button className="btn btn-sm" onClick={() => openEdit(selected)}>编辑规则</button>}
               </div>
             </footer>

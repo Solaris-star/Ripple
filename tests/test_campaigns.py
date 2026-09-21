@@ -30,6 +30,22 @@ def _campaign(**overrides):
     return upstream.CampaignInput(**payload)
 
 
+def test_legacy_campaign_rows_are_normalized_for_new_detail_fields(tmp_path, monkeypatch):
+    path = tmp_path / "campaigns.json"
+    path.write_text(json.dumps([{
+        "id": "legacy-1", "title": "旧活动", "platform": "bilibili",
+        "created_at": 100, "updated_at": 120, "last_verified_at": 0,
+    }], ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", path)
+    row = upstream._read_campaigns()[0]
+    assert row["summary"] == ""
+    assert row["prizes"] == []
+    assert row["winning_conditions"] == []
+    assert row["eligibility"] == []
+    assert row["discovered_at"] == 100
+    assert row["last_seen_at"] == 120
+
+
 def test_campaign_import_is_not_presented_as_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     created = asyncio.run(upstream.api_campaign_create(_campaign()))
@@ -153,6 +169,78 @@ def test_automatic_candidate_merges_evidence_without_overwriting_manual_rules(tm
     assert merged["summary"] == "面向用户的活动摘要"
     assert merged["prizes"] == ["奖金池 5 万元"]
     assert merged["winning_conditions"] == ["播放量达到活动门槛"]
+
+
+def test_list_discovery_and_rule_verification_use_separate_timestamps(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    listed = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:1",
+        "title": "B站活动", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/a.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_list"},
+    })
+    assert listed["last_seen_at"] > 0
+    assert listed["last_verified_at"] == 0
+    first_version = listed["rule_version"]
+
+    verified = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:1",
+        "title": "B站活动", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/a.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+        "prizes": ["瓜分5000元"], "winning_conditions": ["总投币数≥30"],
+    })
+    assert verified["last_verified_at"] > 0
+    assert verified["prizes"] == ["瓜分5000元"]
+    assert verified["winning_conditions"] == ["总投币数≥30"]
+    assert verified["rule_version"] == first_version + 1
+
+    cleared = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:1",
+        "title": "B站活动", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/a.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+    })
+    assert cleared["prizes"] == []
+    assert cleared["winning_conditions"] == []
+    assert cleared["rule_version"] == first_version + 2
+
+
+def test_single_bilibili_rule_verify_enriches_existing_campaign(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    item = upstream._merge_campaign_candidate(items, {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:9",
+        "title": "待核验活动", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/detail.html",
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_list"},
+    })
+    upstream._write_campaigns(items)
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "verify_bilibili_campaign", lambda current: {
+        "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:9",
+        "title": current["title"], "organizer": "B站", "source_url": current["source_url"],
+        "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+        "eligibility": ["需报名"], "prizes": ["瓜分5000元"], "winning_conditions": ["播放量≥10000"],
+    })
+    result = asyncio.run(upstream.api_campaign_verify(item["id"]))
+    assert result["eligibility"] == ["需报名"]
+    assert result["prizes"] == ["瓜分5000元"]
+    assert result["winning_conditions"] == ["播放量≥10000"]
+    assert result["last_verified_at"] > 0
+
+
+def test_background_campaign_tick_merges_due_provider_results(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "due_platforms", lambda: ["bilibili"])
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "refresh", lambda platforms, force=False: {
+        "results": [{"platform": "bilibili", "status": "fresh", "items": [{
+            "provider_id": "bilibili_public", "platform": "bilibili", "external_id": "bilibili:bg",
+            "title": "后台同步活动", "organizer": "B站", "source_url": "https://www.bilibili.com/blackboard/bg.html",
+            "source_type": "platform_public", "evidence": {"kind": "platform_public_detail"},
+            "prizes": ["奖金池"],
+        }]}],
+        "sources": {},
+    })
+    result = upstream._campaign_scheduler_tick()
+    assert result["due"] == ["bilibili"]
+    assert upstream._read_campaigns()[0]["title"] == "后台同步活动"
 
 
 def test_campaign_recommendation_uses_campaign_as_data_and_returns_rule_version(tmp_path, monkeypatch):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import time
 
 import pytest
 
@@ -30,6 +31,47 @@ def test_public_source_state_has_bilibili_ready_without_configuration(source_ser
     assert bili["automatic"] is True
     assert bili["billing"] == "free"
     assert state["automatic_count"] == 1
+
+    assert bili["sync_interval_seconds"] == 30 * 60
+    assert bili["next_sync_at"] == 0
+
+
+def test_campaign_scheduler_intervals_and_failed_attempt_backoff(source_service):
+    _, service = source_service
+    assert service.sync_interval("bilibili") == 30 * 60
+    assert service.sync_interval("x") == 2 * 60 * 60
+    assert service.sync_interval("xiaohongshu") == 60 * 60
+    assert service.sync_interval("douyin") == 60 * 60
+
+    state = service._state()
+    now = int(time.time())
+    state["last_sync"]["bilibili"] = {"at": now, "status": "error", "count": 0, "error": "fixture"}
+    service._write(state)
+    assert "bilibili" not in service.due_platforms()
+    bili = next(row for row in service.public_state()["items"] if row["platform"] == "bilibili")
+    assert bili["next_sync_at"] == now + 30 * 60
+
+    state = service._state()
+    state["last_sync"]["bilibili"]["at"] = now - 31 * 60
+    service._write(state)
+    assert "bilibili" in service.due_platforms()
+
+
+def test_bilibili_priority_detail_rules_cover_saved_linked_and_near_deadline(source_service):
+    workspace, service = source_service
+    campaigns = [
+        {"id": "saved", "platform": "bilibili", "saved": True, "source_url": "https://www.bilibili.com/blackboard/saved.html"},
+        {"id": "linked", "platform": "bilibili", "saved": False, "source_url": "https://www.bilibili.com/blackboard/linked.html"},
+        {"id": "plain", "platform": "bilibili", "saved": False, "source_url": "https://www.bilibili.com/blackboard/plain.html"},
+    ]
+    (workspace.outputs / "_campaigns.json").write_text(json.dumps(campaigns, ensure_ascii=False), encoding="utf-8")
+    (workspace.outputs / "_ideas.json").write_text(json.dumps([{"campaign_id": "linked"}]), encoding="utf-8")
+    urls = service._bilibili_priority_urls()
+    assert "https://www.bilibili.com/blackboard/saved.html" in urls
+    assert "https://www.bilibili.com/blackboard/linked.html" in urls
+    assert "https://www.bilibili.com/blackboard/plain.html" not in urls
+    assert service._bilibili_deadline_soon(time.time() + 6 * 24 * 60 * 60) is True
+    assert service._bilibili_deadline_soon(time.time() + 8 * 24 * 60 * 60) is False
 
 
 def test_bilibili_detail_parser_separates_prizes_winning_conditions_and_entry_requirements():

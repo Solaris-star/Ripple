@@ -307,6 +307,8 @@ export interface Campaign {
   source_type: string;
   source_status: 'imported' | 'verified' | 'stale' | 'unavailable' | string;
   last_verified_at: number;
+  discovered_at?: number;
+  last_seen_at?: number;
   note: string;
   status: 'upcoming' | 'active' | 'ended' | 'cancelled' | 'unknown';
   account_id: string;
@@ -345,6 +347,8 @@ export interface CampaignSourceCapability {
   tikhub_enabled?: boolean;
   tikhub_api_key_set?: boolean;
   last_sync?: CampaignSourceSyncState;
+  sync_interval_seconds?: number;
+  next_sync_at?: number;
 }
 export interface CampaignSourceState { items: CampaignSourceCapability[]; automatic_count: number; revision?: number; }
 export interface CampaignRefreshResult {
@@ -355,8 +359,27 @@ export interface CampaignRefreshResult {
   stale_platforms: string[];
   campaigns: Campaign[];
 }
-export function fetchCampaigns(): Promise<Campaign[]> { return request('/api/campaigns'); }
-export function fetchCampaign(id: string): Promise<Campaign> { return request(`/api/campaigns/${encodeURIComponent(id)}`); }
+function normalizeCampaign(item: Campaign): Campaign {
+  return {
+    ...item,
+    summary: item.summary || '',
+    eligibility: Array.isArray(item.eligibility) ? item.eligibility : [],
+    content_requirements: Array.isArray(item.content_requirements) ? item.content_requirements : [],
+    prizes: Array.isArray(item.prizes) ? item.prizes : [],
+    winning_conditions: Array.isArray(item.winning_conditions) ? item.winning_conditions : [],
+    reward_rules: Array.isArray(item.reward_rules) ? item.reward_rules : [],
+    required_topics: Array.isArray(item.required_topics) ? item.required_topics : [],
+  };
+}
+export function fetchCampaigns(): Promise<Campaign[]> {
+  return request<Campaign[]>('/api/campaigns').then((items) => items.map(normalizeCampaign));
+}
+export function fetchCampaign(id: string): Promise<Campaign> {
+  return request<Campaign>(`/api/campaigns/${encodeURIComponent(id)}`).then(normalizeCampaign);
+}
+export function verifyCampaign(id: string): Promise<Campaign> {
+  return request<Campaign>(`/api/campaigns/${encodeURIComponent(id)}/verify`, { method: 'POST' }).then(normalizeCampaign);
+}
 export function fetchCampaignSources(): Promise<CampaignSourceState> { return request('/api/campaigns/sources'); }
 export function configureCampaignSource(platform: CampaignPlatform, input: {
   method?: string; x_api_account_id?: string; fallback_method?: string; fallback_enabled?: boolean;
@@ -367,9 +390,9 @@ export function configureCampaignSource(platform: CampaignPlatform, input: {
   });
 }
 export function refreshCampaigns(platforms: CampaignPlatform[] = [], force = false): Promise<CampaignRefreshResult> {
-  return request('/api/campaigns/refresh', {
+  return request<CampaignRefreshResult>('/api/campaigns/refresh', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platforms, force }),
-  });
+  }).then((result) => ({ ...result, campaigns: result.campaigns.map(normalizeCampaign) }));
 }
 export function createCampaign(item: CampaignInput): Promise<Campaign> {
   return request('/api/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });

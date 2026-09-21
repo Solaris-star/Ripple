@@ -25,13 +25,19 @@ from .publishing import WorkflowError
 from .secrets import protect
 
 
-SYNC_TTL = 30 * 60
+SYNC_INTERVALS = {
+    "bilibili": 30 * 60,
+    "x": 2 * 60 * 60,
+    "xiaohongshu": 60 * 60,
+    "douyin": 60 * 60,
+}
 MAX_RESPONSE = 4 * 1024 * 1024
 CREATOR_WORDS = ("创作", "创作者", "征稿", "投稿", "激励", "奖金", "UP主", "视频", "内容", "挑战")
 X_QUERY = '("creator challenge" OR "creator rewards" OR "creator program" OR "creator incentive" OR "call for creators" OR "creator contest" OR "submissions open") -is:retweet'
 BILI_API = "https://api.bilibili.com/x/activity/page/list"
 TIKHUB_API = "https://api.tikhub.io"
 BILI_DETAIL_TTL = 24 * 60 * 60
+BILI_PRIORITY_DETAIL_TTL = 6 * 60 * 60
 BILI_EVA_MARKER = re.compile(r"window\.__BILIACT_EVAPAGEDATA__\s*=\s*")
 
 
@@ -60,6 +66,16 @@ def _read(path: Path, limit: int = 1024 * 1024) -> dict:
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def _read_list(path: Path, limit: int = 4 * 1024 * 1024) -> list[dict[str, Any]]:
+    try:
+        if not path.is_file() or path.stat().st_size > limit:
+            return []
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
+    except (OSError, ValueError, TypeError):
+        return []
 
 
 def _safe_url(value: str, roots: tuple[str, ...]) -> str:
@@ -414,6 +430,14 @@ class CampaignSourceService:
             return status, (account.get("label") if account else "请选择已连接的 X Developer API 账号")
         return "needs_config", "选择 xAI X Search 或 X Developer API。"
 
+    def sync_interval(self, platform: str) -> int:
+        return int(SYNC_INTERVALS.get(platform, 60 * 60))
+
+    def next_sync_at(self, platform: str) -> int:
+        row = self._state()["last_sync"].get(platform, {})
+        at = int(row.get("at") or 0)
+        return at + self.sync_interval(platform) if at else 0
+
     def public_state(self) -> dict[str, Any]:
         state = self._state()
         x_method = str(state["x"].get("method") or "")
@@ -478,6 +502,10 @@ class CampaignSourceService:
                 "billing": "unknown", "last_sync": state["last_sync"].get("weixin-channels", {}),
             },
         ]
+        for row in rows:
+            platform = str(row.get("platform") or "")
+            row["sync_interval_seconds"] = self.sync_interval(platform)
+            row["next_sync_at"] = self.next_sync_at(platform) if row.get("automatic") else 0
         return {"items": rows, "automatic_count": sum(1 for row in rows if row["automatic"]),
                 "revision": state["revision"]}
 
@@ -493,27 +521,122 @@ class CampaignSourceService:
 
     def _recent(self, platform: str) -> bool:
         row = self._state()["last_sync"].get(platform, {})
-        return bool(row.get("status") == "fresh" and time.time() - float(row.get("at") or 0) < SYNC_TTL)
+        # Successful and failed attempts both observe the platform interval.
+        # Manual force refresh is the explicit bypass; the background scheduler
+        # must never hammer a broken or paid provider every two seconds.
+        return bool(
+            float(row.get("at") or 0) > 0
+            and time.time() - float(row.get("at") or 0) < self.sync_interval(platform)
+        )
 
-    def _bilibili_detail(self, client: httpx.Client, url: str, cache: dict[str, Any]) -> dict[str, Any]:
+    def due_platforms(self) -> list[str]:
+        state = self.public_state()
+        return [
+            str(row["platform"]) for row in state["items"]
+            if row.get("automatic") and not self._recent(str(row.get("platform") or ""))
+        ]
+
+    def _bilibili_priority_urls(self) -> set[str]:
+        campaigns = _read_list(self.workspace.outputs / "_campaigns.json")
+        ideas = _read_list(self.workspace.outputs / "_ideas.json")
+        linked_ids = {
+            str(row.get("campaign_id") or "") for row in ideas
+            if str(row.get("campaign_id") or "")
+        }
+        urls: set[str] = set()
+        for campaign in campaigns:
+            if campaign.get("platform") != "bilibili":
+                continue
+            if not (campaign.get("saved") or str(campaign.get("id") or "") in linked_ids):
+                continue
+            url = _safe_url(str(campaign.get("source_url") or ""), ("bilibili.com", "www.bilibili.com"))
+            if url:
+                urls.add(url)
+        return urls
+
+    @staticmethod
+    def _bilibili_deadline_soon(value: Any) -> bool:
+        try:
+            stamp = float(value)
+            if stamp > 10_000_000_000:
+                stamp /= 1000
+            delta = stamp - time.time()
+            return 0 <= delta <= 7 * 24 * 60 * 60
+        except (TypeError, ValueError, OSError, OverflowError):
+            return False
+
+    def _bilibili_detail(self, client: httpx.Client, url: str, cache: dict[str, Any], *,
+                           force: bool = False, strict: bool = False,
+                           ttl: int = BILI_DETAIL_TTL) -> dict[str, Any]:
         now = int(time.time())
         cached = cache.get(url) if isinstance(cache.get(url), dict) else {}
-        if cached and now - int(cached.get("fetched_at") or 0) < BILI_DETAIL_TTL:
+        if not force and cached and now - int(cached.get("fetched_at") or 0) < max(0, int(ttl)):
             detail = cached.get("detail")
             return detail if isinstance(detail, dict) else {}
         try:
             response = client.get(url, headers={"Accept": "text/html,application/xhtml+xml"})
             response.raise_for_status()
             if len(response.content) > MAX_RESPONSE:
+                if strict:
+                    raise WorkflowError("B站活动详情响应超过安全上限。", 502)
                 return {}
             detail = _bilibili_detail_from_html(response.text)
+        except WorkflowError:
+            raise
         except (httpx.HTTPError, ValueError, TypeError):
+            if strict:
+                raise WorkflowError("B站活动详情暂时无法重新核验，请稍后重试。", 502) from None
             return {}
         cache[url] = {"fetched_at": now, "detail": detail}
         return detail
 
 
-    def _bilibili(self) -> list[dict[str, Any]]:
+    def verify_bilibili_campaign(self, campaign: dict[str, Any]) -> dict[str, Any]:
+        url = _safe_url(str(campaign.get("source_url") or ""), ("bilibili.com", "www.bilibili.com"))
+        if not url:
+            raise WorkflowError("当前活动没有可核验的 B站官方详情链接。", 422)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
+            "Referer": "https://www.bilibili.com/blackboard/activity-list.html",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        with self._lock:
+            cache = _read(self.bilibili_detail_cache_path, 4 * 1024 * 1024)
+            with httpx.Client(timeout=httpx.Timeout(20, connect=8), trust_env=False,
+                              follow_redirects=True, headers=headers) as client:
+                detail = self._bilibili_detail(client, url, cache, force=True, strict=True, ttl=0)
+            cache[url] = {"fetched_at": int(time.time()), "detail": detail}
+            _atomic(self.bilibili_detail_cache_path, dict(list(cache.items())[-200:]))
+        return {
+            "provider_id": "bilibili_public",
+            "platform": "bilibili",
+            "external_id": next(
+                (str(v) for v in (campaign.get("external_ids") or {}).values() if str(v).startswith("bilibili:")),
+                "",
+            ),
+            "title": str(campaign.get("title") or "")[:240],
+            "organizer": str(campaign.get("organizer") or "B站")[:160],
+            "organizer_type": str(campaign.get("organizer_type") or "platform")[:40],
+            "activity_type": str(campaign.get("activity_type") or "创作活动")[:80],
+            "reward_type": str(campaign.get("reward_type") or "")[:120],
+            "reward_summary": str(campaign.get("reward_summary") or "")[:600],
+            "summary": str(campaign.get("summary") or "")[:1200],
+            "starts_at": str(campaign.get("starts_at") or "")[:40],
+            "submit_deadline": str(campaign.get("submit_deadline") or "")[:40],
+            "eligibility": detail.get("eligibility", []),
+            "content_requirements": detail.get("content_requirements", []),
+            "prizes": detail.get("prizes", []),
+            "winning_conditions": detail.get("winning_conditions", []),
+            "reward_rules": detail.get("reward_rules", []),
+            "required_topics": detail.get("required_topics", []),
+            "source_url": url,
+            "source_type": "platform_public",
+            "source_status": "verified",
+            "note": str(campaign.get("note") or "")[:3000],
+            "evidence": {"kind": "platform_public_detail", "url": url},
+        }
+
+    def _bilibili(self, *, force_priority_details: bool = False) -> list[dict[str, Any]]:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
             "Referer": "https://www.bilibili.com/blackboard/activity-list.html",
@@ -521,6 +644,7 @@ class CampaignSourceService:
         }
         rows: list[dict[str, Any]] = []
         detail_cache = _read(self.bilibili_detail_cache_path, 4 * 1024 * 1024)
+        priority_urls = self._bilibili_priority_urls()
         try:
             with httpx.Client(timeout=httpx.Timeout(20, connect=8), trust_env=False,
                               follow_redirects=True, headers=headers) as client:
@@ -538,7 +662,12 @@ class CampaignSourceService:
                             continue
                         url = _safe_url(str(item.get("pc_url") or item.get("h5_url") or ""),
                                         ("bilibili.com", "www.bilibili.com"))
-                        detail = self._bilibili_detail(client, url, detail_cache) if url else {}
+                        priority = bool(url and (url in priority_urls or self._bilibili_deadline_soon(item.get("etime"))))
+                        detail = self._bilibili_detail(
+                            client, url, detail_cache,
+                            force=bool(force_priority_details and priority),
+                            ttl=BILI_PRIORITY_DETAIL_TTL if priority else BILI_DETAIL_TTL,
+                        ) if url else {}
                         detail_hint = str(detail.get("summary_hint") or "").strip()
                         summary_parts = [part for part in (desc[:700], detail_hint[:700]) if part]
                         summary = "；".join(dict.fromkeys(summary_parts))[:1200]
@@ -770,7 +899,7 @@ class CampaignSourceService:
                     fallback_used = False
                     provider = ""
                     if platform == "bilibili":
-                        items = self._bilibili(); provider = "bilibili_public"
+                        items = self._bilibili(force_priority_details=force); provider = "bilibili_public"
                     elif platform == "x":
                         method = str(state["x"].get("method") or "")
                         try:

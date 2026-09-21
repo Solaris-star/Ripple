@@ -3726,6 +3726,29 @@ CAMPAIGN_STATUSES = {"upcoming", "active", "ended", "cancelled", "unknown"}
 CAMPAIGN_QUALIFICATION_STATES = {"eligible", "ineligible", "unknown"}
 
 
+def _normalize_campaign(item: dict) -> dict:
+    for field in ("eligibility", "content_requirements", "prizes", "winning_conditions",
+                  "reward_rules", "required_topics", "rule_history", "source_evidence"):
+        if not isinstance(item.get(field), list):
+            item[field] = []
+    if not isinstance(item.get("external_ids"), dict):
+        item["external_ids"] = {}
+    if not isinstance(item.get("account_states"), dict):
+        item["account_states"] = {}
+    for field in ("summary", "reward_summary", "source_url", "source_type", "source_status",
+                  "note", "starts_at", "signup_deadline", "submit_deadline", "stats_deadline",
+                  "timezone", "ai_policy", "account_id"):
+        if item.get(field) is None:
+            item[field] = ""
+    created = int(item.get("created_at") or 0)
+    updated = int(item.get("updated_at") or created or 0)
+    verified = int(item.get("last_verified_at") or 0)
+    item["discovered_at"] = int(item.get("discovered_at") or created or updated or verified or 0)
+    item["last_seen_at"] = int(item.get("last_seen_at") or verified or updated or created or 0)
+    item["last_verified_at"] = verified
+    return item
+
+
 def _read_campaigns() -> list[dict]:
     if not CAMPAIGNS_FILE.is_file():
         return []
@@ -3733,13 +3756,7 @@ def _read_campaigns() -> list[dict]:
         data = json.loads(CAMPAIGNS_FILE.read_text(encoding="utf-8"))
         if not isinstance(data, list):
             return []
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            item.setdefault("summary", "")
-            item.setdefault("prizes", [])
-            item.setdefault("winning_conditions", [])
-        return data
+        return [_normalize_campaign(item) for item in data if isinstance(item, dict)]
     except Exception:
         return []
 
@@ -3894,6 +3911,8 @@ def _campaign_from_request(req: CampaignInput, previous: dict | None = None) -> 
         "source_type": previous.get("source_type") or "user_import",
         "source_status": previous.get("source_status") or "imported",
         "last_verified_at": int(previous.get("last_verified_at") or 0),
+        "discovered_at": int(previous.get("discovered_at") or previous.get("created_at") or now),
+        "last_seen_at": int(previous.get("last_seen_at") or previous.get("created_at") or now),
         "note": req.note,
         "status": status,
         "account_id": req.account_id,
@@ -3943,6 +3962,14 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
     provider_id = str(candidate.get("provider_id") or "")[:80]
     external_id = str(candidate.get("external_id") or "")[:200]
     evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
+    evidence_kind = str(evidence.get("kind") or "")
+    authoritative_rules = evidence_kind == "platform_public_detail"
+    rule_verified = evidence_kind not in {"", "platform_public_list"} or any(
+        candidate.get(field) for field in (
+            "eligibility", "content_requirements", "prizes", "winning_conditions",
+            "reward_rules", "required_topics",
+        )
+    )
     account_id = str(candidate.get("account_id") or "")[:80]
     if existing is None:
         item = {
@@ -3973,7 +4000,9 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "source_url": str(candidate.get("source_url") or "")[:2000],
             "source_type": str(candidate.get("source_type") or "automatic")[:80],
             "source_status": "verified",
-            "last_verified_at": now,
+            "discovered_at": now,
+            "last_seen_at": now,
+            "last_verified_at": now if rule_verified else 0,
             "note": str(candidate.get("note") or "")[:6000],
             "status": "unknown",
             "account_id": account_id,
@@ -4001,7 +4030,14 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
         for field in list_fields:
             incoming = [str(x)[:240] for x in candidate.get(field, []) if str(x).strip()][:30]
             current = item.get(field) if isinstance(item.get(field), list) else []
-            if incoming and (not manual or not current):
+            if manual:
+                if incoming and not current:
+                    proposed[field] = incoming
+            elif authoritative_rules:
+                # B站详情页是完整规则快照；显式消失的字段也要清掉，
+                # 否则旧奖品/门槛会永久残留。
+                proposed[field] = incoming
+            elif incoming:
                 proposed[field] = incoming
         changed = any(item.get(k) != v for k, v in proposed.items())
         if changed and int(item.get("rule_version") or 0) > 0:
@@ -4010,7 +4046,9 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             item["rule_history"] = history[-20:]
             item["rule_version"] = int(item.get("rule_version") or 0) + 1
         item.update(proposed)
-        item["last_verified_at"] = now
+        item["last_seen_at"] = now
+        if rule_verified:
+            item["last_verified_at"] = now
         item["source_status"] = "verified"
         item["updated_at"] = now
         if not item.get("source_url") and candidate.get("source_url"):
@@ -4064,6 +4102,18 @@ def _merge_campaign_refresh(payload: dict) -> dict:
     return {"merged": merged, "total": len(items), "stale_platforms": stale_platforms}
 
 
+def _campaign_scheduler_tick() -> dict:
+    due = _CAMPAIGN_SOURCES.due_platforms()
+    if not due:
+        return {"due": [], "merged": 0}
+    payload = _CAMPAIGN_SOURCES.refresh(due, force=False)
+    merged = _merge_campaign_refresh(payload)
+    return {"due": due, **merged}
+
+
+app.state.campaign_scheduler_tick = _campaign_scheduler_tick
+
+
 @app.get("/api/campaigns/sources")
 async def api_campaign_sources():
     _ensure_ai_provider_migration()
@@ -4097,6 +4147,21 @@ async def api_campaign_list():
 async def api_campaign_detail(cid: str):
     item = _campaign_by_id(cid)
     return {**item, "status": _campaign_effective_status(item)}
+
+
+@app.post("/api/campaigns/{cid}/verify")
+async def api_campaign_verify(cid: str):
+    item = _campaign_by_id(cid)
+    if item.get("platform") != "bilibili":
+        raise HTTPException(409, "当前仅 B站支持单活动规则重新核验；其他平台请使用“刷新活动”。")
+    try:
+        candidate = await asyncio.to_thread(_CAMPAIGN_SOURCES.verify_bilibili_campaign, item)
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    items = _read_campaigns()
+    updated = _merge_campaign_candidate(items, candidate)
+    _write_campaigns(items)
+    return {**updated, "status": _campaign_effective_status(updated)}
 
 
 @app.post("/api/campaigns")
