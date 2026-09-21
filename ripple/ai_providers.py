@@ -342,7 +342,7 @@ class AIProviderService:
         state = self._state()
         if provider_id:
             provider = self._provider(state, provider_id)
-            base = str(provider.get("base_url") or "")
+            base = _valid_endpoint(base_url) if str(base_url or "").strip() else str(provider.get("base_url") or "")
             key = api_key.strip() or self._key(provider_id)
         else:
             if kind not in KINDS:
@@ -362,8 +362,16 @@ class AIProviderService:
                 data = response.json()
         except WorkflowError:
             raise
-        except (httpx.HTTPError, ValueError, TypeError):
-            raise WorkflowError("无法从 Provider 读取模型列表；可以手工添加模型 ID。", 502) from None
+        except httpx.TimeoutException:
+            raise WorkflowError("Provider /models 请求超时（20 秒）；请检查该接口是否可用，或先手工添加模型 ID。", 504) from None
+        except httpx.HTTPStatusError as exc:
+            raise WorkflowError(f"Provider /models 返回 HTTP {exc.response.status_code}；请检查接口权限与 Base URL。", 502) from None
+        except httpx.ConnectError:
+            raise WorkflowError("无法连接 Provider /models；请检查 Base URL、DNS 与网络连通性。", 502) from None
+        except httpx.HTTPError:
+            raise WorkflowError("Provider /models 请求失败；请检查网络与接口兼容性。", 502) from None
+        except (ValueError, TypeError):
+            raise WorkflowError("Provider /models 返回的不是有效 JSON 模型列表；可以手工添加模型 ID。", 502) from None
         values = data.get("data", data.get("models", [])) if isinstance(data, dict) else []
         rows = _model_rows(values if isinstance(values, list) else [])
         return rows[:MAX_MODELS]

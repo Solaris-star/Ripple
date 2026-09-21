@@ -30,6 +30,8 @@ export default function ModelSettings() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverFeedback, setDiscoverFeedback] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null);
 
   const load = async () => setState(await fetchAIProviders());
   useEffect(() => { void load().catch((e) => setError(e instanceof Error ? e.message : '模型配置读取失败')); }, []);
@@ -53,7 +55,7 @@ export default function ModelSettings() {
       default_model: provider.default_model, enabled: provider.enabled,
       api_key_set: provider.api_key_set,
     });
-    setManualModel(''); setError(''); setNotice('');
+    setManualModel(''); setError(''); setNotice(''); setDiscoverFeedback(null);
   };
 
   const addManual = () => {
@@ -66,18 +68,30 @@ export default function ModelSettings() {
 
   const discover = async () => {
     if (!editor || busy) return;
-    setBusy(true); setError(''); setNotice('');
+    setBusy(true); setDiscovering(true); setError(''); setNotice(''); setDiscoverFeedback(null);
     try {
       const result = await discoverAIProviderModels({
         provider_id: editor.provider_id, kind: editor.kind, base_url: editor.base_url, api_key: editor.api_key,
       });
+      const existing = new Set(editor.models.map((row) => row.id));
       const map = new Map(editor.models.map((row) => [row.id, row]));
       for (const row of result.items) map.set(row.id, row);
       const models = [...map.values()];
+      const added = result.items.filter((row) => !existing.has(row.id)).length;
       setEditor({ ...editor, models, default_model: editor.default_model || models[0]?.id || '' });
-      setNotice(`发现 ${result.items.length} 个模型。`);
-    } catch (e) { setError(e instanceof Error ? e.message : '模型发现失败'); }
-    finally { setBusy(false); }
+      setDiscoverFeedback({
+        kind: 'ok',
+        text: result.items.length === 0
+          ? 'Provider 已响应，但 /models 没有返回可用模型。'
+          : added > 0
+            ? `发现 ${result.items.length} 个模型，新增 ${added} 个；列表已更新。`
+            : `发现 ${result.items.length} 个模型，均已在当前列表中。`,
+      });
+    } catch (e) {
+      setDiscoverFeedback({ kind: 'error', text: e instanceof Error ? e.message : '模型发现失败' });
+    } finally {
+      setDiscovering(false); setBusy(false);
+    }
   };
 
   const save = async () => {
@@ -162,7 +176,7 @@ export default function ModelSettings() {
         </div>)}
         {state && !state.providers.length && <div className="r2-api-empty">还没有 AI Provider。旧版单 Provider 配置会自动迁移到这里。</div>}
       </div>
-      <button className="r2-button" disabled={busy || !!editor} onClick={() => { setEditor(blank()); setManualModel(''); }}>+ 添加 Provider</button>
+      <button className="r2-button" disabled={busy || !!editor} onClick={() => { setEditor(blank()); setManualModel(''); setDiscoverFeedback(null); }}>+ 添加 Provider</button>
 
       <div className="r2-ai-routes">
         <h3>用途路由</h3>
@@ -188,14 +202,15 @@ export default function ModelSettings() {
           <label className="r2-field wide"><span>Base URL</span><input type="url" value={editor.base_url} onChange={(e) => setEditor({ ...editor, base_url: e.target.value })} placeholder={editor.kind === 'xai' ? 'https://api.x.ai/v1' : 'https://api.example.com/v1'} /></label>
           <label className="r2-field wide"><span>API Key</span><input type="password" autoComplete="new-password" value={editor.api_key} onChange={(e) => setEditor({ ...editor, api_key: e.target.value })} placeholder={editor.api_key_set ? '已加密保存；留空保持原 Key' : '首次保存必须填写'} /></label>
         </div>
-        <div className="r2-toolbar"><button className="r2-button" disabled={busy || !editor.base_url || (!editor.api_key && !editor.api_key_set)} onClick={() => void discover()}>发现 /models</button><span className="r2-muted">发现失败仍可手工添加模型 ID。</span></div>
+        <div className="r2-toolbar"><button className="r2-button" disabled={busy || !editor.base_url || (!editor.api_key && !editor.api_key_set)} onClick={() => void discover()}>{discovering ? '正在读取 /models…' : '发现 /models'}</button><span className="r2-muted">最长等待 20 秒；失败仍可手工添加模型 ID。</span></div>
+        {discoverFeedback && <div className={`r2-provider-discover-feedback ${discoverFeedback.kind === 'error' ? 'error' : 'ok'}`} role={discoverFeedback.kind === 'error' ? 'alert' : 'status'}>{discoverFeedback.text}</div>}
         <div className="r2-agent-model-add"><input value={manualModel} onChange={(e) => setManualModel(e.target.value)} placeholder="模型 ID，例如 grok-4.6" onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addManual(); } }} /><button className="r2-button" disabled={!manualModel.trim()} onClick={addManual}>添加</button></div>
         <div className="r2-agent-model-list">{editor.models.map((model) => <div key={model.id}>
           <label className="r2-radio-line"><input type="radio" name="provider-default-model" checked={editor.default_model === model.id} onChange={() => setEditor({ ...editor, default_model: model.id })} /><span><strong>{model.name || model.id}</strong><small>{model.id}</small></span></label>
           <button className="r2-text-button" disabled={editor.models.length <= 1 || editor.default_model === model.id} onClick={() => setEditor({ ...editor, models: editor.models.filter((row) => row.id !== model.id) })}>移除</button>
         </div>)}</div>
         <label className="r2-checkbox"><input type="checkbox" checked={editor.enabled} onChange={(e) => setEditor({ ...editor, enabled: e.target.checked })} />启用此 Provider</label>
-        <div className="r2-toolbar"><button className="r2-button primary" disabled={busy || !editor.base_url || !editor.default_model || !editor.models.length || (!editor.api_key && !editor.api_key_set)} onClick={() => void save()}>{busy ? '保存中…' : '保存 Provider'}</button></div>
+        <div className="r2-toolbar"><button className="r2-button primary" disabled={busy || !editor.base_url || !editor.default_model || !editor.models.length || (!editor.api_key && !editor.api_key_set)} onClick={() => void save()}>{busy && !discovering ? '保存中…' : '保存 Provider'}</button></div>
       </div>}
     </div>
   </section>;

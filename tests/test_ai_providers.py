@@ -80,6 +80,54 @@ def test_x_search_capability_cannot_be_assumed_from_grok_model_name(tmp_path, mo
         service.x_search("creator challenge")
 
 
+def test_discover_existing_provider_prefers_current_editor_base_url(tmp_path, monkeypatch):
+    from ripple import ai_providers
+    monkeypatch.setattr(ai_providers, "protect", fake_protect)
+    service = AIProviderService(tmp_path / "private")
+    state = service.upsert(
+        name="Gateway", kind="openai-compatible", base_url="https://old.example/v1",
+        api_key="secret", models=["model-a"], default_model="model-a",
+    )
+    provider_id = state["providers"][0]["id"]
+    seen = []
+
+    class Response:
+        content = b'{"data":[{"id":"model-b"}]}'
+        def raise_for_status(self): return None
+        def json(self): return {"data": [{"id": "model-b"}]}
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def get(self, url):
+            seen.append(url)
+            return Response()
+
+    monkeypatch.setattr(ai_providers.httpx, "Client", Client)
+    rows = service.discover(provider_id=provider_id, base_url="https://new.example/v1")
+    assert seen == ["https://new.example/v1/models"]
+    assert rows[0]["id"] == "model-b"
+
+
+def test_discover_timeout_reports_specific_error(tmp_path, monkeypatch):
+    from ripple import ai_providers
+    service = AIProviderService(tmp_path / "private")
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def get(self, url):
+            request = ai_providers.httpx.Request("GET", url)
+            raise ai_providers.httpx.ReadTimeout("slow", request=request)
+
+    monkeypatch.setattr(ai_providers.httpx, "Client", Client)
+    with pytest.raises(WorkflowError, match="20 秒") as exc:
+        service.discover(base_url="https://slow.example/v1", api_key="secret")
+    assert exc.value.status == 504
+
+
 def test_provider_rejects_insecure_public_endpoint(tmp_path, monkeypatch):
     from ripple import ai_providers
     monkeypatch.setattr(ai_providers, "protect", fake_protect)
