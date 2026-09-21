@@ -179,6 +179,13 @@ class XhsOpsService:
         self._record_snapshot(account_id, 'notes', payload)
         return payload
 
+    def events(self, account_id: str, limit: int = 30) -> dict[str, Any]:
+        result = self._worker(account_id, 'events', {'limit': max(1, min(limit, 50))})
+        payload = {'source': str(result['data'].get('source') or 'creator_events'),
+                   'sample_scope': 'selected_account_creator_events', 'fetched_at': _now(), **result['data']}
+        self._record_snapshot(account_id, 'events', payload)
+        return payload
+
     def note(self, account_id: str, *, note_id: str = '', url: str = '') -> dict[str, Any]:
         note_id, locator = self._locator(account_id, note_id=note_id, url=url)
         result = self._worker(account_id, 'note', {'url': locator})

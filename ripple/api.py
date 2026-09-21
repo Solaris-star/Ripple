@@ -722,6 +722,8 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
             "/api/env",
             "/api/model-config",
             "/api/media-model-config",
+            "/api/ai-providers",
+            "/api/campaigns/sources",
             "/api/agent/profiles",
             "/api/agent/runtimes",
             "/api/ripple/environment",

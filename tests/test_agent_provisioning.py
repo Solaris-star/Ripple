@@ -28,8 +28,9 @@ def test_adapter_options_are_hidden_until_native_agent_is_detected(tmp_path: Pat
     assert not service.root.exists(), "read-only detection must not materialize provisioning storage"
 
 
-def test_manifest_distinguishes_builtin_and_installable_adapters(tmp_path: Path):
+def test_manifest_distinguishes_builtin_and_installable_adapters(tmp_path: Path, monkeypatch):
     service = AgentAdapterProvisioningService(tmp_path / "private")
+    monkeypatch.setattr(service, "_unmanaged_command", lambda spec: None)
 
     opencode = service.options_for_runtime("opencode", _runtime(ready=True))
     assert [(row["id"], row["state"], row["actions"]) for row in opencode] == [

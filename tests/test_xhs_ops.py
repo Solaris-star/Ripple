@@ -36,6 +36,11 @@ def fake_read_result(action: str) -> dict:
         return {"state": "success", "data": {"items": [{"note_id": "note123", "title": "搜索结果", "url": "https://www.xiaohongshu.com/explore/note123", "scope": "keyword_search", "metrics": {}}], "_locators": [{"note_id": "note123", "url": locator}]}}
     if action == "notes":
         return {"state": "success", "data": {"items": [{"note_id": "note123", "title": "我的作品", "url": "https://www.xiaohongshu.com/explore/note123", "scope": "account_notes", "metrics": {"likes": 12}}], "_locators": [{"note_id": "note123", "url": locator}]}}
+    if action == "events":
+        return {"state": "success", "data": {"source": "creator_events_api", "items": [{
+            "external_id": "event1", "title": "创作活动", "url": "https://creator.xiaohongshu.com/new/events",
+            "starts_at": "", "ends_at": "", "description": "活动详情",
+        }]}}
     if action == "note":
         return {"state": "success", "data": {"note": {"note_id": "note123", "title": "详情", "body": "正文", "author": "作者", "url": "https://www.xiaohongshu.com/explore/note123", "scope": "note_detail", "metrics": {"likes": 12}, "images": []}, "_locators": [{"note_id": "note123", "url": locator}]}}
     if action == "comments":
@@ -92,6 +97,20 @@ def test_search_and_account_notes_have_explicit_sample_scope(tmp_path, monkeypat
     assert search["sample_scope"] == "query:旅行"
     assert notes["sample_scope"] == "selected_account_creator_notes"
     assert search["items"][0]["scope"] == "keyword_search"
+
+
+def test_creator_events_use_same_connected_xhs_profile_boundary(tmp_path, monkeypatch):
+    service, account_id = connected_service(tmp_path)
+    calls = []
+    def run(account, operation, operation_id, **extra):
+        calls.append((operation, extra["xhs_action"]))
+        return fake_read_result(extra["xhs_action"])
+    monkeypatch.setattr(service.accounts, "run", run)
+    result = service.xhs_ops.events(account_id, 10)
+    assert result["source"] == "creator_events_api"
+    assert result["sample_scope"] == "selected_account_creator_events"
+    assert result["items"][0]["external_id"] == "event1"
+    assert calls == [("xhs_read", "events")]
 
 
 def test_interaction_draft_idempotency_guard_and_execute_once(tmp_path, monkeypatch):

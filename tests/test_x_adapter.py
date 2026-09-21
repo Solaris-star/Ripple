@@ -45,6 +45,13 @@ class FakeX:
         if path == '/2/users/me':
             assert request.headers.get('authorization', '').startswith('Bearer access-')
             return httpx.Response(200, json={'data':{'id':'42','username':'ripple_fixture','name':'Ripple Fixture'}})
+        if path == '/2/tweets/search/recent':
+            assert request.headers.get('authorization', '').startswith('Bearer access-')
+            assert 'creator' in request.url.params.get('query', '')
+            return httpx.Response(200, json={
+                'data': [{'id':'post-search-1','text':'Creator challenge submissions open','author_id':'42','created_at':'2026-09-21T00:00:00Z'}],
+                'includes': {'users': [{'id':'42','username':'ripple_fixture','name':'Ripple Fixture','verified':True}]},
+            })
         if path == '/2/media/upload':
             self.media += 1
             if self.fail_media:
@@ -179,6 +186,18 @@ def test_expired_token_refreshes_before_probe(work):
     checked = service.x.probe(account['id'], True)
     assert checked['status'] == 'connected' and fake.refreshes == 1
     assert 'access-refresh' not in service.x._credentials_path(account['id']).read_text()
+
+
+def test_x_developer_recent_search_is_read_only_and_normalized(work):
+    service, fake = work
+    account, _ = start_and_finish(service)
+    result = service.x.search_recent(account['id'], 'creator challenge', 25)
+    assert result['count'] == 1
+    item = result['items'][0]
+    assert item['id'] == 'post-search-1'
+    assert item['username'] == 'ripple_fixture'
+    assert item['url'] == 'https://x.com/ripple_fixture/status/post-search-1'
+    assert fake.posts == 0
 
 
 def test_native_x_text_post_is_once_and_keeps_manual_publication_boundary(work):

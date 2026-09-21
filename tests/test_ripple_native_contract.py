@@ -62,8 +62,8 @@ def payload(native, platform='zhihu', operation='publish', media=False):
             'media_paths':[str(file)] if media else []}
 
 
-@pytest.mark.parametrize('platform',list(NATIVE))
-def test_native_login_contract_each_platform(native,platform):
+@pytest.mark.parametrize('platform',[platform for platform in NATIVE if platform != 'douyin'])
+def test_native_login_contract_each_legacy_platform(native,platform):
     p=payload(native,platform,'login')
     result=worker.execute(p)
     assert result['state']=='connected' and result['identity']['remote_id']=='fixture-user'

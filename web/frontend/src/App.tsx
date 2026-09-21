@@ -719,7 +719,8 @@ ${JSON.stringify(structured, null, 2)}
         return <TrendsPage onUseTopic={handleUseTopic} onBreakdown={handleBreakdown} />;
       case 'campaigns':
         return <CampaignsPage onUseTopic={handleUseTopic} persona={selectedPersona} aiReady={recommendationAiReady}
-          personas={personas} onPersonaChange={handlePersonaChange} onNewPersona={() => setShowWizard(true)} />;
+          personas={personas} onPersonaChange={handlePersonaChange} onNewPersona={() => setShowWizard(true)}
+          onOpenSettings={() => setCurrentPage('integrations')} />;
       case 'ideas':
         return <IdeasPage onUseTopic={handleUseTopic} persona={selectedPersona} aiReady={recommendationAiReady}
           personas={personas} onPersonaChange={handlePersonaChange} onNewPersona={() => setShowWizard(true)} />;

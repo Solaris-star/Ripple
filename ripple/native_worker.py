@@ -63,16 +63,49 @@ def structured_identity(raw: str) -> dict:
 
 def execute(payload: dict) -> dict:
     platform, operation = payload["platform"], payload["operation"]
-    if platform not in NATIVE or operation not in {"login", "probe", "publish", "xhs_read", "xhs_interact"}:
+    if platform not in NATIVE or operation not in {"login", "probe", "publish", "xhs_read", "xhs_interact", "campaign_read"}:
         raise ValueError("unsupported operation")
     if operation in {"xhs_read", "xhs_interact"} and platform != "xiaohongshu":
         raise ValueError("xiaohongshu operation requires xiaohongshu account")
+    if operation == "campaign_read" and platform != "douyin":
+        raise ValueError("campaign_read currently supports douyin creator accounts only")
     if not re.fullmatch(r'[a-f0-9]{32}', payload.get('operation_id', '')):
         raise ValueError('invalid operation id')
     directory = Path(payload["private_dir"]).resolve()
     run_dir = directory / "operations" / payload["operation_id"]
     run_dir.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(SCRIPTS))
+    if platform == "douyin" and operation in {"login", "probe", "campaign_read"}:
+        from . import douyin_browser
+        try:
+            if operation == "login":
+                identity = douyin_browser.login(
+                    directory, headed=bool(payload.get("headed", True)),
+                    browser_channel=str(payload.get("browser_channel") or "") or None,
+                    timeout=240, fallback_name=str(payload.get("profile_label") or ""),
+                )
+                return {"state": "connected", "identity": identity, "message": "抖音创作者账号登录状态已核验。"}
+            if operation == "probe":
+                identity = douyin_browser.probe(
+                    directory, browser_channel=str(payload.get("browser_channel") or "") or None,
+                    fallback_name=str(payload.get("profile_label") or ""),
+                )
+                return {"state": "connected" if identity.get("logged_in") else "expired",
+                        "identity": identity, "message": "账号状态已核验。" if identity.get("logged_in") else "抖音创作者登录态已失效。"}
+            params = payload.get("campaign_params") if isinstance(payload.get("campaign_params"), dict) else {}
+            params = {**params, "browser_channel": str(payload.get("browser_channel") or "")}
+            data = douyin_browser.run(str(payload.get("campaign_action") or "events"), directory, params)
+            return {"state": "success", "not_submitted": True,
+                    "message": "抖音创作者中心活动只读获取完成。", "data": data}
+        except douyin_browser.DouyinBrowserError as exc:
+            code = str(exc)
+            if code == "login_required":
+                return {"state": "verification_required" if operation == "campaign_read" else "expired",
+                        "not_submitted": True, "identity": {"logged_in": False, "name": "", "remote_id": ""},
+                        "message": "抖音创作者中心登录态已失效，请先重新连接账号。", "data": {}}
+            return {"state": "failed_terminal", "not_submitted": True,
+                    "message": "抖音创作者中心只读操作未完成。", "data": {}}
+
     module = importlib.import_module(NATIVE[platform]["module"])
     import login_state
     # Redirect every legacy diagnostic path, including paths calculated from __file__.

@@ -60,6 +60,68 @@ MY_NOTES_JS = r"""(limit) => {
   }
   return out;
 }"""
+CREATOR_EVENTS_JS = r"""(limit) => {
+  const out=[]; const seen=new Set();
+  const nodes=Array.from(document.querySelectorAll("a[href], [class*=event], [class*=activity], [class*=task], [class*=card]"));
+  for(const node of nodes) {
+    if(out.length>=limit) break;
+    const text=(node.innerText||node.textContent||'').replace(/\s+/g,' ').trim();
+    if(!text || text.length<4 || !/(活动|征稿|激励|创作|任务|招募|挑战)/.test(text)) continue;
+    const a=node.matches?.('a[href]') ? node : node.querySelector?.('a[href]');
+    const href=a?.href||'';
+    const title=(node.querySelector?.("[class*=title],[class*=name],h1,h2,h3,h4")?.textContent||text.split('  ')[0]||text).trim().slice(0,200);
+    const key=(href||title).toLowerCase(); if(!key||seen.has(key)) continue; seen.add(key);
+    out.push({title, url:href, text:text.slice(0,1600)});
+  }
+  return out;
+}"""
+
+
+def _campaign_candidates(value: Any, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Extract bounded activity-like rows from creator JSON without depending on one response schema."""
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    title_keys = ("activity_name", "activityName", "event_name", "eventName", "task_name", "taskName",
+                  "title", "name", "subject")
+    id_keys = ("activity_id", "activityId", "event_id", "eventId", "task_id", "taskId", "id")
+    start_keys = ("start_time", "startTime", "begin_time", "beginTime", "start_at", "startAt")
+    end_keys = ("end_time", "endTime", "deadline", "submit_deadline", "submitDeadline", "expire_time", "expireTime")
+    url_keys = ("jump_url", "jumpUrl", "url", "link", "h5_url", "h5Url")
+    desc_keys = ("description", "desc", "summary", "sub_title", "subTitle")
+
+    def walk(node: Any, depth: int = 0) -> None:
+        if len(rows) >= limit or depth > 7:
+            return
+        if isinstance(node, list):
+            for child in node[:200]:
+                walk(child, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        title = next((str(node.get(k) or '').strip() for k in title_keys if str(node.get(k) or '').strip()), '')
+        activityish = any(k in node for k in id_keys + start_keys + end_keys) or any(
+            word in title for word in ("活动", "征稿", "激励", "创作", "任务", "招募", "挑战")
+        )
+        if title and activityish and len(title) <= 300:
+            external_id = next((str(node.get(k) or '').strip() for k in id_keys if str(node.get(k) or '').strip()), '')
+            key = (external_id or title).casefold()
+            if key not in seen:
+                seen.add(key)
+                rows.append({
+                    "external_id": external_id[:160],
+                    "title": title[:240],
+                    "url": next((str(node.get(k) or '').strip() for k in url_keys if str(node.get(k) or '').strip()), '')[:2048],
+                    "starts_at": next((str(node.get(k) or '').strip() for k in start_keys if str(node.get(k) or '').strip()), '')[:80],
+                    "ends_at": next((str(node.get(k) or '').strip() for k in end_keys if str(node.get(k) or '').strip()), '')[:80],
+                    "description": next((str(node.get(k) or '').strip() for k in desc_keys if str(node.get(k) or '').strip()), '')[:3000],
+                })
+        for child in node.values():
+            if isinstance(child, (dict, list)):
+                walk(child, depth + 1)
+
+    walk(value)
+    return rows[:limit]
+
 COMMENT_TARGET_COUNT_JS = r"""([id,nickname,content]) => {
   const uniq=[];
   const push=(e)=>{ if(e && !uniq.includes(e)) uniq.push(e); };
@@ -272,6 +334,64 @@ def account_notes(directory: Path, limit: int) -> dict[str, Any]:
         _close(p, context)
 
 
+def creator_events(directory: Path, limit: int = 30) -> dict[str, Any]:
+    p, context, page = _launch(directory)
+    payloads: list[Any] = []
+    try:
+        def on_response(response):
+            lower = response.url.lower()
+            if not any(token in lower for token in ("event", "activity", "campaign", "mission", "task", "inspire")):
+                return
+            try:
+                if "json" in (response.headers.get("content-type") or "").lower():
+                    value = response.json()
+                    if isinstance(value, (dict, list)) and len(payloads) < 40:
+                        payloads.append(value)
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        _goto(page, "https://creator.xiaohongshu.com/new/events", wait=2600)
+        body = ""
+        try:
+            body = (page.locator("body").inner_text(timeout=1500) or "")[:5000]
+        except Exception:
+            pass
+        if "login" in (page.url or "").lower() or ("登录" in body and ("扫码" in body or "手机号" in body)):
+            raise XhsBrowserError("login_required")
+        for _ in range(2):
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(700)
+        items: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for payload in payloads:
+            for row in _campaign_candidates(payload, limit=max(limit * 2, 30)):
+                key = (row.get("external_id") or row.get("url") or row.get("title") or "").casefold()
+                if key and key not in seen:
+                    seen.add(key); items.append(row)
+                    if len(items) >= limit: break
+            if len(items) >= limit: break
+        source = "creator_events_api"
+        if not items:
+            source = "creator_events_dom"
+            raw = page.evaluate(CREATOR_EVENTS_JS, max(1, min(limit, 50))) or []
+            for row in raw:
+                if not isinstance(row, dict): continue
+                title = str(row.get("title") or "").strip()[:240]
+                if not title: continue
+                items.append({
+                    "external_id": "",
+                    "title": title,
+                    "url": str(row.get("url") or "")[:2048],
+                    "starts_at": "",
+                    "ends_at": "",
+                    "description": str(row.get("text") or "")[:3000],
+                })
+        return {"items": items[:limit], "source": source, "page_url": (page.url or "")[:2048]}
+    finally:
+        _close(p, context)
+
+
 def note_detail(directory: Path, url: str) -> dict[str, Any]:
     note_id, _, locator = parse_note_url(url)
     p, context, page = _launch(directory)
@@ -461,6 +581,7 @@ def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
     if action=='feed': return feed(directory,limit)
     if action=='search': return search(directory,str(params.get('query') or ''),limit)
     if action=='notes': return account_notes(directory,limit)
+    if action=='events': return creator_events(directory,limit)
     if action=='note': return note_detail(directory,str(params.get('url') or ''))
     if action=='comments': return comments(directory,str(params.get('url') or ''),limit)
     if action=='reply': return reply(directory,str(params.get('url') or ''),list(params.get('items') or []))

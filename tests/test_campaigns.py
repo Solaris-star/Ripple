@@ -58,14 +58,24 @@ def test_campaign_edit_bumps_rule_version_and_keeps_import_provenance(tmp_path, 
     assert updated["rule_history"][0]["content_requirements"] == ["原创图文"]
 
 
-def test_campaign_source_capabilities_do_not_claim_unverified_automation():
-    state = asyncio.run(upstream.api_campaign_sources())
-    assert len(state["items"]) == 6
-    assert state["automatic_count"] == 0
-    assert all(item["automatic"] is False for item in state["items"])
-    assert {item["platform"] for item in state["items"]} == {
-        "x", "xiaohongshu", "douyin", "bilibili", "wechat", "weixin-channels",
+def test_campaign_source_capabilities_only_claim_bilibili_without_configuration(monkeypatch):
+    state = {
+        "items": [
+            {"platform": "bilibili", "automatic": True, "status": "ready"},
+            {"platform": "x", "automatic": False, "status": "needs_config"},
+            {"platform": "xiaohongshu", "automatic": False, "status": "needs_config"},
+            {"platform": "douyin", "automatic": False, "status": "needs_config"},
+            {"platform": "wechat", "automatic": False, "status": "manual"},
+            {"platform": "weixin-channels", "automatic": False, "status": "manual"},
+        ],
+        "automatic_count": 1,
     }
+    monkeypatch.setattr(upstream, "_ensure_ai_provider_migration", lambda: None)
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "public_state", lambda: state)
+    result = asyncio.run(upstream.api_campaign_sources())
+    assert len(result["items"]) == 6
+    assert result["automatic_count"] == 1
+    assert [item["platform"] for item in result["items"] if item["automatic"]] == ["bilibili"]
 
 
 def test_structured_idea_keeps_campaign_and_trend_context(tmp_path, monkeypatch):
@@ -106,6 +116,29 @@ def test_structured_idea_keeps_campaign_and_trend_context(tmp_path, monkeypatch)
     assert detail["campaign"]["rule_version"] == 2
     assert detail["campaign_rule_snapshot"]["version"] == 1
     assert detail["campaign_rule_snapshot"]["content_requirements"] == ["原创图文"]
+
+
+def test_automatic_candidate_merges_evidence_without_overwriting_manual_rules(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    manual = asyncio.run(upstream.api_campaign_create(_campaign(title="同一个活动", reward_summary="人工确认奖励")))
+    items = upstream._read_campaigns()
+    merged = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events",
+        "platform": "xiaohongshu",
+        "external_id": "xhs:a1",
+        "title": "同一个活动",
+        "organizer": "平台",
+        "reward_summary": "自动源摘要不应覆盖人工规则",
+        "source_url": "https://creator.xiaohongshu.com/new/events",
+        "source_type": "creator_events_api",
+        "evidence": {"kind": "creator_account"},
+        "account_id": "account-1",
+    })
+    assert merged["id"] == manual["id"]
+    assert merged["reward_summary"] == "人工确认奖励"
+    assert merged["external_ids"]["xiaohongshu_creator_events"] == "xhs:a1"
+    assert merged["source_evidence"][-1]["evidence"]["kind"] == "creator_account"
+    assert merged["account_states"]["account-1"]["visible"] is True
 
 
 def test_campaign_recommendation_uses_campaign_as_data_and_returns_rule_version(tmp_path, monkeypatch):

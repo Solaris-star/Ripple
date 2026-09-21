@@ -32,6 +32,7 @@ export interface StatusResponse {
   agentVersion?: string;
   agentModel?: string;
   agentDetail?: string;
+  features?: { campaigns?: boolean; campaign_sources_v2?: boolean; ai_providers_v2?: boolean };
   skills: SkillItem[];
   personas: PersonaItem[];
 }
@@ -308,22 +309,62 @@ export interface Campaign {
   rule_history?: CampaignRuleSnapshot[];
   created_at: number;
   updated_at: number;
+  external_ids?: Record<string, string>;
+  source_evidence?: { provider_id?: string; external_id?: string; source_url?: string; fetched_at?: number; status?: string; evidence?: Record<string, unknown> }[];
+  account_states?: Record<string, { visible?: boolean; qualification_state?: CampaignQualification; last_seen_at?: number; provider_id?: string }>;
 }
 export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<Campaign,
   'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' |
   'starts_at' | 'signup_deadline' | 'submit_deadline' | 'stats_deadline' | 'timezone' |
   'eligibility' | 'qualification_state' | 'content_requirements' | 'reward_rules' |
   'required_topics' | 'ai_policy' | 'source_url' | 'note' | 'status' | 'account_id'>>;
+export interface CampaignSourceSyncState {
+  at?: number; status?: string; count?: number; error?: string; provider?: string; fallback_used?: boolean;
+}
 export interface CampaignSourceCapability {
+  id?: string;
   platform: CampaignPlatform;
   label: string;
-  mode: 'import' | 'automatic' | string;
+  mode: string;
   automatic: boolean;
   detail: string;
+  status?: 'ready' | 'ready_fallback' | 'needs_config' | 'needs_login' | 'stale' | 'error' | 'manual' | string;
+  billing?: 'free' | 'paid_or_plan_dependent' | 'free_primary_paid_fallback' | 'unknown' | string;
+  cost_note?: string;
+  method?: string;
+  x_api_account_id?: string;
+  fallback_method?: string;
+  fallback_enabled?: boolean;
+  account_id?: string;
+  tikhub_enabled?: boolean;
+  tikhub_api_key_set?: boolean;
+  last_sync?: CampaignSourceSyncState;
+}
+export interface CampaignSourceState { items: CampaignSourceCapability[]; automatic_count: number; revision?: number; }
+export interface CampaignRefreshResult {
+  results: { platform: CampaignPlatform; status: string; count: number; provider?: string; fallback_used?: boolean; error?: string }[];
+  sources: CampaignSourceState;
+  merged: number;
+  total: number;
+  stale_platforms: string[];
+  campaigns: Campaign[];
 }
 export function fetchCampaigns(): Promise<Campaign[]> { return request('/api/campaigns'); }
 export function fetchCampaign(id: string): Promise<Campaign> { return request(`/api/campaigns/${encodeURIComponent(id)}`); }
-export function fetchCampaignSources(): Promise<{ items: CampaignSourceCapability[]; automatic_count: number }> { return request('/api/campaigns/sources'); }
+export function fetchCampaignSources(): Promise<CampaignSourceState> { return request('/api/campaigns/sources'); }
+export function configureCampaignSource(platform: CampaignPlatform, input: {
+  method?: string; x_api_account_id?: string; fallback_method?: string; fallback_enabled?: boolean;
+  account_id?: string; tikhub_enabled?: boolean; tikhub_api_key?: string;
+}): Promise<CampaignSourceState> {
+  return request(`/api/campaigns/sources/${encodeURIComponent(platform)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+}
+export function refreshCampaigns(platforms: CampaignPlatform[] = [], force = false): Promise<CampaignRefreshResult> {
+  return request('/api/campaigns/refresh', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platforms, force }),
+  });
+}
 export function createCampaign(item: CampaignInput): Promise<Campaign> {
   return request('/api/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
 }
@@ -400,6 +441,45 @@ export function recommendIdeas(input: {
 }): Promise<IdeaRecommendResponse> {
   return request('/api/ideas/recommend', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+}
+
+// ---- AI / Agent Providers ----
+export type AIRoutePurpose = 'default_agent' | 'idea_generation' | 'research' | 'x_campaign_discovery';
+export interface AIProviderModel { id: string; name: string; effort_levels?: string[]; source?: string; supports_reasoning?: boolean; }
+export interface AIProvider {
+  id: string; name: string; kind: 'openai-compatible' | 'xai'; base_url: string;
+  models: AIProviderModel[]; default_model: string; enabled: boolean; api_key_set: boolean;
+  capabilities: Record<string, string>; migrated_from_legacy?: boolean; updated_at?: string;
+}
+export interface AIProviderState {
+  schema: number; revision: number; providers: AIProvider[];
+  routes: Partial<Record<AIRoutePurpose, { provider_id: string; model_id: string }>>;
+  purposes: { id: AIRoutePurpose; label: string }[];
+}
+export function fetchAIProviders(): Promise<AIProviderState> { return request('/api/ai-providers'); }
+export function saveAIProvider(input: {
+  provider_id?: string; name: string; kind: 'openai-compatible' | 'xai'; base_url: string; api_key?: string;
+  models: (AIProviderModel | string)[]; default_model: string; enabled?: boolean;
+}): Promise<AIProviderState> {
+  return request('/api/ai-providers', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+}
+export function deleteAIProvider(id: string): Promise<AIProviderState> {
+  return request(`/api/ai-providers/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+export function discoverAIProviderModels(input: {
+  provider_id?: string; kind?: 'openai-compatible' | 'xai'; base_url?: string; api_key?: string;
+}): Promise<{ items: AIProviderModel[] }> {
+  return request('/api/ai-providers/discover', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+}
+export function setAIProviderRoute(purpose: AIRoutePurpose, provider_id: string, model_id: string): Promise<AIProviderState> {
+  return request(`/api/ai-providers/routes/${encodeURIComponent(purpose)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ provider_id, model_id }),
+  });
+}
+export function probeAIProvider(id: string, model_id: string, capability: 'chat' | 'x_search' | 'web_search'): Promise<{ ok: boolean; capability: string; state: AIProviderState }> {
+  return request(`/api/ai-providers/${encodeURIComponent(id)}/probe`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model_id, capability }),
   });
 }
 

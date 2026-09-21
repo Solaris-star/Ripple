@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import difflib
 import os
 if os.name == "nt":
@@ -53,6 +54,8 @@ from ripple.media_connections import MediaConnectionStore
 from ripple.library import MotherCreate, MotherRevision
 from ripple.publishing import CreateInput, WorkflowError
 from ripple.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
+from ripple.ai_providers import AIProviderService
+from ripple.campaign_sources import CampaignSourceService
 
 PROFILES_DIR = PROJECT_ROOT / "profiles"
 SKILLS_DIR = PROJECT_ROOT / "skills"
@@ -197,6 +200,10 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac"}
 app = FastAPI(title="Ripple", docs_url=None, redoc_url=None)
 from ripple.api import install as install_ripple
 install_ripple(app, OUTPUTS_DIR)
+_AI_PROVIDERS = AIProviderService(app.state.ripple.private)
+_CAMPAIGN_SOURCES = CampaignSourceService(app.state.ripple, _AI_PROVIDERS)
+app.state.ai_providers = _AI_PROVIDERS
+app.state.campaign_sources = _CAMPAIGN_SOURCES
 
 
 def list_personas() -> list[dict]:
@@ -390,8 +397,21 @@ def _direct_llm_config(env: dict[str, str] | None = None) -> dict[str, str] | No
     return {"base_url": base.rstrip("/"), "api_key": key, "model": model}
 
 
+def _task_llm_config(purpose: str, env: dict[str, str] | None = None) -> dict[str, str] | None:
+    service = globals().get("_AI_PROVIDERS")
+    if service is not None:
+        try:
+            resolved = service.resolved(purpose)
+        except Exception:
+            resolved = None
+        if resolved:
+            return {"base_url": resolved["base_url"], "api_key": resolved["api_key"],
+                    "model": resolved["model"], "provider_id": resolved["provider_id"]}
+    return _direct_llm_config(env)
+
+
 def _recommendation_ai_backend(env: dict[str, str] | None = None) -> str:
-    if _direct_llm_config(env):
+    if _task_llm_config("idea_generation", env):
         return "direct"
     if not _ai_enabled(env):
         return ""
@@ -589,9 +609,9 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def _direct_llm_chat(prompt: str, timeout: int = TIMEOUT_DIRECT) -> str:
     """Call the locally configured OpenAI-compatible endpoint directly."""
-    cfg = _direct_llm_config()
+    cfg = _task_llm_config("idea_generation")
     if not cfg:
-        raise RecommendationAIError(409, "AI 推荐直连配置不完整。")
+        raise RecommendationAIError(409, "AI 推荐模型路由尚未配置。")
     payload = json.dumps({
         "model": cfg["model"],
         "messages": [{"role": "user", "content": prompt}],
@@ -1033,7 +1053,7 @@ def _agent_mcp_guidance(capability_ids: list[str]) -> str:
 async def api_status():
     env = _read_env()
     agent = await asyncio.to_thread(_AGENT_RUNTIME.status, _agent_tool_base(), start=True)
-    recommendation_backend = "direct" if _direct_llm_config(env) else (
+    recommendation_backend = "direct" if _task_llm_config("idea_generation", env) else (
         str(agent.get("runtime") or _AGENT_RUNTIME.default_runtime_id) if _ai_enabled(env) and agent.get("healthy") else ""
     )
     return {
@@ -1044,6 +1064,11 @@ async def api_status():
         "agentDetail": agent.get("detail", ""),
         "recommendationAi": bool(recommendation_backend) or bool(agent.get("healthy")),
         "recommendationProvider": recommendation_backend or (agent.get("runtime", _AGENT_RUNTIME.default_runtime_id) if agent.get("healthy") else ""),
+        "features": {
+            "campaigns": True,
+            "campaign_sources_v2": True,
+            "ai_providers_v2": True,
+        },
         "skills": get_skills(),
         "personas": list_personas(),
     }
@@ -1100,6 +1125,139 @@ def _model_config_status() -> dict:
         "models": registry.get("models", []),
         "api_key_set": bool(_runtime_value("RIPPLE_LLM_API_KEY", env)),
     }
+
+
+def _ensure_ai_provider_migration() -> None:
+    env = _read_env()
+    legacy = _runtime_value("RIPPLE_LLM_MODEL", env)
+    registry = _AGENT_CAPABILITIES.model_state(legacy)
+    _AI_PROVIDERS.ensure_legacy(
+        enabled=_ai_enabled(env),
+        base_url=_runtime_value("RIPPLE_LLM_BASE_URL", env),
+        api_key=_runtime_value("RIPPLE_LLM_API_KEY", env),
+        models=registry.get("models", []),
+        default_model=registry.get("default_model") or legacy,
+    )
+
+
+async def _sync_default_agent_provider() -> None:
+    cfg = _AI_PROVIDERS.resolved("default_agent", fallback_to_default=False)
+    if not cfg:
+        _write_env({
+            "RIPPLE_ENABLE_AI": "0",
+            "RIPPLE_LLM_BASE_URL": "",
+            "RIPPLE_LLM_API_KEY": "",
+            "RIPPLE_LLM_MODEL": "",
+        })
+        await asyncio.to_thread(_AGENT_RUNTIME.close)
+        return
+    public = _AI_PROVIDERS.public_state()
+    provider = next((row for row in public["providers"] if row["id"] == cfg["provider_id"]), None)
+    models = (provider or {}).get("models") or [{"id": cfg["model"], "name": cfg["model"]}]
+    try:
+        registry = _AGENT_CAPABILITIES.save_models(models, cfg["model"], _runtime_value("RIPPLE_LLM_MODEL", _read_env()))
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    _write_env({
+        "RIPPLE_ENABLE_AI": "1",
+        "RIPPLE_LLM_BASE_URL": cfg["base_url"],
+        "RIPPLE_LLM_API_KEY": cfg["api_key"],
+        "RIPPLE_LLM_MODEL": registry["default_model"],
+    })
+    await asyncio.to_thread(_AGENT_RUNTIME.close)
+
+
+class AIProviderInput(BaseModel):
+    provider_id: str = Field(default="", max_length=40)
+    name: str = Field(default="", max_length=80)
+    kind: str = Field(default="openai-compatible", pattern=r"^(openai-compatible|xai)$")
+    base_url: str = Field(min_length=8, max_length=1024)
+    api_key: str = Field(default="", max_length=4096, repr=False)
+    models: list[dict[str, Any] | str] = Field(default_factory=list, max_length=200)
+    default_model: str = Field(min_length=1, max_length=200)
+    enabled: bool = True
+
+
+class AIProviderDiscoverInput(BaseModel):
+    provider_id: str = Field(default="", max_length=40)
+    kind: str = Field(default="openai-compatible", pattern=r"^(openai-compatible|xai)$")
+    base_url: str = Field(default="", max_length=1024)
+    api_key: str = Field(default="", max_length=4096, repr=False)
+
+
+class AIProviderRouteInput(BaseModel):
+    provider_id: str = Field(default="", max_length=40)
+    model_id: str = Field(default="", max_length=200)
+
+
+class AIProviderProbeInput(BaseModel):
+    model_id: str = Field(min_length=1, max_length=200)
+    capability: str = Field(pattern=r"^(chat|x_search|web_search)$")
+
+
+@app.get("/api/ai-providers")
+async def api_ai_providers():
+    _ensure_ai_provider_migration()
+    return _AI_PROVIDERS.public_state()
+
+
+@app.post("/api/ai-providers")
+async def api_ai_provider_save(req: AIProviderInput):
+    _ensure_ai_provider_migration()
+    try:
+        state = _AI_PROVIDERS.upsert(
+            provider_id=req.provider_id, name=req.name, kind=req.kind, base_url=req.base_url,
+            api_key=req.api_key, models=req.models, default_model=req.default_model, enabled=req.enabled,
+        )
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    await _sync_default_agent_provider()
+    return state
+
+
+@app.delete("/api/ai-providers/{provider_id}")
+async def api_ai_provider_delete(provider_id: str):
+    _ensure_ai_provider_migration()
+    try:
+        state = _AI_PROVIDERS.remove(provider_id)
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    await _sync_default_agent_provider()
+    return state
+
+
+@app.post("/api/ai-providers/discover")
+async def api_ai_provider_discover(req: AIProviderDiscoverInput):
+    _ensure_ai_provider_migration()
+    try:
+        return {"items": await asyncio.to_thread(
+            _AI_PROVIDERS.discover, provider_id=req.provider_id, kind=req.kind,
+            base_url=req.base_url, api_key=req.api_key,
+        )}
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+
+
+@app.put("/api/ai-providers/routes/{purpose}")
+async def api_ai_provider_route(purpose: str, req: AIProviderRouteInput):
+    _ensure_ai_provider_migration()
+    try:
+        state = _AI_PROVIDERS.set_route(purpose, req.provider_id, req.model_id)
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    if purpose == "default_agent":
+        await _sync_default_agent_provider()
+    return state
+
+
+@app.post("/api/ai-providers/{provider_id}/probe")
+async def api_ai_provider_probe(provider_id: str, req: AIProviderProbeInput):
+    _ensure_ai_provider_migration()
+    try:
+        result = await asyncio.to_thread(_AI_PROVIDERS.probe, provider_id, req.model_id, req.capability)
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    return {**result, "state": _AI_PROVIDERS.public_state()}
 
 
 @app.get("/api/model-config")
@@ -3564,20 +3722,6 @@ CAMPAIGN_PLATFORM_LABELS = {
     "wechat": "微信公众号",
     "weixin-channels": "微信视频号",
 }
-CAMPAIGN_SOURCE_CAPABILITIES = [
-    {"platform": "x", "label": "X", "mode": "import", "automatic": False,
-     "detail": "支持活动链接与规则导入；官方搜索/流式公告适配器尚未在 Ripple 内验证。"},
-    {"platform": "xiaohongshu", "label": "小红书", "mode": "import", "automatic": False,
-     "detail": "支持公开活动与账号任务导入；活动中心自动读取仍需单独验证。"},
-    {"platform": "douyin", "label": "抖音", "mode": "import", "automatic": False,
-     "detail": "支持活动链接与规则导入；第三方活动接口尚未作为 Ripple 内置数据源验收。"},
-    {"platform": "bilibili", "label": "B站", "mode": "import", "automatic": False,
-     "detail": "支持官方活动页导入；活动列表自动采集适配器尚未在 Ripple 内验证。"},
-    {"platform": "wechat", "label": "微信公众号", "mode": "import", "automatic": False,
-     "detail": "支持公告文章与征稿规则导入；公众号订阅采集器尚未内置。"},
-    {"platform": "weixin-channels", "label": "微信视频号", "mode": "import", "automatic": False,
-     "detail": "支持活动公告与账号任务导入；创作者任务自动读取仍需单独验证。"},
-]
 CAMPAIGN_STATUSES = {"upcoming", "active", "ended", "cancelled", "unknown"}
 CAMPAIGN_QUALIFICATION_STATES = {"eligible", "ineligible", "unknown"}
 
@@ -3655,6 +3799,23 @@ class CampaignSavedInput(BaseModel):
     saved: bool
 
 
+class CampaignSourceConfigInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    method: str = Field(default="", max_length=30)
+    x_api_account_id: str = Field(default="", max_length=32)
+    fallback_method: str = Field(default="", max_length=30)
+    fallback_enabled: bool = False
+    account_id: str = Field(default="", max_length=32)
+    tikhub_enabled: bool | None = None
+    tikhub_api_key: str = Field(default="", max_length=4096, repr=False)
+
+
+class CampaignRefreshInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    platforms: list[str] = Field(default_factory=list, max_length=6)
+    force: bool = False
+
+
 CAMPAIGN_RULE_SNAPSHOT_FIELDS = (
     "title", "platform", "platform_label", "organizer", "organizer_type", "activity_type",
     "reward_type", "reward_summary", "starts_at", "signup_deadline", "submit_deadline",
@@ -3725,6 +3886,9 @@ def _campaign_from_request(req: CampaignInput, previous: dict | None = None) -> 
         "saved": bool(previous.get("saved", False)),
         "rule_version": int(previous.get("rule_version") or 0) + 1,
         "rule_history": history,
+        "external_ids": deepcopy(previous.get("external_ids") or {}),
+        "source_evidence": deepcopy(previous.get("source_evidence") or []),
+        "account_states": deepcopy(previous.get("account_states") or {}),
         "created_at": int(previous.get("created_at") or now),
         "updated_at": now,
     }
@@ -3737,9 +3901,167 @@ def _campaign_by_id(cid: str) -> dict:
     raise HTTPException(404, "活动不存在")
 
 
+def _campaign_match_key(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def _campaign_find_candidate(items: list[dict], candidate: dict) -> dict | None:
+    external = str(candidate.get("external_id") or "")
+    url = str(candidate.get("source_url") or "")
+    title_key = _campaign_match_key(candidate.get("title", ""))
+    platform = str(candidate.get("platform") or "")
+    for item in items:
+        if item.get("platform") != platform:
+            continue
+        ids = item.get("external_ids") if isinstance(item.get("external_ids"), dict) else {}
+        if external and external in {str(v) for v in ids.values() if v}:
+            return item
+        if url and str(item.get("source_url") or "") == url:
+            return item
+        if title_key and _campaign_match_key(item.get("title", "")) == title_key:
+            return item
+    return None
+
+
+def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
+    now = int(time.time())
+    existing = _campaign_find_candidate(items, candidate)
+    provider_id = str(candidate.get("provider_id") or "")[:80]
+    external_id = str(candidate.get("external_id") or "")[:200]
+    evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
+    account_id = str(candidate.get("account_id") or "")[:80]
+    if existing is None:
+        item = {
+            "id": uuid.uuid4().hex[:12],
+            "title": str(candidate.get("title") or "未命名活动").strip()[:240] or "未命名活动",
+            "platform": str(candidate.get("platform") or ""),
+            "platform_label": CAMPAIGN_PLATFORM_LABELS.get(str(candidate.get("platform") or ""), str(candidate.get("platform") or "")),
+            "organizer": str(candidate.get("organizer") or "")[:160],
+            "organizer_type": str(candidate.get("organizer_type") or "unknown")[:40],
+            "activity_type": str(candidate.get("activity_type") or "创作活动")[:80],
+            "reward_type": str(candidate.get("reward_type") or "")[:120],
+            "reward_summary": str(candidate.get("reward_summary") or "")[:600],
+            "starts_at": str(candidate.get("starts_at") or "")[:40],
+            "signup_deadline": "",
+            "submit_deadline": str(candidate.get("submit_deadline") or "")[:40],
+            "stats_deadline": "",
+            "timezone": "",
+            "eligibility": [],
+            "qualification_state": "unknown",
+            "qualification_basis": "unknown",
+            "content_requirements": [str(x)[:240] for x in candidate.get("content_requirements", []) if str(x).strip()][:30],
+            "reward_rules": [],
+            "required_topics": [str(x)[:120] for x in candidate.get("required_topics", []) if str(x).strip()][:20],
+            "ai_policy": "unknown",
+            "source_url": str(candidate.get("source_url") or "")[:2000],
+            "source_type": str(candidate.get("source_type") or "automatic")[:80],
+            "source_status": "verified",
+            "last_verified_at": now,
+            "note": str(candidate.get("note") or "")[:6000],
+            "status": "unknown",
+            "account_id": account_id,
+            "saved": False,
+            "rule_version": 1,
+            "rule_history": [],
+            "external_ids": ({provider_id: external_id} if provider_id and external_id else {}),
+            "source_evidence": [],
+            "account_states": {},
+            "created_at": now,
+            "updated_at": now,
+        }
+        items.insert(0, item)
+    else:
+        item = existing
+        manual = item.get("source_type") == "user_import"
+        rule_fields = ("title", "organizer", "organizer_type", "activity_type", "reward_type",
+                       "reward_summary", "starts_at", "submit_deadline", "source_url", "note")
+        proposed = {}
+        for field in rule_fields:
+            incoming = str(candidate.get(field) or "").strip()
+            if incoming and (not manual or not str(item.get(field) or "").strip()):
+                proposed[field] = incoming[:6000 if field == "note" else 2000 if field == "source_url" else 600]
+        changed = any(str(item.get(k) or "") != str(v) for k, v in proposed.items())
+        if changed and int(item.get("rule_version") or 0) > 0:
+            history = [x for x in (item.get("rule_history") or []) if isinstance(x, dict)]
+            history.append(_campaign_rule_snapshot(item, archived_at=now))
+            item["rule_history"] = history[-20:]
+            item["rule_version"] = int(item.get("rule_version") or 0) + 1
+        item.update(proposed)
+        item["last_verified_at"] = now
+        item["source_status"] = "verified"
+        item["updated_at"] = now
+        if not item.get("source_url") and candidate.get("source_url"):
+            item["source_url"] = str(candidate["source_url"])[:2000]
+        if not item.get("account_id") and account_id:
+            item["account_id"] = account_id
+    ids = item.setdefault("external_ids", {})
+    if provider_id and external_id:
+        ids[provider_id] = external_id
+    source_rows = [x for x in (item.get("source_evidence") or []) if isinstance(x, dict)]
+    source_key = (provider_id, external_id, str(candidate.get("source_url") or ""))
+    source_rows = [x for x in source_rows if (
+        str(x.get("provider_id") or ""), str(x.get("external_id") or ""), str(x.get("source_url") or "")
+    ) != source_key]
+    source_rows.append({
+        "provider_id": provider_id,
+        "external_id": external_id,
+        "source_url": str(candidate.get("source_url") or "")[:2000],
+        "fetched_at": now,
+        "status": "verified",
+        "evidence": evidence,
+    })
+    item["source_evidence"] = source_rows[-20:]
+    if account_id:
+        states = item.setdefault("account_states", {})
+        state = states.setdefault(account_id, {})
+        state.update({"visible": True, "qualification_state": state.get("qualification_state", "unknown"),
+                      "last_seen_at": now, "provider_id": provider_id})
+    return item
+
+
+def _merge_campaign_refresh(payload: dict) -> dict:
+    items = _read_campaigns()
+    merged = 0
+    stale_platforms: list[str] = []
+    for result in payload.get("results", []):
+        if not isinstance(result, dict):
+            continue
+        platform = str(result.get("platform") or "")
+        if result.get("status") == "fresh":
+            for candidate in result.get("items", []) if isinstance(result.get("items"), list) else []:
+                if isinstance(candidate, dict) and candidate.get("title") and candidate.get("platform"):
+                    _merge_campaign_candidate(items, candidate)
+                    merged += 1
+        elif result.get("status") in {"stale", "error", "needs_login"}:
+            stale_platforms.append(platform)
+    for item in items:
+        if item.get("platform") in stale_platforms and item.get("source_type") != "user_import" and item.get("source_evidence"):
+            item["source_status"] = "stale"
+    _write_campaigns(items)
+    return {"merged": merged, "total": len(items), "stale_platforms": stale_platforms}
+
+
 @app.get("/api/campaigns/sources")
 async def api_campaign_sources():
-    return {"items": CAMPAIGN_SOURCE_CAPABILITIES, "automatic_count": sum(1 for x in CAMPAIGN_SOURCE_CAPABILITIES if x["automatic"])}
+    _ensure_ai_provider_migration()
+    return _CAMPAIGN_SOURCES.public_state()
+
+
+@app.put("/api/campaigns/sources/{platform}")
+async def api_campaign_source_configure(platform: str, req: CampaignSourceConfigInput):
+    _ensure_ai_provider_migration()
+    try:
+        return _CAMPAIGN_SOURCES.configure(platform, req.model_dump(exclude_none=True))
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+
+
+@app.post("/api/campaigns/refresh")
+async def api_campaign_refresh(req: CampaignRefreshInput):
+    _ensure_ai_provider_migration()
+    payload = await asyncio.to_thread(_CAMPAIGN_SOURCES.refresh, req.platforms or None, force=req.force)
+    merged = _merge_campaign_refresh(payload)
+    return {**payload, **merged, "campaigns": [{**item, "status": _campaign_effective_status(item)} for item in _read_campaigns()]}
 
 
 @app.get("/api/campaigns")

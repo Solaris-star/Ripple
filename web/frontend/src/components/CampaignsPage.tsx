@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  createCampaign, createIdea, createSchedule, fetchCampaigns, fetchCampaignSources, fetchTrends,
-  recommendIdeas, saveCampaign, updateCampaign,
+  configureCampaignSource, createCampaign, createIdea, createSchedule, fetchCampaigns, fetchCampaignSources,
+  fetchStatus, fetchTrends, recommendIdeas, refreshCampaigns, saveCampaign, updateCampaign,
 } from '../lib/api';
 import type {
   Campaign, CampaignInput, CampaignPlatform, CampaignSourceCapability, IdeaRecommendation,
@@ -21,6 +21,7 @@ interface CampaignsPageProps {
   personas: PersonaItem[];
   onPersonaChange: (name: string) => void;
   onNewPersona: () => void;
+  onOpenSettings: () => void;
 }
 
 const PLATFORMS: { key: CampaignPlatform; label: string }[] = [
@@ -48,9 +49,19 @@ const STATUS: Record<string, string> = {
 
 const SOURCE_STATUS: Record<string, string> = {
   imported: '用户导入',
-  verified: '官方已核验',
+  verified: '来源已核验',
   stale: '缓存/待复核',
   unavailable: '来源不可用',
+};
+
+const SOURCE_HEALTH: Record<string, string> = {
+  ready: '自动同步', ready_fallback: '备用源可用', needs_config: '需要配置',
+  needs_login: '需要登录', stale: '缓存/待复核', error: '读取异常', manual: '支持导入',
+};
+
+type SourceDraft = {
+  method: string; x_api_account_id: string; fallback_method: string; fallback_enabled: boolean;
+  account_id: string; tikhub_enabled: boolean; tikhub_api_key: string;
 };
 
 const emptyCampaign = (): CampaignInput => ({
@@ -109,7 +120,7 @@ function platformLabel(key: string): string {
 }
 
 export default function CampaignsPage({
-  onUseTopic, persona, aiReady, personas, onPersonaChange, onNewPersona,
+  onUseTopic, persona, aiReady, personas, onPersonaChange, onNewPersona, onOpenSettings,
 }: CampaignsPageProps) {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [sources, setSources] = useState<CampaignSourceCapability[]>([]);
@@ -120,6 +131,13 @@ export default function CampaignsPage({
   const [toast, setToast] = useState('');
   const [selected, setSelected] = useState<Campaign | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+  const [sourceEditor, setSourceEditor] = useState<CampaignSourceCapability | null>(null);
+  const [sourceDraft, setSourceDraft] = useState<SourceDraft>({
+    method: '', x_api_account_id: '', fallback_method: '', fallback_enabled: false,
+    account_id: '', tikhub_enabled: false, tikhub_api_key: '',
+  });
+  const [sourceSaving, setSourceSaving] = useState(false);
 
   const [platformFilter, setPlatformFilter] = useState('all');
   const [typeFilter, setTypeFilter] = useState('all');
@@ -149,23 +167,53 @@ export default function CampaignsPage({
     window.setTimeout(() => setToast(''), 2300);
   };
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (autoRefresh = false) => {
     setLoading(true);
     try {
-      const [campaignRows, sourceState] = await Promise.all([fetchCampaigns(), fetchCampaignSources()]);
-      setCampaigns(campaignRows);
-      setSources(sourceState.items || []);
-      setAutomaticCount(sourceState.automatic_count || 0);
-      setSelected((current) => current ? campaignRows.find((x) => x.id === current.id) || null : null);
+      const runtime = await fetchStatus();
+      if (!runtime.features?.campaigns || !runtime.features?.campaign_sources_v2) {
+        setCampaigns([]); setSources([]); setAutomaticCount(0);
+        setError('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
+        return;
+      }
+      const [campaignRows, sourceState, accountRows] = await Promise.all([
+        fetchCampaigns(), fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
+      ]);
+      let nextCampaigns = campaignRows;
+      let nextSources = sourceState;
+      setAccounts(accountRows);
+      if (autoRefresh) {
+        const automaticPlatforms = Array.from(new Set(
+          sourceState.items.filter((source) => source.automatic).map((source) => source.platform),
+        ));
+        if (automaticPlatforms.length) {
+          try {
+            const refreshed = await refreshCampaigns(automaticPlatforms, false);
+            nextCampaigns = refreshed.campaigns;
+            nextSources = refreshed.sources;
+          } catch { /* initial sync failure is represented by the source state on next manual refresh */ }
+        }
+      }
+      setCampaigns(nextCampaigns);
+      setSources(nextSources.items || []);
+      setAutomaticCount(nextSources.automatic_count || 0);
+      setSelected((current) => current ? nextCampaigns.find((x) => x.id === current.id) || null : null);
       setError('');
     } catch (e) {
-      setError(e instanceof Error ? e.message : '活动数据读取失败');
+      const message = e instanceof Error ? e.message : '活动数据读取失败';
+      setError(message === 'Not Found'
+        ? '当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。'
+        : message);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void load(true);
+    const timer = window.setInterval(() => { void load(true); }, 30 * 60 * 1000);
+    return () => window.clearInterval(timer);
+  }, [load]);
 
   useEffect(() => {
     const selectedTrends = loadTrendSelection();
@@ -173,8 +221,48 @@ export default function CampaignsPage({
     fetchTrends(selectedTrends.join(','), 6)
       .then((value) => setTrendGroups(value.trends || []))
       .catch(() => setTrendGroups([]));
-    rippleApi<Account[]>('/api/ripple/accounts').then(setAccounts).catch(() => setAccounts([]));
   }, []);
+
+  const refreshNow = async () => {
+    if (refreshing) return;
+    const platforms = Array.from(new Set(sources.filter((source) => source.automatic).map((source) => source.platform)));
+    if (!platforms.length) { showToast('当前没有已就绪的自动活动源'); return; }
+    setRefreshing(true); setError('');
+    try {
+      const result = await refreshCampaigns(platforms, true);
+      setCampaigns(result.campaigns);
+      setSources(result.sources.items || []);
+      setAutomaticCount(result.sources.automatic_count || 0);
+      const fresh = result.results.filter((row) => row.status === 'fresh');
+      const stale = result.results.filter((row) => row.status !== 'fresh' && row.status !== 'cached');
+      showToast(`已刷新 ${fresh.length} 个来源${stale.length ? `，${stale.length} 个来源需要处理` : ''}`);
+    } catch (e) { setError(e instanceof Error ? e.message : '活动刷新失败'); }
+    finally { setRefreshing(false); }
+  };
+
+  const openSourceEditor = (source: CampaignSourceCapability) => {
+    setSourceEditor(source);
+    setSourceDraft({
+      method: source.method || '',
+      x_api_account_id: source.x_api_account_id || '',
+      fallback_method: source.fallback_method || '',
+      fallback_enabled: !!source.fallback_enabled,
+      account_id: source.account_id || '',
+      tikhub_enabled: !!source.tikhub_enabled,
+      tikhub_api_key: '',
+    });
+  };
+
+  const saveSourceEditor = async () => {
+    if (!sourceEditor || sourceSaving) return;
+    setSourceSaving(true); setError('');
+    try {
+      const state = await configureCampaignSource(sourceEditor.platform, sourceDraft);
+      setSources(state.items || []); setAutomaticCount(state.automatic_count || 0);
+      setSourceEditor(null); showToast('活动数据源配置已保存');
+    } catch (e) { setError(e instanceof Error ? e.message : '活动数据源配置失败'); }
+    finally { setSourceSaving(false); }
+  };
 
   const activityTypes = useMemo(() => Array.from(new Set(campaigns.map((x) => x.activity_type).filter(Boolean))), [campaigns]);
   const rewardTypes = useMemo(() => Array.from(new Set(campaigns.map((x) => x.reward_type).filter(Boolean))), [campaigns]);
@@ -394,7 +482,12 @@ export default function CampaignsPage({
           <h1 className="page-title"><IconCompass size={22} /> 活动广场</h1>
           <p className="page-subtitle">聚合 X、小红书、抖音、B站、微信公众号、微信视频号的创作活动与激励活动，结合热点生成选题灵感。</p>
         </div>
-        <button className="btn btn-sm btn-primary" onClick={openNew}>+ 导入活动</button>
+        <div className="campaign-head-actions">
+          <button className="btn btn-sm btn-primary" disabled={refreshing || loading} onClick={() => void refreshNow()}>
+            <IconRefresh size={13} /> {refreshing ? '刷新中…' : '刷新活动'}
+          </button>
+          <button className="btn btn-sm" onClick={openNew}>+ 补充导入</button>
+        </div>
       </div>
 
       <div className="campaign-stats">
@@ -406,12 +499,29 @@ export default function CampaignsPage({
       <div className="campaign-source-note">
         <IconRefresh size={15} />
         <div>
-          <strong>{automaticCount > 0 ? `已启用 ${automaticCount} 个自动活动源` : '自动活动源尚未通过 Ripple 验收'}</strong>
-          <span>{automaticCount > 0
-            ? '自动来源会标明最近核验时间；失败时不会伪装为最新数据。'
-            : '当前只展示你导入或确认过的真实活动，不填充演示活动。各平台自动采集会按来源逐个验收后启用。'}</span>
+          <strong>已就绪 {automaticCount} 个自动活动源</strong>
+          <span>B站零配置自动同步；X 可选 xAI X Search 或 X Developer API；小红书和抖音优先复用创作者后台登录态。收费备用源未经显式启用不会调用。</span>
         </div>
       </div>
+      <section className="campaign-source-status-grid">
+        {sources.map((source) => {
+          const sync = source.last_sync;
+          const configurable = ['x', 'xiaohongshu', 'douyin'].includes(source.platform);
+          return <article key={source.id || source.platform} className={`campaign-source-status source-${source.status || 'unknown'}`}>
+            <div className="campaign-source-status-head">
+              <strong>{source.label}</strong>
+              <span>{SOURCE_HEALTH[source.status || ''] || source.status || (source.automatic ? '自动同步' : '支持导入')}</span>
+            </div>
+            <p>{source.detail}</p>
+            {source.cost_note && <small>{source.cost_note}</small>}
+            {sync?.at && <small>最近同步：{new Date(sync.at * 1000).toLocaleString('zh-CN')} · {sync.status}{sync.count != null ? ` · ${sync.count} 条` : ''}{sync.fallback_used ? ' · 使用备用源' : ''}</small>}
+            {sync?.error && <small className="error">{sync.error}</small>}
+            <div className="campaign-source-status-actions">
+              {configurable && <button className="r2-text-button" onClick={() => openSourceEditor(source)}>配置</button>}
+            </div>
+          </article>;
+        })}
+      </section>
 
       <div className="campaign-filters">
         <select className="field" value={platformFilter} onChange={(e) => setPlatformFilter(e.target.value)}>
@@ -468,8 +578,8 @@ export default function CampaignsPage({
             <div className="campaign-empty">
               <IconCompass size={28} />
               <strong>{campaigns.length ? '当前筛选条件没有匹配活动' : '还没有已确认的创作活动'}</strong>
-              <p>{campaigns.length ? '调整筛选条件继续查看。' : '可以先导入平台活动链接和规则。Ripple 不会用虚构活动填充这里。'}</p>
-              {!campaigns.length && <button className="btn btn-primary btn-sm" onClick={openNew}>导入第一个活动</button>}
+              <p>{campaigns.length ? '调整筛选条件继续查看。' : '可点击“刷新活动”从已就绪的数据源自动获取；手动导入用于补充遗漏活动。Ripple 不会用虚构活动填充这里。'}</p>
+              {!campaigns.length && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openNew}>补充导入</button></div>}
             </div>
           )}
           <div className="campaign-grid">
@@ -509,20 +619,6 @@ export default function CampaignsPage({
             })}
           </div>
 
-          {sources.length > 0 && campaigns.length === 0 && (
-            <section className="campaign-source-grid">
-              <h3>六平台来源接入状态</h3>
-              <div>
-                {sources.map((source) => (
-                  <article key={source.platform}>
-                    <strong>{source.label}</strong>
-                    <span>{source.automatic ? '自动采集已启用' : '当前支持导入'}</span>
-                    <p>{source.detail}</p>
-                  </article>
-                ))}
-              </div>
-            </section>
-          )}
         </main>
 
         <aside className="campaign-trends">
@@ -576,6 +672,68 @@ export default function CampaignsPage({
               </div>
             </footer>
           </aside>
+        </div>
+      )}
+
+      {sourceEditor && (
+        <div className="overlay">
+          <div className="modal campaign-source-config-modal">
+            <div className="campaign-modal-head">
+              <div><h3>{sourceEditor.label} · 活动数据源</h3><p>{sourceEditor.detail}</p></div>
+              <button onClick={() => setSourceEditor(null)}>×</button>
+            </div>
+            {sourceEditor.platform === 'x' && <>
+              <label className="field-label">主检索方式</label>
+              <select className="field" value={sourceDraft.method} onChange={(e) => {
+                const method = e.target.value;
+                setSourceDraft({ ...sourceDraft, method, fallback_method: sourceDraft.fallback_method === method ? '' : sourceDraft.fallback_method });
+              }}>
+                <option value="">未启用</option>
+                <option value="xai">Grok / xAI · X Search</option>
+                <option value="x_api">X Developer API</option>
+              </select>
+              {sourceDraft.method === 'xai' && <div className="campaign-source-config-note">
+                xAI 方式使用“设置 → AI / Agent Provider”里的「X 活动发现」路由，并要求 X Search 能力测试通过。X Search 可能产生调用费用。
+                <button className="r2-text-button" onClick={onOpenSettings}>打开模型设置</button>
+              </div>}
+              {(sourceDraft.method === 'x_api' || sourceDraft.fallback_method === 'x_api') && <>
+                <label className="field-label">X Developer API 账号</label>
+                <select className="field" value={sourceDraft.x_api_account_id} onChange={(e) => setSourceDraft({ ...sourceDraft, x_api_account_id: e.target.value })}>
+                  <option value="">请选择账号</option>
+                  {accounts.filter((a) => a.platform === 'x' && a.adapter === 'x-api').map((a) => <option key={a.id} value={a.id}>{a.label} · {a.status}</option>)}
+                </select>
+              </>}
+              {sourceDraft.method && <label className="r2-checkbox campaign-source-fallback"><input type="checkbox" checked={sourceDraft.fallback_enabled} onChange={(e) => setSourceDraft({
+                ...sourceDraft,
+                fallback_enabled: e.target.checked,
+                fallback_method: e.target.checked ? (sourceDraft.method === 'xai' ? 'x_api' : 'xai') : '',
+              })} />主来源失败时允许使用 {sourceDraft.method === 'xai' ? 'X Developer API' : 'xAI X Search'} 备用源</label>}
+              {sourceDraft.fallback_enabled && <p className="campaign-source-config-warning">备用源只有在你显式启用后才会调用；涉及的 API/搜索费用按对应服务商规则计算。</p>}
+            </>}
+            {sourceEditor.platform === 'xiaohongshu' && <>
+              <label className="field-label">创作者账号</label>
+              <select className="field" value={sourceDraft.account_id} onChange={(e) => setSourceDraft({ ...sourceDraft, account_id: e.target.value })}>
+                <option value="">自动选择唯一已连接账号</option>
+                {accounts.filter((a) => a.platform === 'xiaohongshu').map((a) => <option key={a.id} value={a.id}>{a.label} · {a.status}</option>)}
+              </select>
+              <div className="campaign-source-config-note">读取 <code>creator.xiaohongshu.com/new/events</code>，复用该账号独立 XiaohongshuProfile。登录失效会显示“需要登录”，不会显示成“没有活动”。</div>
+            </>}
+            {sourceEditor.platform === 'douyin' && <>
+              <label className="field-label">创作者账号（主来源）</label>
+              <select className="field" value={sourceDraft.account_id} onChange={(e) => setSourceDraft({ ...sourceDraft, account_id: e.target.value })}>
+                <option value="">自动选择唯一已连接账号</option>
+                {accounts.filter((a) => a.platform === 'douyin').map((a) => <option key={a.id} value={a.id}>{a.label} · {a.status}</option>)}
+              </select>
+              <div className="campaign-source-config-note">优先使用 creator.douyin.com 的登录态，只读监听活动/任务接口。</div>
+              <label className="r2-checkbox campaign-source-fallback"><input type="checkbox" checked={sourceDraft.tikhub_enabled} onChange={(e) => setSourceDraft({ ...sourceDraft, tikhub_enabled: e.target.checked })} />显式启用 TikHub 收费 fallback</label>
+              {sourceDraft.tikhub_enabled && <>
+                <label className="field-label">TikHub API Key</label>
+                <input className="field" type="password" autoComplete="new-password" value={sourceDraft.tikhub_api_key} onChange={(e) => setSourceDraft({ ...sourceDraft, tikhub_api_key: e.target.value })} placeholder={sourceEditor.tikhub_api_key_set ? '已加密保存；留空保持原 Key' : '首次启用需要填写'} />
+                <p className="campaign-source-config-warning">TikHub 的活动接口会计费。Ripple 不自动调用价格查询，也不会在未启用 fallback 时产生 TikHub 活动请求。</p>
+              </>}
+            </>}
+            <div className="campaign-import-foot"><span>自动来源只读，不执行报名、投稿或领奖。</span><div><button className="btn btn-sm" disabled={sourceSaving} onClick={() => setSourceEditor(null)}>取消</button><button className="btn btn-sm btn-primary" disabled={sourceSaving} onClick={() => void saveSourceEditor()}>{sourceSaving ? '保存中…' : '保存数据源'}</button></div></div>
+          </div>
         </div>
       )}
 

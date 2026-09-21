@@ -144,10 +144,10 @@ class XClient:
         return value
 
     def _request(self, method: str, path: str, *, token: str | None = None, json_body=None,
-                 form=None, mutation=False, ambiguous_5xx=False) -> dict:
+                 form=None, params=None, mutation=False, ambiguous_5xx=False) -> dict:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         try:
-            response = self.http.request(method, path, headers=headers, json=json_body, data=form)
+            response = self.http.request(method, path, headers=headers, json=json_body, data=form, params=params)
         except httpx.HTTPError:
             raise XApiError("X API 连接中断；未自动重试。", outcome_unknown=mutation) from None
         return self._decode(response, mutation=mutation, ambiguous_5xx=ambiguous_5xx)
@@ -170,6 +170,19 @@ class XClient:
             raise XApiError("X 没有返回可确认的账号身份。")
         return {"id": str(data["id"])[:128], "username": str(data["username"])[:80],
                 "name": str(data.get("name") or data["username"])[:120]}
+
+    def search_recent(self, token: str, query: str, max_results: int = 25) -> dict:
+        query = str(query or "").strip()
+        if not query or len(query) > 512:
+            raise XApiError("X 搜索条件无效。", status=422)
+        max_results = max(10, min(int(max_results), 100))
+        return self._request("GET", "/2/tweets/search/recent", token=token, params={
+            "query": query,
+            "max_results": str(max_results),
+            "tweet.fields": "created_at,author_id,lang,entities",
+            "expansions": "author_id",
+            "user.fields": "username,name,verified",
+        })
 
     def upload_image(self, token: str, path: Path) -> str:
         size = path.stat().st_size
@@ -458,6 +471,47 @@ class XService:
                 account["auth_revision"] += 1
                 self.workspace.accounts.invalidate_tasks(state, account_id, "X 账号身份变化，原审批失效。")
             return self.workspace.accounts.project(account)
+
+    def search_recent(self, account_id: str, query: str, max_results: int = 25) -> dict:
+        account = self.workspace.accounts.get(account_id)
+        if account.get("platform") != "x" or account.get("adapter") != ADAPTER:
+            raise WorkflowError("请选择通过 X Developer API 连接的 X 账号。", 422)
+        if account.get("status") != "connected":
+            raise WorkflowError("X Developer API 账号当前未连接，请重新授权。", 409)
+        token, _ = self._token(account_id)
+        client = self.client_factory()
+        try:
+            value = client.search_recent(token, query, max_results)
+        finally:
+            client.close()
+        users = {}
+        includes = value.get("includes") if isinstance(value, dict) else None
+        if isinstance(includes, dict):
+            for row in includes.get("users", []) if isinstance(includes.get("users"), list) else []:
+                if isinstance(row, dict) and row.get("id"):
+                    users[str(row["id"])] = row
+        items = []
+        data = value.get("data") if isinstance(value, dict) else None
+        for row in data if isinstance(data, list) else []:
+            if not isinstance(row, dict):
+                continue
+            post_id = str(row.get("id") or "")[:128]
+            author_id = str(row.get("author_id") or "")[:128]
+            user = users.get(author_id, {})
+            username = str(user.get("username") or "")[:80]
+            if not post_id:
+                continue
+            items.append({
+                "id": post_id,
+                "text": str(row.get("text") or "")[:5000],
+                "created_at": str(row.get("created_at") or "")[:80],
+                "author_id": author_id,
+                "username": username,
+                "author_name": str(user.get("name") or username)[:120],
+                "verified": bool(user.get("verified")),
+                "url": f"https://x.com/{username}/status/{post_id}" if username else f"https://x.com/i/status/{post_id}",
+            })
+        return {"items": items, "count": len(items), "source": "x_developer_api"}
 
     def disconnect(self, account_id: str, confirmed: bool) -> dict:
         if not confirmed:

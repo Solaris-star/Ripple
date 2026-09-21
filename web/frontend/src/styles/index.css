@@ -1051,6 +1051,28 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-source-note svg { margin-top: 2px; color: var(--accent-end); flex-shrink: 0; }
 .campaign-source-note strong { display: block; font-size: 14px; color: var(--text); }
 .campaign-source-note span { display: block; font-size: 13px; line-height: 1.55; margin-top: 2px; }
+.campaign-head-actions { display: flex; align-items: center; gap: 7px; }
+.campaign-source-status-grid { max-width: 1220px; margin: 9px auto 0; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 7px; }
+.campaign-source-status { min-width: 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.campaign-source-status.source-ready,.campaign-source-status.source-ready_fallback { border-color: color-mix(in srgb, var(--green) 34%, var(--border)); }
+.campaign-source-status.source-needs_config,.campaign-source-status.source-needs_login { border-color: #eadfca; }
+.campaign-source-status.source-stale,.campaign-source-status.source-error { border-color: color-mix(in srgb, var(--red) 25%, var(--border)); }
+.campaign-source-status-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.campaign-source-status-head strong { font-size: 13px; color: var(--text); }
+.campaign-source-status-head span { padding: 2px 6px; border-radius: 999px; background: var(--surface-2); color: var(--text-secondary); font-size: 11px; white-space: nowrap; }
+.campaign-source-status.source-ready .campaign-source-status-head span,.campaign-source-status.source-ready_fallback .campaign-source-status-head span { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
+.campaign-source-status p { margin: 5px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.45; }
+.campaign-source-status small { display: block; margin-top: 4px; color: var(--text-tertiary); font-size: 11px; line-height: 1.45; }
+.campaign-source-status small.error { color: var(--red); }
+.campaign-source-status-actions { display: flex; justify-content: flex-end; margin-top: 5px; }
+.campaign-source-status-actions .r2-text-button { font-size: 12px; }
+.campaign-source-config-modal { width: min(620px, calc(100vw - 36px)); max-height: calc(100vh - 48px); overflow-y: auto; }
+.campaign-source-config-modal > .field-label { margin-top: 13px; }
+.campaign-source-config-note { margin-top: 9px; padding: 9px 10px; border-radius: 7px; background: var(--surface-2); color: var(--text-secondary); font-size: 12px; line-height: 1.55; }
+.campaign-source-config-note .r2-text-button { margin-left: 7px; font-size: 12px; }
+.campaign-source-config-warning { margin: 8px 0 0; padding: 8px 9px; border-radius: 7px; background: #fff8e9; color: #8d6d35; font-size: 12px; line-height: 1.55; }
+.campaign-source-fallback { margin-top: 12px; color: var(--text-secondary); font-size: 13px; }
+[data-theme="dark"] .campaign-source-config-warning { background: color-mix(in srgb, #d7912c 13%, transparent); color: #d5b06a; }
 .campaign-filters { max-width: 1220px; margin: 12px auto 0; display: grid; grid-template-columns: repeat(7, minmax(120px, 1fr)); gap: 7px; }
 .campaign-filters .field { min-width: 0; height: 36px; padding: 6px 8px; font-size: 13px; }
 .campaign-sort { max-width: 1220px; margin: 10px auto 0; display: flex; align-items: center; gap: 3px; border-bottom: 1px solid var(--border); }
@@ -1165,6 +1187,7 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-calendar-context a { flex-shrink: 0; font-size: 12px; color: var(--accent-end); text-decoration: none; }
 
 @media (max-width: 1100px) {
+  .campaign-source-status-grid { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .campaign-filters { grid-template-columns: repeat(4, minmax(120px, 1fr)); }
   .campaign-layout { grid-template-columns: 1fr; }
   .campaign-trends { position: static; }
@@ -1172,7 +1195,7 @@ textarea.field { resize: vertical; min-height: 90px; }
 }
 @media (max-width: 760px) {
   .campaign-page { padding: 20px 14px 60px; }
-  .campaign-stats, .campaign-grid, .campaign-source-grid > div { grid-template-columns: 1fr; }
+  .campaign-stats, .campaign-grid, .campaign-source-grid > div, .campaign-source-status-grid { grid-template-columns: 1fr; }
   .campaign-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .campaign-rec-context { grid-template-columns: repeat(2, 1fr); }
   .campaign-import-grid { grid-template-columns: 1fr; }
