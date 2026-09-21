@@ -211,9 +211,11 @@ export interface ScheduleItem {
   time: string; status: string; note: string;
   kind?: string;          // content（内容/发布）| event（平台活动/节日/特殊日期）
   url?: string;           // 已发布链接
-  source?: string;        // manual | publish-page | chat | scheduler
+  source?: string;        // manual | publish-page | chat | scheduler | campaign
   event_type?: string;    // event 专属：节日/电商/平台活动/行业
   end_date?: string;      // event 专属：活动区间结束日
+  campaign_id?: string;
+  campaign_rule_version?: number;
 }
 export type ScheduleInput = Omit<ScheduleItem, 'id'>;
 export interface ScheduleContext {
@@ -243,12 +245,132 @@ export function deleteSchedule(id: string): Promise<{ ok: boolean }> {
   return request(`/api/schedule/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
+// ---- 创作活动 ----
+export type CampaignPlatform = 'x' | 'xiaohongshu' | 'douyin' | 'bilibili' | 'wechat' | 'weixin-channels';
+export type CampaignQualification = 'eligible' | 'ineligible' | 'unknown';
+export interface CampaignRuleSnapshot {
+  version: number;
+  archived_at?: number;
+  title?: string;
+  platform?: CampaignPlatform;
+  platform_label?: string;
+  organizer?: string;
+  activity_type?: string;
+  reward_type?: string;
+  reward_summary?: string;
+  starts_at?: string;
+  signup_deadline?: string;
+  submit_deadline?: string;
+  stats_deadline?: string;
+  timezone?: string;
+  eligibility?: string[];
+  qualification_state?: CampaignQualification;
+  content_requirements?: string[];
+  reward_rules?: string[];
+  required_topics?: string[];
+  ai_policy?: string;
+  source_url?: string;
+  source_status?: string;
+  note?: string;
+}
+
+export interface Campaign {
+  id: string;
+  title: string;
+  platform: CampaignPlatform;
+  platform_label: string;
+  organizer: string;
+  organizer_type: string;
+  activity_type: string;
+  reward_type: string;
+  reward_summary: string;
+  starts_at: string;
+  signup_deadline: string;
+  submit_deadline: string;
+  stats_deadline: string;
+  timezone: string;
+  eligibility: string[];
+  qualification_state: CampaignQualification;
+  qualification_basis?: string;
+  content_requirements: string[];
+  reward_rules: string[];
+  required_topics: string[];
+  ai_policy: string;
+  source_url: string;
+  source_type: string;
+  source_status: 'imported' | 'verified' | 'stale' | 'unavailable' | string;
+  last_verified_at: number;
+  note: string;
+  status: 'upcoming' | 'active' | 'ended' | 'cancelled' | 'unknown';
+  account_id: string;
+  saved: boolean;
+  rule_version: number;
+  rule_history?: CampaignRuleSnapshot[];
+  created_at: number;
+  updated_at: number;
+}
+export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<Campaign,
+  'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' |
+  'starts_at' | 'signup_deadline' | 'submit_deadline' | 'stats_deadline' | 'timezone' |
+  'eligibility' | 'qualification_state' | 'content_requirements' | 'reward_rules' |
+  'required_topics' | 'ai_policy' | 'source_url' | 'note' | 'status' | 'account_id'>>;
+export interface CampaignSourceCapability {
+  platform: CampaignPlatform;
+  label: string;
+  mode: 'import' | 'automatic' | string;
+  automatic: boolean;
+  detail: string;
+}
+export function fetchCampaigns(): Promise<Campaign[]> { return request('/api/campaigns'); }
+export function fetchCampaign(id: string): Promise<Campaign> { return request(`/api/campaigns/${encodeURIComponent(id)}`); }
+export function fetchCampaignSources(): Promise<{ items: CampaignSourceCapability[]; automatic_count: number }> { return request('/api/campaigns/sources'); }
+export function createCampaign(item: CampaignInput): Promise<Campaign> {
+  return request('/api/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
+}
+export function updateCampaign(id: string, item: CampaignInput): Promise<Campaign> {
+  return request(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
+}
+export function saveCampaign(id: string, saved: boolean): Promise<Campaign> {
+  return request(`/api/campaigns/${encodeURIComponent(id)}/saved`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ saved }) });
+}
+export function deleteCampaign(id: string): Promise<{ ok: boolean }> {
+  return request(`/api/campaigns/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
 // ---- 选题库 ----
 export interface Idea {
   id: string; title: string; note: string; source: string; status: string; created: number;
+  angle?: string; reason?: string; campaign_id?: string; campaign_rule_version?: number;
+  trend_refs?: string[]; target_platforms?: string[]; requirements?: string[]; pending_checks?: string[];
 }
-export type IdeaInput = { title: string; note?: string; source?: string; status?: string };
+export type IdeaInput = {
+  title: string; note?: string; source?: string; status?: string;
+  angle?: string; reason?: string; campaign_id?: string; campaign_rule_version?: number;
+  trend_refs?: string[]; target_platforms?: string[]; requirements?: string[]; pending_checks?: string[];
+};
+export interface TopicUseContext {
+  title: string;
+  ideaId?: string;
+  angle?: string;
+  reason?: string;
+  campaignId?: string;
+  campaignTitle?: string;
+  campaignRuleVersion?: number;
+  trendRefs?: string[];
+  targetPlatforms?: string[];
+  requirements?: string[];
+  pendingChecks?: string[];
+  campaignRequirements?: string[];
+  campaignRequiredTopics?: string[];
+  campaignAiPolicy?: string;
+  campaignSubmitDeadline?: string;
+  campaignSourceUrl?: string;
+  campaignQualification?: CampaignQualification;
+  campaignCurrentRuleVersion?: number;
+  source?: string;
+}
 export function fetchIdeas(): Promise<Idea[]> { return request('/api/ideas'); }
+export function fetchIdea(id: string): Promise<{ idea: Idea; campaign: Campaign | null; campaign_rule_snapshot?: CampaignRuleSnapshot | null }> { return request(`/api/ideas/${encodeURIComponent(id)}`); }
 export function createIdea(item: IdeaInput): Promise<Idea> {
   return request('/api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
 }
@@ -262,13 +384,20 @@ export function deleteIdea(id: string): Promise<{ ok: boolean }> {
 export interface IdeaRecommendation {
   title: string; angle: string; reason: string; score: number;
   platforms: string[]; trend_refs: string[];
+  requirements?: string[]; pending_checks?: string[];
+  campaign_id?: string; campaign_rule_version?: number;
 }
 export interface IdeaRecommendResponse {
   persona: string; platforms: string[]; generated_at: number; existing_count: number;
+  trend_sources?: string[]; target_platforms?: string[];
+  campaign?: Pick<Campaign, 'id' | 'title' | 'platform' | 'platform_label' | 'rule_version' | 'submit_deadline' | 'qualification_state' | 'source_status'> | null;
   trend_summary: { platform: string; label: string; status: string; count: number }[];
   recommendations: IdeaRecommendation[];
 }
-export function recommendIdeas(input: { persona: string; platforms: string[]; limit?: number }): Promise<IdeaRecommendResponse> {
+export function recommendIdeas(input: {
+  persona: string; platforms?: string[]; trend_sources?: string[]; target_platforms?: string[];
+  campaign_id?: string; limit?: number;
+}): Promise<IdeaRecommendResponse> {
   return request('/api/ideas/recommend', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
   });

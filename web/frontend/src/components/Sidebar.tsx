@@ -7,7 +7,7 @@ import {
   IconDashboard, IconPublish, IconCompass, IconFile, IconSun, IconMoon,
 } from './icons';
 
-export type Page = 'dashboard' | 'chat' | 'trends' | 'ideas' | 'calendar' | 'publish' | 'interactions' | 'breakdown' | 'skills' | 'outputs' | 'accounts' | 'profile' | 'channels' | 'analytics' | 'contents' | 'integrations' | 'planning';
+export type Page = 'dashboard' | 'chat' | 'trends' | 'campaigns' | 'ideas' | 'calendar' | 'publish' | 'interactions' | 'breakdown' | 'skills' | 'outputs' | 'accounts' | 'profile' | 'channels' | 'analytics' | 'contents' | 'integrations' | 'planning';
 
 interface SidebarProps {
   currentPage: Page;
@@ -20,7 +20,7 @@ interface SidebarProps {
   recommendationAiReady: boolean;
 }
 
-const TOPIC_PAGES: Page[] = ['trends', 'ideas', 'planning', 'breakdown'];
+const TOPIC_PAGES: Page[] = ['trends', 'campaigns', 'ideas', 'planning', 'breakdown'];
 const PUBLISH_PAGES: Page[] = ['publish', 'interactions', 'calendar', 'analytics'];
 const RESOURCE_NAV: { page: Page; Icon: ComponentType<{ size?: number }>; label: string }[] = [
   { page: 'outputs', Icon: IconOutputs, label: '素材与成品' },

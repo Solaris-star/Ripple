@@ -1,6 +1,6 @@
 import type { Page } from './Sidebar';
 import type { ComponentType } from 'react';
-import { IconDashboard, IconFire, IconIdea, IconCalendar, IconPublish, IconSkills, IconChart } from './icons';
+import { IconDashboard, IconFire, IconIdea, IconCalendar, IconPublish, IconSkills, IconChart, IconCompass } from './icons';
 
 interface SubNavProps {
   current: Page;
@@ -11,6 +11,7 @@ type ToolItem = { page: Page; Icon: ComponentType<{ size?: number }>; label: str
 
 const TOPIC_TOOLS: ToolItem[] = [
   { page: 'trends', Icon: IconFire, label: '热点雷达' },
+  { page: 'campaigns', Icon: IconCompass, label: '活动广场' },
   { page: 'ideas', Icon: IconIdea, label: '选题库' },
   { page: 'planning', Icon: IconCalendar, label: '选题日历' },
   { page: 'breakdown', Icon: IconSkills, label: '爆款拆解' },

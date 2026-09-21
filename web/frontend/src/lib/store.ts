@@ -1,4 +1,4 @@
-import type { UploadedFile } from './api';
+import type { TopicUseContext, UploadedFile } from './api';
 
 export interface ChatArtifact {
   kind: 'content_draft';
@@ -36,6 +36,7 @@ export interface ChatSession {
   pendingTurnId?: string; // 进行中的可重连 job；浏览器重开后继续按 eventId 续流
   archived?: boolean;   // 归档：从 History 主列表移到「已归档」区
   contentContext?: ContentChatContext; // 从内容工作台进入的既有主稿引用；不复制正文到 localStorage
+  topicContext?: TopicUseContext; // 从热点/活动/选题进入创作时保留结构化约束，供内容工作台展示与续接
 }
 
 /** 进行中的流式状态（存于 App，不随页面切换/ChatPage 卸载而丢失）。 */

@@ -12,9 +12,9 @@ const STATUS_META: Record<string, { label: string; color: string }> = {
 const EVENT_COLOR = 'var(--layer-discover)';
 const EVENT_TYPES = ['节日', '电商', '平台活动', '行业'];
 const SOURCE_LABEL: Record<string, string> = {
-  chat: '对话页', 'publish-page': '发布页', manual: '手动', scheduler: '排期',
+  chat: '对话页', 'publish-page': '发布页', manual: '手动', scheduler: '排期', campaign: '活动广场',
 };
-const PLATFORMS = ['小红书', '抖音', 'B站', '微信视频号', '快手', '公众号', '微博', '知乎'];
+const PLATFORMS = ['X', '小红书', '抖音', 'B站', '微信公众号', '微信视频号', '快手', '公众号', '微博', '知乎'];
 const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日'];
 type Filter = 'all' | 'content' | 'event';
 
@@ -87,7 +87,8 @@ export default function CalendarPage() {
           style={{ ['--ev' as string]: EVENT_COLOR }}
           onClick={(e) => { e.stopPropagation(); openEdit(it); }}>
           <span className="cal-event-dot" />
-          <span className="cal-event-title">{it.title}</span>
+          <span className="cal-event-title">{it.platform ? `[${it.platform}] ` : ''}{it.title}</span>
+          {it.campaign_id && <span className="cal-src">活动广场 · v{it.campaign_rule_version || 1}</span>}
         </div>
       );
     }
@@ -287,6 +288,12 @@ export default function CalendarPage() {
                   ))}
                 </div>
               </>
+            )}
+            {isEvent && form.campaign_id && (
+              <div className="campaign-calendar-context">
+                <div><strong>来自活动广场</strong><span>规则 v{form.campaign_rule_version || 1} 已随日历节点保存</span></div>
+                {form.url && <a href={form.url} target="_blank" rel="noreferrer">打开原活动页</a>}
+              </div>
             )}
             <label className="field-label">备注</label>
             <textarea className="field" style={{ minHeight: 60 }} value={form.note}

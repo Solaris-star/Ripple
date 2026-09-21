@@ -297,6 +297,7 @@ export default function Contents({
   });
 
   const editorLocked = busy || !!stream;
+  const topicContext = session?.topicContext;
   const sessionForContent = useMemo(() => session, [session]);
   const layoutStyle = {
     '--r2-content-list-width': `${listCollapsed ? CONTENT_LIST_COLLAPSED_WIDTH : listWidth}px`,
@@ -306,6 +307,25 @@ export default function Contents({
   return <div className="r2-workspace r2-content-workspace">
     <Feedback error={error} notice={notice} />
     {aiUpdate && <div className="r2-ai-update-banner"><span>{aiUpdate.created ? 'AI 创建内容' : `AI 更新：${aiUpdate.fields.join(' · ')}`}</span>{undo && !aiUpdate.created && <button className="r2-text-button" disabled={busy || !!stream} onClick={() => void undoAi()}>撤销这次 AI 修改</button>}</div>}
+    {topicContext && <section className="r2-topic-handoff">
+      <header>
+        <div>
+          <strong>{topicContext.campaignTitle ? `活动创作任务 · ${topicContext.campaignTitle}` : '选题创作任务'}</strong>
+          <span>{topicContext.title}</span>
+        </div>
+        {topicContext.campaignId && <button className="r2-text-button" type="button" onClick={() => onNavigate('campaigns')}>活动广场</button>}
+      </header>
+      <div className="r2-topic-handoff-tags">
+        {topicContext.targetPlatforms?.map((platform) => <span key={platform}>目标平台 · {platform}</span>)}
+        {topicContext.campaignSubmitDeadline && <span>投稿截止 · {topicContext.campaignSubmitDeadline.slice(0, 10)}</span>}
+        {topicContext.campaignCurrentRuleVersion && <span>当前规则 · v{topicContext.campaignCurrentRuleVersion}</span>}
+        {topicContext.trendRefs?.slice(0, 3).map((ref) => <span key={ref}>热点 · {ref}</span>)}
+      </div>
+      {!!topicContext.campaignRequiredTopics?.length && <div className="r2-topic-handoff-row"><b>指定话题</b><span>{topicContext.campaignRequiredTopics.join('、')}</span></div>}
+      {!!topicContext.campaignRequirements?.length && <div className="r2-topic-handoff-row"><b>活动要求</b><span>{topicContext.campaignRequirements.join('；')}</span></div>}
+      {!!topicContext.pendingChecks?.length && <div className="r2-topic-handoff-row pending"><b>待确认</b><span>{topicContext.pendingChecks.join('；')}</span></div>}
+      {topicContext.campaignAiPolicy && topicContext.campaignAiPolicy !== 'unknown' && <div className="r2-topic-handoff-row"><b>AI 使用要求</b><span>{topicContext.campaignAiPolicy}</span></div>}
+    </section>}
 
     <div ref={layoutRef} className={`r2-content-layout r2-content-layout-ai ${listCollapsed ? 'list-collapsed' : ''} ${resizingPane ? 'resizing' : ''}`.trim()} style={layoutStyle}>
       <div className="r2-content-resize-handle r2-content-list-resize" role="separator" aria-label="调整内容列表宽度" aria-orientation="vertical" aria-valuemin={CONTENT_LIST_MIN_WIDTH} aria-valuemax={paneMaxWidth('list')} aria-valuenow={listWidth} tabIndex={0}

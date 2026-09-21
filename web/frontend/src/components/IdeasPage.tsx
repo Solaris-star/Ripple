@@ -1,13 +1,13 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { fetchIdeas, createIdea, updateIdea, deleteIdea, createSchedule, recommendIdeas } from '../lib/api';
-import type { Idea, IdeaInput, IdeaRecommendation, IdeaRecommendResponse, PersonaItem } from '../lib/api';
+import type { Idea, IdeaInput, IdeaRecommendation, IdeaRecommendResponse, PersonaItem, TopicUseContext } from '../lib/api';
 import { IconIdea, IconEdit, IconTrash, IconChat, IconCalendar, IconChevron, IconSkills } from './icons';
 import { loadTrendSelection, TREND_PLATFORMS } from '../lib/trendPrefs';
 import { executeStructuredOperation, fetchStructuredOperations } from '../lib/ripple';
 import type { OperationResult, TopicEvaluationOutput } from '../lib/ripple';
 
 interface IdeasPageProps {
-  onUseTopic: (title: string) => void;
+  onUseTopic: (input: string | TopicUseContext) => void;
   persona: string;
   aiReady: boolean;
   personas: PersonaItem[];
@@ -51,7 +51,12 @@ export default function IdeasPage({ onUseTopic, persona, aiReady, personas, onPe
   }, [ideas]);
 
   const openNew = () => { setEditId(null); setForm({ ...EMPTY }); };
-  const openEdit = (it: Idea) => { setEditId(it.id); setForm({ title: it.title, note: it.note, source: it.source, status: it.status }); };
+  const openEdit = (it: Idea) => { setEditId(it.id); setForm({
+    title: it.title, note: it.note, source: it.source, status: it.status,
+    angle: it.angle, reason: it.reason, campaign_id: it.campaign_id,
+    campaign_rule_version: it.campaign_rule_version, trend_refs: it.trend_refs,
+    target_platforms: it.target_platforms, requirements: it.requirements, pending_checks: it.pending_checks,
+  }); };
   const save = async () => {
     if (!form || !form.title.trim()) return;
     if (editId) await updateIdea(editId, form); else await createIdea(form);
@@ -61,9 +66,20 @@ export default function IdeasPage({ onUseTopic, persona, aiReady, personas, onPe
   const remove = async (it: Idea) => { await deleteIdea(it.id); load(); };
   const schedule = async (it: Idea) => {
     const d = new Date();
-    await createSchedule({ title: it.title, date: d.toISOString().slice(0, 10), platform: '', time: '', status: 'idea', note: it.note });
+    await createSchedule({
+      title: it.title, date: d.toISOString().slice(0, 10), platform: it.target_platforms?.[0] || '',
+      time: '', status: 'idea', note: it.note, kind: 'content', source: it.campaign_id ? 'campaign' : 'manual',
+      campaign_id: it.campaign_id || '', campaign_rule_version: it.campaign_rule_version || 0,
+    });
     showToast('已加入日历（今天）');
   };
+
+  const startIdeaContent = (it: Idea) => onUseTopic({
+    title: it.title, ideaId: it.id, angle: it.angle, reason: it.reason,
+    campaignId: it.campaign_id, campaignRuleVersion: it.campaign_rule_version,
+    trendRefs: it.trend_refs, targetPlatforms: it.target_platforms,
+    requirements: it.requirements, pendingChecks: it.pending_checks, source: it.source,
+  });
 
   const evaluateIdea = async (it: Idea) => {
     setEvaluationIdea(it); setEvaluation(null); setEvaluationError(''); setEvaluating(true);
@@ -176,8 +192,12 @@ export default function IdeasPage({ onUseTopic, persona, aiReady, personas, onPe
                   <div className="idea-title">{it.title}</div>
                   {it.source && <span className="badge" style={{ marginTop: 6 }}>{it.source}</span>}
                   {it.note && <div className="idea-note">{it.note}</div>}
+                  {(it.campaign_id || !!it.trend_refs?.length) && <div className="idea-context-tags">
+                    {it.campaign_id && <span>活动选题 · v{it.campaign_rule_version || 1}</span>}
+                    {it.trend_refs?.slice(0, 2).map((ref) => <span key={ref}>热点 · {ref}</span>)}
+                  </div>}
                   <div className="idea-foot">
-                    <button className="idea-act" onClick={() => onUseTopic(it.title)}><IconChat size={13} /> 做内容</button>
+                    <button className="idea-act" onClick={() => startIdeaContent(it)}><IconChat size={13} /> 做内容</button>
                     <button className="idea-act" onClick={() => schedule(it)}><IconCalendar size={13} /> 排期</button>
                     <button className="idea-act next" onClick={() => advance(it)} title="推进状态">
                       {COLUMNS.find((c) => c.key === NEXT[it.status])?.label} <IconChevron size={12} />
@@ -202,7 +222,7 @@ export default function IdeasPage({ onUseTopic, persona, aiReady, personas, onPe
               {evaluation.output.assumptions.length > 0 && <section><h4>信息边界</h4><ul>{evaluation.output.assumptions.map((x) => <li key={x}>{x}</li>)}</ul></section>}
               {evaluation.output.optimizations.length > 0 && <section><h4>优化建议</h4><ul>{evaluation.output.optimizations.map((x) => <li key={x}>{x}</li>)}</ul></section>}
               {evaluation.output.alternatives.length > 0 && <section><h4>替代选题</h4><ul>{evaluation.output.alternatives.map((x) => <li key={x}>{x}</li>)}</ul></section>}
-              <footer><span>评估结果不会自动改变选题状态。</span><button className="btn btn-primary btn-sm" onClick={() => onUseTopic(evaluationIdea.title)}>做内容</button></footer>
+              <footer><span>评估结果不会自动改变选题状态。</span><button className="btn btn-primary btn-sm" onClick={() => startIdeaContent(evaluationIdea)}>做内容</button></footer>
             </div>}
           </div>
         </div>
@@ -240,7 +260,11 @@ export default function IdeasPage({ onUseTopic, persona, aiReady, personas, onPe
                     </div>
                     <div className="idea-rec-actions">
                       <button className="btn btn-sm" disabled={added} onClick={() => void addRecommendation(rec)}>{added ? '已加入' : '加入选题库'}</button>
-                      <button className="btn btn-sm" onClick={() => onUseTopic(rec.title)}>做内容</button>
+                      <button className="btn btn-sm" onClick={() => onUseTopic({
+                        title: rec.title, angle: rec.angle, reason: rec.reason, trendRefs: rec.trend_refs,
+                        targetPlatforms: rec.platforms, requirements: rec.requirements, pendingChecks: rec.pending_checks,
+                        campaignId: rec.campaign_id, campaignRuleVersion: rec.campaign_rule_version, source: `AI推荐 · ${persona}`,
+                      })}>做内容</button>
                     </div>
                   </div>;
                 })}
