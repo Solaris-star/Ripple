@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   cancelCampaignEnrichment, configureCampaignSource, createCampaign, createIdea, createSchedule, enrichCampaign,
   fetchCampaignEnrichmentPreview, fetchCampaignEnrichmentStatus, fetchCampaigns, fetchCampaignSources,
@@ -210,6 +210,12 @@ function platformLabel(key: string): string {
   return platformDisplayName(key);
 }
 
+function isNetworkError(error: unknown): boolean {
+  if (error instanceof TypeError) return true;
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /failed to fetch|networkerror|load failed|network request failed/i.test(message);
+}
+
 export default function CampaignsPage({
   onUseTopic, persona, aiReady, personas, onPersonaChange, onNewPersona, onOpenSettings,
 }: CampaignsPageProps) {
@@ -218,6 +224,10 @@ export default function CampaignsPage({
   const [automaticCount, setAutomaticCount] = useState(0);
   const [trendGroups, setTrendGroups] = useState<TrendGroup[]>([]);
   const [loading, setLoading] = useState(true);
+  const [campaignsLoaded, setCampaignsLoaded] = useState(false);
+  const [sourcesLoaded, setSourcesLoaded] = useState(false);
+  const [connectionIssue, setConnectionIssue] = useState('');
+  const [reconnecting, setReconnecting] = useState(false);
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [selected, setSelected] = useState<Campaign | null>(null);
@@ -240,6 +250,12 @@ export default function CampaignsPage({
     account_id: '', tikhub_enabled: false, tikhub_api_key: '',
   });
   const [sourceSaving, setSourceSaving] = useState(false);
+  const loadRef = useRef<(initial?: boolean) => Promise<void>>(async () => undefined);
+  const loadInFlightRef = useRef(false);
+  const retryTimerRef = useRef<number | null>(null);
+  const retryAttemptRef = useRef(0);
+  const campaignsLoadedRef = useRef(false);
+  const sourcesLoadedRef = useRef(false);
 
   const [platformFilter, setPlatformFilter] = useState('all');
   const [typeFilter, setTypeFilter] = useState('all');
@@ -275,43 +291,111 @@ export default function CampaignsPage({
     window.setTimeout(() => setToast(''), 2300);
   };
 
+  const clearRetry = useCallback(() => {
+    if (retryTimerRef.current != null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    retryAttemptRef.current = 0;
+  }, []);
+
+  const scheduleRetry = useCallback(() => {
+    if (retryTimerRef.current != null) return;
+    const delays = [1000, 2000, 5000];
+    const delay = delays[Math.min(retryAttemptRef.current, delays.length - 1)];
+    retryAttemptRef.current += 1;
+    retryTimerRef.current = window.setTimeout(() => {
+      retryTimerRef.current = null;
+      void loadRef.current(false);
+    }, delay);
+  }, []);
+
+  const markConnectionFailure = useCallback(() => {
+    const hasSnapshot = campaignsLoadedRef.current || sourcesLoadedRef.current;
+    setReconnecting(true);
+    setConnectionIssue(hasSnapshot
+      ? 'Ripple 后端正在重新连接，当前保留已成功读取的数据。'
+      : '活动数据暂时无法读取，正在自动重新连接 Ripple 后端…');
+    scheduleRetry();
+  }, [scheduleRetry]);
+
   const load = useCallback(async (initial = false) => {
-    if (initial) setLoading(true);
+    if (loadInFlightRef.current) return;
+    loadInFlightRef.current = true;
+    if (initial && !campaignsLoadedRef.current && !sourcesLoadedRef.current) setLoading(true);
     try {
-      const runtime = await fetchStatus();
-      if (!runtime.features?.campaigns || !runtime.features?.campaign_sources_v2) {
-        setCampaigns([]); setSources([]); setAutomaticCount(0);
-        setError('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
+      let runtime;
+      try {
+        runtime = await fetchStatus();
+      } catch {
+        markConnectionFailure();
         return;
       }
-      const [campaignRows, sourceState, accountRows, agentState, xRuleState] = await Promise.all([
+      if (!runtime.features?.campaigns || !runtime.features?.campaign_sources_v2) {
+        setReconnecting(false);
+        setConnectionIssue('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
+        clearRetry();
+        return;
+      }
+
+      const [campaignResult, sourceResult, accountResult, agentResult, xRuleResult] = await Promise.allSettled([
         fetchCampaigns(), fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
-        fetchCampaignEnrichmentStatus().catch(() => null), fetchXCampaignEnrichmentStatus().catch(() => null),
+        fetchCampaignEnrichmentStatus(), fetchXCampaignEnrichmentStatus(),
       ]);
-      setAccounts(accountRows);
-      setCampaigns(campaignRows);
-      setSources(sourceState.items || []);
-      setAutomaticCount(sourceState.automatic_count || 0);
-      if (agentState) setEnrichmentStatus(agentState);
-      if (xRuleState) setXEnrichmentStatus(xRuleState);
-      if (sourceState.server_now) setServerOffset(sourceState.server_now - Math.floor(Date.now() / 1000));
-      setSelected((current) => current ? campaignRows.find((x) => x.id === current.id) || null : null);
-      setError('');
-    } catch (e) {
-      const message = e instanceof Error ? e.message : '活动数据读取失败';
-      setError(message === 'Not Found'
-        ? '当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。'
-        : message);
+
+      let coreFailed = false;
+      if (campaignResult.status === 'fulfilled') {
+        const campaignRows = campaignResult.value;
+        setCampaigns(campaignRows);
+        setCampaignsLoaded(true);
+        campaignsLoadedRef.current = true;
+        setSelected((current) => current ? campaignRows.find((x) => x.id === current.id) || null : null);
+      } else {
+        coreFailed = true;
+      }
+
+      if (sourceResult.status === 'fulfilled') {
+        const sourceState = sourceResult.value;
+        setSources(sourceState.items || []);
+        setAutomaticCount(sourceState.automatic_count || 0);
+        setSourcesLoaded(true);
+        sourcesLoadedRef.current = true;
+        if (sourceState.server_now) setServerOffset(sourceState.server_now - Math.floor(Date.now() / 1000));
+      } else {
+        coreFailed = true;
+      }
+
+      if (accountResult.status === 'fulfilled') setAccounts(accountResult.value);
+      if (agentResult.status === 'fulfilled') setEnrichmentStatus(agentResult.value);
+      if (xRuleResult.status === 'fulfilled') setXEnrichmentStatus(xRuleResult.value);
+
+      if (coreFailed) {
+        markConnectionFailure();
+      } else {
+        clearRetry();
+        setReconnecting(false);
+        setConnectionIssue('');
+        setError('');
+      }
     } finally {
+      loadInFlightRef.current = false;
       if (initial) setLoading(false);
     }
-  }, []);
+  }, [clearRetry, markConnectionFailure]);
+
+  useEffect(() => {
+    loadRef.current = load;
+  }, [load]);
 
   useEffect(() => {
     void load(true);
     const refreshTimer = window.setInterval(() => { void load(false); }, 60 * 1000);
     const clockTimer = window.setInterval(() => setClock(Math.floor(Date.now() / 1000)), 1000);
-    return () => { window.clearInterval(refreshTimer); window.clearInterval(clockTimer); };
+    return () => {
+      window.clearInterval(refreshTimer);
+      window.clearInterval(clockTimer);
+      if (retryTimerRef.current != null) window.clearTimeout(retryTimerRef.current);
+    };
   }, [load]);
 
   useEffect(() => {
@@ -352,13 +436,23 @@ export default function CampaignsPage({
     try {
       const result = await refreshCampaigns(platforms, true);
       setCampaigns(result.campaigns);
+      setCampaignsLoaded(true);
+      campaignsLoadedRef.current = true;
       setSelected((current) => current ? result.campaigns.find((row) => row.id === current.id) || current : null);
       setSources(result.sources.items || []);
       setAutomaticCount(result.sources.automatic_count || 0);
+      setSourcesLoaded(true);
+      sourcesLoadedRef.current = true;
+      clearRetry();
+      setReconnecting(false);
+      setConnectionIssue('');
       const fresh = result.results.filter((row) => row.status === 'fresh');
       const stale = result.results.filter((row) => row.status !== 'fresh' && row.status !== 'cached');
       showToast(`已刷新 ${fresh.length} 个来源${stale.length ? `，${stale.length} 个来源需要处理` : ''}`);
-    } catch (e) { setError(e instanceof Error ? e.message : '活动刷新失败'); }
+    } catch (e) {
+      if (isNetworkError(e)) markConnectionFailure();
+      else setError(e instanceof Error ? e.message : '活动刷新失败');
+    }
     finally { setRefreshing(false); }
   };
 
@@ -676,7 +770,7 @@ export default function CampaignsPage({
           <p className="page-subtitle">聚合 X、小红书、抖音、B站、微信公众号、微信视频号的创作活动与激励活动，结合热点生成选题灵感。</p>
         </div>
         <div className="campaign-head-actions">
-          <button className="btn btn-sm btn-primary" title="立即重新检查已启用的活动源；单个活动规则可在详情中单独重新核验" disabled={refreshing || loading} onClick={() => void refreshNow()}>
+          <button className="btn btn-sm btn-primary" title="立即重新检查已启用的活动源；单个活动规则可在详情中单独重新核验" disabled={refreshing || loading || !sourcesLoaded} onClick={() => void refreshNow()}>
             <IconRefresh size={13} /> {refreshing ? '刷新中…' : '刷新活动'}
           </button>
           <button className="btn btn-sm" onClick={() => void openEnrichmentPreview()} disabled={agentBatchActive}>✦ Agent 补全缺失规则</button>
@@ -685,21 +779,21 @@ export default function CampaignsPage({
       </div>
 
       <div className="campaign-stats">
-        <div className="campaign-stat"><span className="campaign-stat-dot ok" /><span>进行中活动</span><strong>{stats.active}</strong></div>
-        <div className="campaign-stat"><span className="campaign-stat-dot warn" /><span>即将截止</span><strong>{stats.soon}</strong></div>
-        <div className="campaign-stat"><span className="campaign-stat-dot saved" /><span>已收藏</span><strong>{stats.saved}</strong></div>
+        <div className="campaign-stat"><span className="campaign-stat-dot ok" /><span>进行中活动</span><strong>{campaignsLoaded ? stats.active : '—'}</strong></div>
+        <div className="campaign-stat"><span className="campaign-stat-dot warn" /><span>即将截止</span><strong>{campaignsLoaded ? stats.soon : '—'}</strong></div>
+        <div className="campaign-stat"><span className="campaign-stat-dot saved" /><span>已收藏</span><strong>{campaignsLoaded ? stats.saved : '—'}</strong></div>
       </div>
 
       <div className="campaign-source-note">
         <IconRefresh size={15} />
         <div>
-          <strong>已就绪 {automaticCount} 个自动活动源</strong>
+          <strong>{sourcesLoaded ? `已就绪 ${automaticCount} 个自动活动源` : '活动源状态暂时无法读取'}</strong>
           <span>活动源由 Ripple 后端定时同步，页面无需保持打开；右上角“刷新活动”可随时手动重新检查。收费备用源未经显式启用不会调用。</span>
         </div>
         {enrichmentStatus && ['running', 'queued', 'cancelling'].includes(enrichmentStatus.status) && <div className="campaign-agent-progress"><strong>Agent 补全 {enrichmentStatus.done}/{enrichmentStatus.total}</strong><span>{enrichmentStatus.failed ? `失败 ${enrichmentStatus.failed} · ` : ''}按活动串行处理，避免重复 Token 消耗</span><button className="r2-text-button" onClick={() => void cancelGlobalEnrichment()}>取消</button></div>}
         {xEnrichmentStatus && ['running', 'queued'].includes(xEnrichmentStatus.status) && <div className="campaign-agent-progress"><strong>X 规则整理 {xEnrichmentStatus.done}/{xEnrichmentStatus.total}</strong><span>{xEnrichmentStatus.failed ? `失败 ${xEnrichmentStatus.failed} · ` : ''}逐条中文整理，已处理活动不会自动重复消耗 Token</span></div>}
       </div>
-      <section className="campaign-source-status-grid">
+      {sourcesLoaded && <section className="campaign-source-status-grid">
         {sources.map((source) => {
           const sync = source.last_sync;
           const now = clock + serverOffset;
@@ -736,7 +830,7 @@ export default function CampaignsPage({
             </div>
           </article>;
         })}
-      </section>
+      </section>}
 
       <div className="campaign-filters">
         <select className="field" value={platformFilter} onChange={(e) => setPlatformFilter(e.target.value)}>
@@ -782,19 +876,27 @@ export default function CampaignsPage({
         ] as const).map(([key, label]) => (
           <button key={key} className={sortMode === key ? 'active' : ''} onClick={() => setSortMode(key)}>{label}</button>
         ))}
-        <span>共 {visible.length} 个活动</span>
+        <span>{campaignsLoaded ? `共 ${visible.length} 个活动` : '活动数据未读取'}</span>
       </div>
 
+      {connectionIssue && <div className={`campaign-connection-notice ${reconnecting ? 'reconnecting' : ''}`}>{connectionIssue}{reconnecting && <span>自动重试中…</span>}</div>}
       {error && <div className="notice-error">{error}</div>}
       <div className="campaign-layout">
         <main className="campaign-list">
-          {loading && <div className="campaign-empty">正在读取活动…</div>}
-          {!loading && visible.length === 0 && (
+          {loading && !campaignsLoaded && <div className="campaign-empty">正在读取活动…</div>}
+          {!loading && !campaignsLoaded && (
+            <div className="campaign-empty">
+              <IconCompass size={28} />
+              <strong>活动数据暂时无法读取</strong>
+              <p>Ripple 正在自动重新连接后端。连接恢复后会自动载入活动，不会把未读取状态当成 0 条数据。</p>
+            </div>
+          )}
+          {campaignsLoaded && visible.length === 0 && (
             <div className="campaign-empty">
               <IconCompass size={28} />
               <strong>{campaigns.length ? '当前筛选条件没有匹配活动' : '还没有已确认的创作活动'}</strong>
               <p>{campaigns.length ? '调整筛选条件继续查看。' : '可点击“刷新活动”从已就绪的数据源自动获取；手动导入用于补充遗漏活动。Ripple 不会用虚构活动填充这里。'}</p>
-              {!campaigns.length && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openImport}>补充导入</button></div>}
+              {!campaigns.length && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing || !sourcesLoaded} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openImport}>补充导入</button></div>}
             </div>
           )}
           <div className="campaign-grid">

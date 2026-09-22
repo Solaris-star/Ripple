@@ -1096,6 +1096,9 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-source-note svg { margin-top: 2px; color: var(--accent-end); flex-shrink: 0; }
 .campaign-source-note strong { display: block; font-size: 14px; color: var(--text); }
 .campaign-source-note span { display: block; font-size: 13px; line-height: 1.55; margin-top: 2px; }
+.campaign-connection-notice { max-width: 1220px; margin: 10px auto 0; padding: 9px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-2); color: var(--text-secondary); font-size: 13px; line-height: 1.5; display: flex; align-items: center; gap: 10px; }
+.campaign-connection-notice.reconnecting { border-color: color-mix(in srgb, #d7912c 35%, var(--border)); background: color-mix(in srgb, #d7912c 8%, var(--surface)); }
+.campaign-connection-notice > span { margin-left: auto; color: #b27b22; font-size: 12px; white-space: nowrap; }
 .campaign-head-actions { display: flex; align-items: center; gap: 7px; }
 .campaign-source-status-grid { max-width: 1220px; margin: 9px auto 0; display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 7px; }
 .campaign-source-status { position: relative; min-width: 0; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); transition: border-color var(--t-fast), background var(--t-fast), box-shadow var(--t-fast); }
