@@ -79,6 +79,28 @@ def test_account_specific_campaign_qualification_is_projected_to_card_and_accoun
     assert "可执行活动任务" in row["account_states"]["xhs-account-1"]["qualification_basis"]
 
 
+def test_xhs_official_activity_id_prevents_same_title_campaigns_from_merging(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    first = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:44405", "title": "原神创作者激励计划",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page-a",
+        "source_type": "creator_activity_center_api", "source_status": "verified",
+        "evidence": {"kind": "creator_account_activity"},
+    })
+    second = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:43521", "title": "原神创作者激励计划",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page-b",
+        "source_type": "creator_activity_center_api", "source_status": "verified",
+        "evidence": {"kind": "creator_account_activity"},
+    })
+    assert first["id"] != second["id"]
+    assert len(items) == 2
+    assert {row["external_ids"]["xiaohongshu_creator_events"] for row in items} == {"xhs:44405", "xhs:43521"}
+
+
 def test_fresh_xhs_v2_refresh_removes_only_confirmed_unsaved_legacy_topic_rows(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     legacy_topic = {

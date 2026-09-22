@@ -4055,12 +4055,29 @@ def _campaign_find_candidate(items: list[dict], candidate: dict) -> dict | None:
     url = str(candidate.get("source_url") or "")
     title_key = _campaign_match_key(candidate.get("title", ""))
     platform = str(candidate.get("platform") or "")
+    provider_id = str(candidate.get("provider_id") or "")
+    strict_xhs_activity = bool(
+        platform == "xiaohongshu"
+        and provider_id == "xiaohongshu_creator_events"
+        and external
+    )
     for item in items:
         if item.get("platform") != platform:
             continue
         ids = item.get("external_ids") if isinstance(item.get("external_ids"), dict) else {}
         if external and external in {str(v) for v in ids.values() if v}:
             return item
+        if strict_xhs_activity:
+            if url and url != "https://creator.xiaohongshu.com/new/events" and str(item.get("source_url") or "") == url:
+                return item
+            if (
+                item.get("source_type") == "user_import"
+                and not str(ids.get(provider_id) or "")
+                and title_key
+                and _campaign_match_key(item.get("title", "")) == title_key
+            ):
+                return item
+            continue
         if url and str(item.get("source_url") or "") == url:
             return item
         if title_key and _campaign_match_key(item.get("title", "")) == title_key:

@@ -65,6 +65,17 @@ def test_creator_activity_rows_use_activity_list_only_and_keep_topics_nested():
     assert rows[0]["topics"] == [{"id": "topic1", "name": "光遇", "link": "xhsdiscover://topic/v2/topic1"}]
 
 
+def test_creator_activity_rows_keep_full_activity_center_result_set():
+    payload = {"data": {"activity_list": [
+        {"activity_id": index, "activity_name": f"活动{index}"}
+        for index in range(1, 251)
+    ]}}
+    rows = _creator_activity_rows(payload)
+    assert len(rows) == 250
+    assert rows[0]["external_id"] == "1"
+    assert rows[-1]["external_id"] == "250"
+
+
 def test_creator_task_detail_maps_publish_topic_rewards_and_account_eligibility():
     payload = {"data": {"enabled": 1, "status": 1, "score_name": "积分", "tasks": [
         {"event_type": "follow_user", "name": "关注@闪耀暖暖 官方账号", "description": "可获得10积分", "finished": False,
@@ -141,14 +152,14 @@ def test_creator_events_use_same_connected_xhs_profile_boundary(tmp_path, monkey
     service, account_id = connected_service(tmp_path)
     calls = []
     def run(account, operation, operation_id, **extra):
-        calls.append((operation, extra["xhs_action"]))
+        calls.append((operation, extra["xhs_action"], extra["xhs_params"]))
         return fake_read_result(extra["xhs_action"])
     monkeypatch.setattr(service.accounts, "run", run)
-    result = service.xhs_ops.events(account_id, 10)
+    result = service.xhs_ops.events(account_id, 250, detail_limit=12)
     assert result["source"] == "creator_events_api"
     assert result["sample_scope"] == "selected_account_creator_events"
     assert result["items"][0]["external_id"] == "event1"
-    assert calls == [("xhs_read", "events")]
+    assert calls == [("xhs_read", "events", {"limit": 250, "detail_limit": 12})]
 
 
 def test_interaction_draft_idempotency_guard_and_execute_once(tmp_path, monkeypatch):

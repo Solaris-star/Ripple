@@ -1130,7 +1130,7 @@ class CampaignSourceService:
         account, status = self._effective_account("xiaohongshu", str(state["xiaohongshu"].get("account_id") or ""))
         if status != "ready" or not account:
             raise WorkflowError("小红书活动源需要已连接的创作者账号。", 409)
-        payload = self.workspace.xhs_ops.events(str(account["id"]), 40, detail_limit=8)
+        payload = self.workspace.xhs_ops.events(str(account["id"]), 500, detail_limit=12)
         if not payload.get("items") and payload.get("source") == "creator_events_dom" and not payload.get("api_observed"):
             raise WorkflowError("小红书创作者活动列表接口本次未返回数据，请稍后重试。", 502)
         rows = []

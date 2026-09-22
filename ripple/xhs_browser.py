@@ -18,6 +18,8 @@ from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 XHS_HOSTS = {"xiaohongshu.com", "www.xiaohongshu.com", "creator.xiaohongshu.com"}
 NOTE_PATH_RE = re.compile(r"/(?:explore|discovery/item|item)/([0-9A-Za-z]+)")
 CREATOR_DETAIL_CACHE_TTL = 24 * 60 * 60
+CREATOR_ACTIVITY_MAX = 500
+CREATOR_DETAIL_CACHE_MAX = 600
 CARD_JS = r"""(limit) => {
   const seen = new Set(); const out = [];
   const anchors = Array.from(document.querySelectorAll("a[href*='/explore/'],a[href*='/discovery/item/'],a[href*='/item/']"));
@@ -124,7 +126,7 @@ def _campaign_candidates(value: Any, *, limit: int = 50) -> list[dict[str, Any]]
     walk(value)
     return rows[:limit]
 
-def _creator_activity_rows(value: Any, *, limit: int = 50) -> list[dict[str, Any]]:
+def _creator_activity_rows(value: Any, *, limit: int = CREATOR_ACTIVITY_MAX) -> list[dict[str, Any]]:
     if not isinstance(value, dict):
         return []
     data = value.get('data') if isinstance(value.get('data'), dict) else {}
@@ -476,7 +478,7 @@ def account_notes(directory: Path, limit: int) -> dict[str, Any]:
         _close(p, context)
 
 
-def creator_events(directory: Path, limit: int = 30, detail_limit: int = 8) -> dict[str, Any]:
+def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_limit: int = 12) -> dict[str, Any]:
     p, context, page = _launch(directory)
     activity_payload: dict[str, Any] | None = None
     try:
@@ -493,8 +495,19 @@ def creator_events(directory: Path, limit: int = 30, detail_limit: int = 8) -> d
             except Exception:
                 pass
 
+        def wait_activity_payload(wait_ms: int) -> None:
+            deadline = time.monotonic() + max(0, wait_ms) / 1000
+            while activity_payload is None and time.monotonic() < deadline:
+                page.wait_for_timeout(250)
+
         page.on('response', on_response)
-        _goto(page, 'https://creator.xiaohongshu.com/new/events', wait=2600)
+        _goto(page, 'https://creator.xiaohongshu.com/new/events', wait=1600)
+        wait_activity_payload(4500)
+        if activity_payload is None:
+            page.reload(wait_until='domcontentloaded', timeout=30000)
+            page.wait_for_timeout(1600)
+            _risk(page)
+            wait_activity_payload(4500)
         try: page.remove_listener('response', on_response)
         except Exception: pass
         body = ''
@@ -511,7 +524,7 @@ def creator_events(directory: Path, limit: int = 30, detail_limit: int = 8) -> d
         if api_observed:
             values = ((activity_payload.get('data') or {}).get('activity_list') or [])
             raw_count = len(values) if isinstance(values, list) else 0
-            items = _creator_activity_rows(activity_payload, limit=max(1, min(limit, 50)))
+            items = _creator_activity_rows(activity_payload, limit=max(1, min(limit, CREATOR_ACTIVITY_MAX)))
         source = 'creator_activity_center_api' if api_observed else 'creator_events_dom'
         if not items:
             raw = page.evaluate(CREATOR_EVENTS_JS, max(1, min(limit, 50))) or []
@@ -578,12 +591,13 @@ def creator_events(directory: Path, limit: int = 30, detail_limit: int = 8) -> d
                 except Exception: pass
             detail_fetched += 1
         if cache_changed:
-            if len(detail_cache) > 200:
-                detail_cache = dict(sorted(detail_cache.items(), key=lambda pair: int((pair[1] or {}).get('at') or 0), reverse=True)[:200])
+            if len(detail_cache) > CREATOR_DETAIL_CACHE_MAX:
+                detail_cache = dict(sorted(detail_cache.items(), key=lambda pair: int((pair[1] or {}).get('at') or 0), reverse=True)[:CREATOR_DETAIL_CACHE_MAX])
             _write_creator_detail_cache(directory, detail_cache)
-        return {'items': items[:limit], 'source': source,
+        listed = items[:max(1, min(limit, CREATOR_ACTIVITY_MAX))]
+        return {'items': listed, 'source': source,
                 'page_url': 'https://creator.xiaohongshu.com/new/events',
-                'api_observed': api_observed, 'raw_count': raw_count,
+                'api_observed': api_observed, 'raw_count': raw_count, 'listed_count': len(listed),
                 'detail_count': detail_count, 'detail_fetched': detail_fetched}
     finally:
         _close(p, context)
@@ -778,7 +792,9 @@ def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
     if action=='feed': return feed(directory,limit)
     if action=='search': return search(directory,str(params.get('query') or ''),limit)
     if action=='notes': return account_notes(directory,limit)
-    if action=='events': return creator_events(directory,limit,max(0,min(int(params.get('detail_limit') or 8),20)))
+    if action=='events':
+        event_limit=max(1,min(int(params.get('limit') or CREATOR_ACTIVITY_MAX),CREATOR_ACTIVITY_MAX))
+        return creator_events(directory,event_limit,max(0,min(int(params.get('detail_limit') or 12),20)))
     if action=='note': return note_detail(directory,str(params.get('url') or ''))
     if action=='comments': return comments(directory,str(params.get('url') or ''),limit)
     if action=='reply': return reply(directory,str(params.get('url') or ''),list(params.get('items') or []))
