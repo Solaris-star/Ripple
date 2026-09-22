@@ -431,14 +431,19 @@ def test_xiaohongshu_source_uses_connected_creator_account_and_marks_account_evi
                 "external_id": "x1", "title": "小红书创作活动",
                 "url": "https://fe.xiaohongshu.com/ditto/vincent/page1?resource_instance_id=1",
                 "starts_at": 1790000000000, "ends_at": 1791000000000,
-                "description": "参与投稿瓜分10W现金", "reward_summary": "参与投稿瓜分10W现金",
+                "description": "秋天开了店喊你来坐坐", "promotion_summary": "秋天开了店喊你来坐坐",
+                "reward_summary": "",
                 "topics": [{"id": "t1", "name": "测试话题", "link": "xhsdiscover://topic/v2/t1"}],
                 "content_requirements": ["发布#测试话题 话题笔记"],
-                "prizes": ["参与投稿瓜分10W现金"],
-                "reward_rules": ["发布#测试话题 话题笔记：可获得10积分"],
+                "prizes": ["2000流量券", "定制便携餐具包"],
+                "winning_conditions": ["活动进度达到 10（进度单位以活动页说明为准）"],
+                "reward_rules": ["活动进度达到 10（进度单位以活动页说明为准）：对应奖励「2000流量券」"],
                 "required_topics": ["测试话题"],
-                "submission_spec": {"formats": ["image_text", "video"], "submission_method": "通过活动页带指定话题发布笔记"},
-                "qualification_state": "eligible", "qualification_basis": "创作者后台已向当前账号返回可执行活动任务。",
+                "submission_spec": {"formats": [], "submission_method": "通过活动页带指定话题发布笔记"},
+                "qualification_state": "unknown",
+                "qualification_basis": "任务可见，不代表满足全部参赛或领奖条件。",
+                "xhs_detail_status": "parsed", "xhs_detail_version": 3, "xhs_detail_fetched_at": 1790067600,
+                "field_evidence": {"prizes": {"source": "xhs_milestone_api", "originals": ["2000流量券", "定制便携餐具包"]}},
                 "page_id": "page1", "instance_id": "1",
             }],
         }
@@ -446,14 +451,18 @@ def test_xiaohongshu_source_uses_connected_creator_account_and_marks_account_evi
     rows = service._xiaohongshu(service._state())
     assert calls == [(account["id"], 500, 12)]
     assert rows[0]["account_id"] == account["id"]
-    assert rows[0]["evidence"]["kind"] == "creator_account_activity"
+    assert rows[0]["evidence"]["kind"] == "platform_public_detail"
     assert rows[0]["evidence"]["topic_ids"] == ["t1"]
     assert rows[0]["source_type"] == "creator_events_api_v2"
     assert rows[0]["required_topics"] == ["测试话题"]
     assert rows[0]["content_requirements"] == ["发布#测试话题 话题笔记"]
-    assert rows[0]["prizes"] == ["参与投稿瓜分10W现金"]
-    assert rows[0]["submission_spec"]["formats"] == ["image_text", "video"]
-    assert rows[0]["qualification_state"] == "eligible"
+    assert rows[0]["prizes"] == ["2000流量券", "定制便携餐具包"]
+    assert rows[0]["reward_summary"] == "2000流量券、定制便携餐具包"
+    assert rows[0]["winning_conditions"] == ["活动进度达到 10（进度单位以活动页说明为准）"]
+    assert rows[0]["submission_spec"]["formats"] == []
+    assert rows[0]["qualification_state"] == "unknown"
+    assert rows[0]["xhs_detail_status"] == "parsed"
+    assert rows[0]["field_evidence"]["prizes"]["source"] == "xhs_milestone_api"
 
     default = service.xiaohongshu_official_snapshot(account["id"], "default")
     latest = service.xiaohongshu_official_snapshot(account["id"], "latest")
@@ -498,6 +507,77 @@ def test_xiaohongshu_source_uses_connected_creator_account_and_marks_account_evi
     assert preserved_default["status"] == preserved_latest["status"] == "stale"
     assert preserved_default["last_observed_source_count"] == 249
     assert "截断" in preserved_default["error"]
+
+
+def test_xiaohongshu_list_only_activity_uses_publish_topic_without_guessing_formats_or_reward(source_service, monkeypatch):
+    workspace, service = source_service
+    account = workspace.accounts.create(AccountInput(
+        platform="xiaohongshu", label="列表号", idempotency_key="xhs-list-only",
+    ))
+    with workspace.store.transaction() as state:
+        state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u-list"})
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda account_id, limit, detail_limit=12: {
+        "source": "creator_activity_center_api", "api_observed": True, "raw_count": 1,
+        "orders": {
+            "default": {"observed": True, "activity_ids": ["43010"], "raw_count": 1, "unique_count": 1, "truncated": False},
+            "latest": {"observed": True, "activity_ids": ["43010"], "raw_count": 1, "unique_count": 1, "truncated": False},
+        },
+        "items": [{
+            "external_id": "43010", "title": "Pick你的每周时刻",
+            "url": "https://fe.xiaohongshu.com/ditto/vincent/page-pick",
+            "description": "带话题发笔记薯来送流量", "promotion_summary": "带话题发笔记薯来送流量",
+            "reward_summary": "带话题发笔记薯来送流量",
+            "topics": [{"id": "t-weekly", "name": "WeeklyPick", "link": "xhsdiscover://topic/v2/t-weekly"}],
+            "publish_url": "https://creator.xiaohongshu.com/publish/publish?from=activity_center&activity_id=43010",
+        }],
+    })
+    row = service._xiaohongshu(service._state())[0]
+    assert row["required_topics"] == ["WeeklyPick"]
+    assert row["content_requirements"] == ["发布时带 #WeeklyPick 话题"]
+    assert row["submission_spec"]["formats"] == []
+    assert row["submission_spec"]["submission_method"] == "通过活动中心指定投稿入口发布并带指定话题"
+    assert row["qualification_state"] == "unknown"
+    assert row["evidence"]["kind"] == "creator_account_activity"
+    assert row["xhs_detail_status"] == "not_fetched"
+
+
+
+
+def test_xiaohongshu_single_campaign_detail_refresh_uses_official_detail_reader(source_service, monkeypatch):
+    workspace, service = source_service
+    account = workspace.accounts.create(AccountInput(
+        platform="xiaohongshu", label="详情刷新号", idempotency_key="xhs-detail-refresh",
+    ))
+    with workspace.store.transaction() as state:
+        state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u4"})
+    calls = []
+    monkeypatch.setattr(workspace.xhs_ops, "event_detail", lambda account_id, **kwargs: (
+        calls.append((account_id, kwargs)) or {
+            "source": "creator_event_detail", "external_id": "44728",
+            "url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+            "xhs_detail_status": "parsed", "xhs_detail_version": 3, "xhs_detail_fetched_at": 20,
+            "prizes": ["2000流量券"], "winning_conditions": ["活动进度达到 10（进度单位以活动页说明为准）"],
+            "reward_rules": ["活动进度达到 10（进度单位以活动页说明为准）：对应奖励「2000流量券」"],
+            "eligibility": [], "content_requirements": ["连更打卡任务"], "required_topics": ["去阿秋店里坐坐"],
+            "submission_spec": {"formats": [], "submission_method": "通过活动页带指定话题发布笔记"},
+            "qualification_state": "unknown", "qualification_basis": "任务可见，不代表满足全部参赛或领奖条件。",
+            "field_evidence": {"prizes": {"source": "xhs_milestone_api", "originals": ["2000流量券"]}},
+        }
+    ))
+    candidate = service.verify_xiaohongshu_campaign({
+        "title": "去阿秋店里坐坐", "platform": "xiaohongshu", "account_id": account["id"],
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+        "summary": "秋天开了店喊你来坐坐", "required_topics": ["去阿秋店里坐坐"],
+        "external_ids": {"xiaohongshu_creator_events": "xhs:44728"},
+    })
+    assert calls == [(account["id"], {
+        "url": "https://fe.xiaohongshu.com/ditto/vincent/page1", "activity_id": "44728", "force": True,
+    })]
+    assert candidate["evidence"]["kind"] == "platform_public_detail"
+    assert candidate["prizes"] == ["2000流量券"]
+    assert candidate["reward_summary"] == "2000流量券"
+    assert candidate["qualification_state"] == "unknown"
+    assert candidate["submission_spec"]["formats"] == []
 
 
 

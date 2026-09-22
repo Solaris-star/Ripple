@@ -20,6 +20,347 @@ NOTE_PATH_RE = re.compile(r"/(?:explore|discovery/item|item)/([0-9A-Za-z]+)")
 CREATOR_DETAIL_CACHE_TTL = 24 * 60 * 60
 CREATOR_ACTIVITY_MAX = 500
 CREATOR_DETAIL_CACHE_MAX = 600
+CREATOR_DETAIL_CACHE_VERSION = 3
+
+CREATOR_DSL_DETAIL_JS = r"""() => {
+  const dsl = window.__SETUP_SERVER_STATE__ && window.__SETUP_SERVER_STATE__.DSL;
+  const root = dsl && Array.isArray(dsl.componentsTree) ? dsl.componentsTree : null;
+  const out = { prizes: [], task_rules: [], eligibility: [], winning_conditions: [], content_rules: [], evidence: [], component_types: [] };
+  const seenPrize = new Set(), seenRule = new Set(), seenEligibility = new Set(), seenWinning = new Set(), seenContent = new Set(), seenType = new Set();
+  let visited = 0;
+  const hidden = (node) => {
+    if (!node || typeof node !== 'object') return false;
+    const props = node.props && typeof node.props === 'object' ? node.props : {};
+    const style = (props.style && typeof props.style === 'object') ? props.style :
+      ((node.style && typeof node.style === 'object') ? node.style : {});
+    return node.visible === false || node.hidden === true || node.disabled === true ||
+      props.visible === false || props.hidden === true || props.disabled === true ||
+      style.display === 'none' || style.visibility === 'hidden';
+  };
+  const pushPrize = (title, path) => {
+    title = String(title || '').replace(/\s+/g, ' ').trim().slice(0, 240);
+    if (!title || seenPrize.has(title)) return;
+    seenPrize.add(title); out.prizes.push(title);
+    out.evidence.push({ field: 'prizes', path, original: title });
+  };
+  const pushRule = (text, path) => {
+    text = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    if (!text || seenRule.has(text)) return;
+    seenRule.add(text); out.task_rules.push(text);
+    out.evidence.push({ field: 'content_requirements', path, original: text });
+  };
+  const pushField = (field, text, path, seen) => {
+    text = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 800);
+    if (!text || text.length < 5 || seen.has(text)) return;
+    seen.add(text); out[field].push(text);
+    out.evidence.push({ field, path, original: text });
+  };
+  const walk = (node, path, depth) => {
+    if (++visited > 18000 || depth > 24 || !node || typeof node !== 'object' || hidden(node)) return;
+    if (Array.isArray(node)) {
+      node.slice(0, 400).forEach((child, index) => walk(child, path + '[' + index + ']', depth + 1));
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      const next = path + '.' + key;
+      if ((key === 'componentName' || key === 'componentType' || key === 'name') && typeof value === 'string' && value.length < 120) {
+        if (!seenType.has(value)) { seenType.add(value); out.component_types.push(value); }
+      }
+      if (typeof value === 'string') {
+        const text = value.replace(/\s+/g, ' ').trim();
+        if (/(参与条件|参与要求|参与资格|报名条件)/.test(text) && text.length > 6) {
+          pushField('eligibility', text, next, seenEligibility);
+        }
+        if (/(获奖条件|评选规则|评选标准|中奖条件|奖励条件)/.test(text) && text.length > 6) {
+          pushField('winning_conditions', text, next, seenWinning);
+        }
+        if (/(投稿要求|作品要求|创作要求|内容要求)/.test(text) && text.length > 6) {
+          pushField('content_rules', text, next, seenContent);
+        }
+      }
+      if (key === 'prizeInfo' && Array.isArray(value)) {
+        value.slice(0, 50).forEach((row, index) => {
+          if (row && typeof row === 'object') pushPrize(row.title, next + '[' + index + '].title');
+        });
+      }
+      if (key === 'taskList' && Array.isArray(value) && path.includes('playSection')) {
+        value.slice(0, 80).forEach((row, index) => {
+          if (!row || typeof row !== 'object' || hidden(row)) return;
+          const text = row.description || row.title || row.name || '';
+          if (/发布|投稿|创作/.test(String(text || ''))) {
+            pushRule(text, next + '[' + index + '].description');
+          }
+        });
+      }
+      walk(value, next, depth + 1);
+    }
+  };
+  if (root) walk(root, 'DSL.componentsTree', 0);
+  out.prizes = out.prizes.slice(0, 30);
+  out.task_rules = out.task_rules.slice(0, 40);
+  out.eligibility = out.eligibility.slice(0, 30);
+  out.winning_conditions = out.winning_conditions.slice(0, 30);
+  out.content_rules = out.content_rules.slice(0, 40);
+  out.evidence = out.evidence.slice(0, 80);
+  out.component_types = out.component_types.slice(0, 40);
+  out.has_visual_assets = out.component_types.some((value) => /Banner|自定义图片|HotArea|热区图/.test(value));
+  return out;
+}"""
+
+
+def _unique_text(values: list[Any], limit: int, max_len: int = 240) -> list[str]:
+    out: list[str] = []
+    for raw in values:
+        text = re.sub(r'\s+', ' ', str(raw or '')).strip()[:max_len]
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _rewardish_summary(text: str) -> str:
+    value = re.sub(r'\s+', ' ', str(text or '')).strip()[:600]
+    return value if value and re.search(r'(现金|奖金|奖池|瓜分|奖品|礼包|流量|积分|音符|奖励|周边|实物|礼品|券)', value) else ''
+
+
+def _creator_dsl_detail(value: Any) -> dict[str, Any]:
+    data = value if isinstance(value, dict) else {}
+    prizes = _unique_text(data.get('prizes') if isinstance(data.get('prizes'), list) else [], 30)
+    task_rules = _unique_text(data.get('task_rules') if isinstance(data.get('task_rules'), list) else [], 40, 500)
+    content_rules = _unique_text(data.get('content_rules') if isinstance(data.get('content_rules'), list) else [], 40, 800)
+    rules = _unique_text(task_rules + content_rules, 40, 800)
+    eligibility = _unique_text(data.get('eligibility') if isinstance(data.get('eligibility'), list) else [], 30, 800)
+    winning = _unique_text(data.get('winning_conditions') if isinstance(data.get('winning_conditions'), list) else [], 30, 800)
+    evidence = [row for row in data.get('evidence', []) if isinstance(row, dict)][:100] if isinstance(data.get('evidence'), list) else []
+    field_evidence: dict[str, Any] = {}
+    if prizes:
+        field_evidence['prizes'] = {
+            'source': 'xhs_ditto_dsl',
+            'paths': [str(row.get('path') or '')[:300] for row in evidence if row.get('field') == 'prizes'][:30],
+            'originals': prizes[:30],
+        }
+    if rules:
+        field_evidence['content_requirements'] = {
+            'source': 'xhs_ditto_dsl',
+            'paths': [str(row.get('path') or '')[:300] for row in evidence if row.get('field') == 'content_requirements'][:40],
+            'originals': rules[:40],
+        }
+    if eligibility:
+        field_evidence['eligibility'] = {
+            'source': 'xhs_ditto_dsl',
+            'paths': [str(row.get('path') or '')[:300] for row in evidence if row.get('field') == 'eligibility'][:30],
+            'originals': eligibility[:30],
+        }
+    if winning:
+        field_evidence['winning_conditions'] = {
+            'source': 'xhs_ditto_dsl',
+            'paths': [str(row.get('path') or '')[:300] for row in evidence if row.get('field') == 'winning_conditions'][:30],
+            'originals': winning[:30],
+        }
+    return {
+        'prizes': prizes,
+        'content_requirements': rules,
+        'eligibility': eligibility,
+        'winning_conditions': winning,
+        'field_evidence': field_evidence,
+        'dsl_component_types': _unique_text(data.get('component_types') if isinstance(data.get('component_types'), list) else [], 40, 120),
+        'has_visual_assets': bool(data.get('has_visual_assets')),
+    }
+
+
+def _creator_milestone_detail(values: list[Any]) -> dict[str, Any]:
+    prizes: list[str] = []
+    conditions: list[str] = []
+    reward_rules: list[str] = []
+    paths: list[str] = []
+    originals: list[str] = []
+    for payload_index, value in enumerate(values[:8]):
+        data = value.get('data') if isinstance(value, dict) and isinstance(value.get('data'), dict) else (
+            value if isinstance(value, dict) else {}
+        )
+        milestones = data.get('mile_stone_info') if isinstance(data.get('mile_stone_info'), list) else []
+        for index, row in enumerate(milestones[:50]):
+            if not isinstance(row, dict):
+                continue
+            reward = row.get('reward_info') if isinstance(row.get('reward_info'), dict) else {}
+            milestone = row.get('mile_stone') if isinstance(row.get('mile_stone'), dict) else {}
+            title = re.sub(r'\s+', ' ', str(reward.get('title') or '')).strip()[:240]
+            point = milestone.get('point_number')
+            if title and title not in prizes:
+                prizes.append(title)
+                paths.append(f'milestone[{payload_index}].mile_stone_info[{index}].reward_info.title')
+                originals.append(title)
+            try:
+                point_number = int(point)
+            except (TypeError, ValueError):
+                point_number = 0
+            if point_number > 0:
+                condition = f'活动进度达到 {point_number}（进度单位以活动页说明为准）'
+                if condition not in conditions:
+                    conditions.append(condition)
+                if title:
+                    rule = f'{condition}：对应奖励「{title}」'
+                    if rule not in reward_rules:
+                        reward_rules.append(rule)
+    field_evidence: dict[str, Any] = {}
+    if prizes:
+        field_evidence['prizes'] = {
+            'source': 'xhs_milestone_api', 'paths': paths[:30], 'originals': originals[:30],
+        }
+    if conditions:
+        field_evidence['winning_conditions'] = {
+            'source': 'xhs_milestone_api',
+            'originals': conditions[:30],
+            'note': '接口返回进度阈值；未推断进度单位，也未推断必然获奖。',
+        }
+    if reward_rules:
+        field_evidence['reward_rules'] = {
+            'source': 'xhs_milestone_api', 'originals': reward_rules[:30],
+        }
+    return {
+        'prizes': prizes[:30],
+        'winning_conditions': conditions[:30],
+        'reward_rules': reward_rules[:30],
+        'field_evidence': field_evidence,
+    }
+
+
+def _merge_field_evidence(*values: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key, row in value.items():
+            if isinstance(row, dict):
+                merged[str(key)[:80]] = row
+    return merged
+
+
+def _creator_detail_from_sources(task_payload: Any, dsl_value: Any, milestone_values: list[Any]) -> dict[str, Any]:
+    task = _creator_task_detail(task_payload if isinstance(task_payload, dict) else {})
+    dsl = _creator_dsl_detail(dsl_value)
+    milestone = _creator_milestone_detail(milestone_values)
+    content_requirements = _unique_text(
+        list(task.get('content_requirements') or []) + list(dsl.get('content_requirements') or []), 30, 800
+    )
+    eligibility = _unique_text(list(dsl.get('eligibility') or []), 20, 800)
+    prizes = _unique_text(list(milestone.get('prizes') or []) + list(dsl.get('prizes') or []), 30)
+    winning_conditions = _unique_text(
+        list(milestone.get('winning_conditions') or []) + list(dsl.get('winning_conditions') or []), 30, 800
+    )
+    reward_rules = _unique_text(
+        list(task.get('reward_rules') or []) + list(milestone.get('reward_rules') or []), 30, 500
+    )
+    parsed = bool(
+        eligibility or content_requirements or prizes or winning_conditions or reward_rules
+        or task.get('required_topics') or (task.get('submission_spec') or {}).get('submission_method')
+    )
+    return {
+        **task,
+        'eligibility': eligibility,
+        'content_requirements': content_requirements,
+        'prizes': prizes,
+        'winning_conditions': winning_conditions,
+        'reward_rules': reward_rules,
+        'field_evidence': _merge_field_evidence(
+            task.get('field_evidence'), dsl.get('field_evidence'), milestone.get('field_evidence')
+        ),
+        'dsl_component_types': dsl.get('dsl_component_types') or [],
+        'detail_source': '+'.join([
+            name for name, present in (
+                ('creator_task_api', bool(task_payload)),
+                ('xhs_ditto_dsl', bool((dsl.get('prizes') or dsl.get('content_requirements')))),
+                ('xhs_milestone_api', bool(milestone_values)),
+            ) if present
+        ]) or 'creator_event_page',
+        'xhs_detail_status': 'parsed' if parsed else ('needs_visual_review' if dsl.get('has_visual_assets') else 'no_structured_rules'),
+        'xhs_detail_version': CREATOR_DETAIL_CACHE_VERSION,
+        'xhs_detail_fetched_at': int(time.time()),
+        'xhs_detail_error': '',
+    }
+
+
+def _capture_creator_detail(page, url: str) -> dict[str, Any]:
+    task_payload: dict[str, Any] | None = None
+    milestone_payloads: list[dict[str, Any]] = []
+
+    def on_detail(response):
+        nonlocal task_payload
+        try:
+            parsed = urlsplit(response.url)
+            if parsed.hostname != 'edith.xiaohongshu.com' or int(response.status or 0) != 200:
+                return
+            if 'json' not in str(response.headers.get('content-type') or '').lower():
+                return
+            if parsed.path == '/api/sns/v1/activity_platform/config/task/preview_task_list':
+                value = response.json()
+                if isinstance(value, dict):
+                    task_payload = value
+            elif parsed.path == '/api/sns/v1/activity_platform/milestone/info':
+                value = response.json()
+                if isinstance(value, dict):
+                    milestone_payloads.append(value)
+        except Exception:
+            pass
+
+    page.on('response', on_detail)
+    try:
+        _goto(page, url, wait=3000)
+        page.wait_for_timeout(850)
+        dsl = page.evaluate(CREATOR_DSL_DETAIL_JS) or {}
+        return _creator_detail_from_sources(task_payload, dsl, milestone_payloads)
+    finally:
+        try:
+            page.remove_listener('response', on_detail)
+        except Exception:
+            pass
+
+
+def creator_event_detail(directory: Path, url: str, activity_id: str = '', *, force: bool = False) -> dict[str, Any]:
+    try:
+        parsed = urlsplit(str(url or '').strip())
+    except ValueError:
+        raise XhsBrowserError('invalid_event_url') from None
+    if parsed.scheme != 'https' or not parsed.hostname or not _host_ok(parsed.hostname):
+        raise XhsBrowserError('invalid_event_url')
+    cache_key = str(activity_id or parsed.path.rstrip('/').rsplit('/', 1)[-1] or '')[:160]
+    cache = _read_creator_detail_cache(directory)
+    now = int(time.time())
+    cached = cache.get(cache_key) if cache_key else None
+    if (not force and isinstance(cached, dict) and cached.get('url') == parsed.geturl()
+            and now - int(cached.get('at') or 0) < CREATOR_DETAIL_CACHE_TTL
+            and isinstance(cached.get('detail'), dict)):
+        return {'external_id': str(activity_id or '')[:160], 'url': parsed.geturl(),
+                'cached': True, **cached['detail']}
+
+    p, context, page = _launch(directory)
+    try:
+        detail = _capture_creator_detail(page, parsed.geturl())
+    except Exception as exc:
+        return {
+            'external_id': str(activity_id or '')[:160], 'url': parsed.geturl(), 'cached': False,
+            'xhs_detail_status': 'failed', 'xhs_detail_version': CREATOR_DETAIL_CACHE_VERSION,
+            'xhs_detail_fetched_at': int(time.time()),
+            'xhs_detail_error': (str(exc).strip() or type(exc).__name__)[:120],
+            'eligibility': [], 'content_requirements': [], 'prizes': [], 'winning_conditions': [],
+            'reward_rules': [], 'required_topics': [], 'submission_spec': {},
+            'qualification_state': 'unknown',
+            'qualification_basis': '详情读取失败，未对账号参赛资格作结论。',
+        }
+    finally:
+        _close(p, context)
+    if cache_key:
+        cache[cache_key] = {'at': now, 'url': parsed.geturl(), 'detail': detail}
+        if len(cache) > CREATOR_DETAIL_CACHE_MAX:
+            cache = dict(sorted(
+                cache.items(), key=lambda pair: int((pair[1] or {}).get('at') or 0), reverse=True
+            )[:CREATOR_DETAIL_CACHE_MAX])
+        _write_creator_detail_cache(directory, cache)
+    return {'external_id': str(activity_id or '')[:160], 'url': parsed.geturl(),
+            'cached': False, **detail}
+
+
 CARD_JS = r"""(limit) => {
   const seen = new Set(); const out = [];
   const anchors = Array.from(document.querySelectorAll("a[href*='/explore/'],a[href*='/discovery/item/'],a[href*='/item/']"));
@@ -154,7 +495,8 @@ def _creator_activity_rows(value: Any, *, limit: int = CREATOR_ACTIVITY_MAX) -> 
             'url': str(raw.get('activity_link') or '')[:2048],
             'starts_at': raw.get('start_time') or '', 'ends_at': raw.get('end_time') or '',
             'description': str(raw.get('activity_reward') or '')[:1200],
-            'reward_summary': str(raw.get('activity_reward') or '')[:600],
+            'promotion_summary': str(raw.get('activity_reward') or '')[:600],
+            'reward_summary': _rewardish_summary(str(raw.get('activity_reward') or '')),
             'page_id': str(raw.get('page_id') or '')[:100],
             'instance_id': str(raw.get('instance_id') or '')[:100],
             'publish_url': str(raw.get('pc_post_link') or '')[:2048],
@@ -223,23 +565,45 @@ def _creator_task_detail(value: Any, body: str = '') -> dict[str, Any]:
                 if text and re.search(r'(现金|奖金|奖池|瓜分|奖品|礼包|流量|积分|奖励)', text) and text not in prizes:
                     prizes.append(text)
     completed = sum(1 for row in account_tasks if row.get('finished') is True)
-    enabled = int(data.get('enabled') or 0) == 1 and int(data.get('status') or 0) == 1
-    qualification_state = 'eligible' if enabled and post_note else 'unknown'
+    field_evidence: dict[str, Any] = {}
+    if content_requirements:
+        field_evidence['content_requirements'] = {
+            'source': 'xhs_creator_task_api', 'originals': content_requirements[:30],
+        }
+    if reward_rules:
+        field_evidence['reward_rules'] = {
+            'source': 'xhs_creator_task_api', 'originals': reward_rules[:30],
+        }
+    if topics:
+        field_evidence['required_topics'] = {
+            'source': 'xhs_creator_task_api', 'originals': topics[:20],
+        }
+    if post_note:
+        field_evidence['submission_spec'] = {
+            'source': 'xhs_creator_task_api',
+            'originals': ['平台返回 post_note 投稿任务；未据此推断图文/视频格式。'],
+        }
     return {
         'eligibility': [],
         'content_requirements': content_requirements[:30], 'required_topics': topics[:20],
         'reward_rules': reward_rules[:30], 'prizes': prizes[:20], 'winning_conditions': [],
-        'submission_spec': {'formats': ['image_text', 'video'] if post_note else [],
+        'submission_spec': {'formats': [],
                             'content_directions': [f'围绕 #{topic} 创作' for topic in topics[:12]],
                             'style_requirements': [],
                             'submission_method': '通过活动页带指定话题发布笔记' if post_note else '',
                             'required_mentions': [], 'required_music': []},
-        'qualification_state': qualification_state,
-        'qualification_basis': '创作者后台已向当前账号返回可执行投稿任务。' if qualification_state == 'eligible' else '活动对当前账号可见，但平台未返回明确的账号参赛资格结论。',
+        'qualification_state': 'unknown',
+        'qualification_basis': (
+            '创作者后台向当前账号返回了可执行投稿任务；这只证明任务可见，不代表满足全部参赛或领奖条件。'
+            if post_note else
+            '活动对当前账号可见，但平台未返回明确的账号参赛资格结论。'
+        ),
+        'account_task_available': bool(tasks),
         'account_tasks': account_tasks[:50],
         'task_progress': {'total': len(account_tasks), 'completed': completed,
                           'pending': max(0, len(account_tasks) - completed),
                           'score_name': str(data.get('score_name') or '')[:80]},
+        'field_evidence': field_evidence,
         'detail_source': 'creator_task_api' if tasks else 'creator_event_page',
         'detail_start_time': data.get('start_time') or '', 'detail_end_time': data.get('end_time') or '',
     }
@@ -254,7 +618,10 @@ def _read_creator_detail_cache(directory: Path) -> dict[str, Any]:
         if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
             return {}
         value = json.loads(path.read_text(encoding='utf-8'))
-        return value if isinstance(value, dict) else {}
+        if not isinstance(value, dict) or int(value.get('version') or 0) != CREATOR_DETAIL_CACHE_VERSION:
+            return {}
+        items = value.get('items')
+        return items if isinstance(items, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
 
@@ -263,7 +630,7 @@ def _write_creator_detail_cache(directory: Path, value: dict[str, Any]) -> None:
     path = _creator_detail_cache_path(directory)
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix('.tmp')
-    temp.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
+    temp.write_text(json.dumps({'version': CREATOR_DETAIL_CACHE_VERSION, 'items': value}, ensure_ascii=False), encoding='utf-8')
     os.replace(temp, path)
 
 COMMENT_TARGET_COUNT_JS = r"""([id,nickname,content]) => {
@@ -657,32 +1024,20 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
                 continue
             if parsed.scheme != 'https' or not parsed.hostname or not _host_ok(parsed.hostname):
                 continue
-            task_payload: dict[str, Any] | None = None
-            def on_detail(response):
-                nonlocal task_payload
-                if 'preview_task_list' not in response.url:
-                    return
-                try:
-                    value = response.json()
-                    if isinstance(value, dict):
-                        task_payload = value
-                except Exception:
-                    pass
-            page.on('response', on_detail)
             try:
-                _goto(page, url, wait=3000)
-                if task_payload:
-                    detail = _creator_task_detail(task_payload)
-                    item.update(detail)
-                    detail_count += 1
-                    if cache_key and detail.get('detail_source') == 'creator_task_api':
-                        detail_cache[cache_key] = {'at': now, 'url': url, 'detail': detail}
-                        cache_changed = True
+                detail = _capture_creator_detail(page, url)
+                item.update(detail)
+                detail_count += 1
+                if cache_key:
+                    detail_cache[cache_key] = {'at': now, 'url': url, 'detail': detail}
+                    cache_changed = True
             except Exception:
-                pass
-            finally:
-                try: page.remove_listener('response', on_detail)
-                except Exception: pass
+                item.update({
+                    'xhs_detail_status': 'failed',
+                    'xhs_detail_version': CREATOR_DETAIL_CACHE_VERSION,
+                    'xhs_detail_fetched_at': int(time.time()),
+                    'xhs_detail_error': 'detail_read_failed',
+                })
             detail_fetched += 1
         if cache_changed:
             if len(detail_cache) > CREATOR_DETAIL_CACHE_MAX:
@@ -892,6 +1247,11 @@ def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
         event_limit=max(1,min(int(CREATOR_ACTIVITY_MAX if raw_event_limit is None else raw_event_limit),CREATOR_ACTIVITY_MAX))
         detail_limit=max(0,min(int(12 if raw_detail_limit is None else raw_detail_limit),20))
         return creator_events(directory,event_limit,detail_limit)
+    if action=='event_detail':
+        return creator_event_detail(
+            directory, str(params.get('url') or ''), str(params.get('activity_id') or ''),
+            force=bool(params.get('force')),
+        )
     if action=='note': return note_detail(directory,str(params.get('url') or ''))
     if action=='comments': return comments(directory,str(params.get('url') or ''),limit)
     if action=='reply': return reply(directory,str(params.get('url') or ''),list(params.get('items') or []))

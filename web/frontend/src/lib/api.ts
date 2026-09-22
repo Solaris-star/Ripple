@@ -359,6 +359,11 @@ export interface Campaign {
   x_enrichment_error?: string;
   x_enrichment_attempt_count?: number;
   x_enrichment_next_retry_at?: number;
+  field_evidence?: Record<string, { source?: string; paths?: string[]; originals?: string[]; note?: string }>;
+  xhs_detail_status?: 'not_fetched' | 'parsed' | 'no_structured_rules' | 'needs_visual_review' | 'failed' | string;
+  xhs_detail_version?: number;
+  xhs_detail_fetched_at?: number;
+  xhs_detail_error?: string;
 }
 export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<Campaign,
   'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' | 'summary' |
@@ -470,6 +475,9 @@ export function fetchCampaign(id: string): Promise<Campaign> {
 }
 export function verifyCampaign(id: string): Promise<Campaign> {
   return request<Campaign>(`/api/campaigns/${encodeURIComponent(id)}/verify`, { method: 'POST' }).then(normalizeCampaign);
+}
+export function refreshXhsCampaignDetail(id: string): Promise<Campaign> {
+  return request<Campaign>(`/api/campaigns/${encodeURIComponent(id)}/xhs-detail`, { method: 'POST' }).then(normalizeCampaign);
 }
 export function enrichCampaign(id: string, force = true): Promise<{ called: boolean; reason: string; changed_fields: string[]; item: Campaign }> {
   return request<{ called: boolean; reason: string; changed_fields: string[]; item: Campaign }>(`/api/campaigns/${encodeURIComponent(id)}/enrich`, {

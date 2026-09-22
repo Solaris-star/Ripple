@@ -3801,6 +3801,10 @@ def _normalize_campaign(item: dict) -> dict:
     item["x_enrichment_error"] = str(item.get("x_enrichment_error") or "")[:600]
     item["x_enrichment_attempt_count"] = max(0, int(item.get("x_enrichment_attempt_count") or 0))
     item["x_enrichment_next_retry_at"] = int(item.get("x_enrichment_next_retry_at") or 0)
+    item["xhs_detail_status"] = str(item.get("xhs_detail_status") or "not_fetched")[:40]
+    item["xhs_detail_version"] = max(0, int(item.get("xhs_detail_version") or 0))
+    item["xhs_detail_fetched_at"] = max(0, int(item.get("xhs_detail_fetched_at") or 0))
+    item["xhs_detail_error"] = str(item.get("xhs_detail_error") or "")[:300]
     x_status = str(item.get("x_enrichment_status") or "")
     if x_status in {"running", "queued"}:
         x_status = "incomplete"
@@ -4255,11 +4259,17 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
     evidence_kind = str(evidence.get("kind") or "")
     candidate_source_status = str(candidate.get("source_status") or "verified")[:40]
     authoritative_rules = evidence_kind == "platform_public_detail"
+    xhs_official_candidate = (
+        str(candidate.get("platform") or "") == "xiaohongshu"
+        and provider_id == "xiaohongshu_creator_events"
+    )
     rule_verified = candidate_source_status == "verified" and (
-        evidence_kind not in {"", "platform_public_list"} or any(
-            candidate.get(field) for field in (
-                "eligibility", "content_requirements", "prizes", "winning_conditions",
-                "reward_rules", "required_topics", "submission_spec",
+        authoritative_rules if xhs_official_candidate else (
+            evidence_kind not in {"", "platform_public_list"} or any(
+                candidate.get(field) for field in (
+                    "eligibility", "content_requirements", "prizes", "winning_conditions",
+                    "reward_rules", "required_topics", "submission_spec",
+                )
             )
         )
     )
@@ -4268,6 +4278,8 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
     if candidate_qualification not in CAMPAIGN_QUALIFICATION_STATES:
         candidate_qualification = "unknown"
     candidate_qualification_basis = str(candidate.get("qualification_basis") or "unknown")[:600]
+    locked: set[str] = set()
+    candidate_detail_failed = xhs_official_candidate and str(candidate.get("xhs_detail_status") or "") == "failed"
     if existing is None:
         item = {
             "id": uuid.uuid4().hex[:12],
@@ -4295,7 +4307,7 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "required_topics": [str(x)[:120] for x in candidate.get("required_topics", []) if str(x).strip()][:20],
             "submission_spec": normalize_submission_spec(candidate.get("submission_spec")),
             "rule_evidence_fingerprint": str(candidate.get("rule_evidence_fingerprint") or "")[:80],
-            "field_evidence": {},
+            "field_evidence": deepcopy(candidate.get("field_evidence")) if isinstance(candidate.get("field_evidence"), dict) else {},
             "last_agent_fingerprint": "", "last_agent_enriched_at": 0,
             "agent_model": "", "agent_run_id": "", "agent_error": "",
             "agent_attempt_fingerprint": "", "agent_attempt_count": 0, "agent_next_retry_at": 0,
@@ -4304,6 +4316,10 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "source_url": str(candidate.get("source_url") or "")[:2000],
             "source_type": str(candidate.get("source_type") or "automatic")[:80],
             "source_status": candidate_source_status,
+            "xhs_detail_status": str(candidate.get("xhs_detail_status") or "not_fetched")[:40],
+            "xhs_detail_version": max(0, int(candidate.get("xhs_detail_version") or 0)),
+            "xhs_detail_fetched_at": max(0, int(candidate.get("xhs_detail_fetched_at") or 0)),
+            "xhs_detail_error": str(candidate.get("xhs_detail_error") or "")[:300],
             "discovered_at": now,
             "last_seen_at": now,
             "last_verified_at": now if rule_verified else 0,
@@ -4331,10 +4347,15 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
                        "reward_summary", "summary", "starts_at", "signup_deadline", "submit_deadline", "stats_deadline",
                        "ai_policy", "source_url", "note")
         proposed = {}
+        candidate_field_evidence = candidate.get("field_evidence") if isinstance(candidate.get("field_evidence"), dict) else {}
         for field in rule_fields:
             incoming = str(candidate.get(field) or "").strip()
-            if incoming and field not in locked and (not manual or not str(item.get(field) or "").strip()):
+            if field in locked:
+                continue
+            if incoming and (not manual or not str(item.get(field) or "").strip()):
                 proposed[field] = incoming[:6000 if field == "note" else 3000 if field == "summary" else 2000 if field == "source_url" else 600]
+            elif authoritative_rules and not manual and field == "reward_summary":
+                proposed[field] = ""
         list_fields = ("eligibility", "content_requirements", "prizes", "winning_conditions", "reward_rules", "required_topics")
         for field in list_fields:
             incoming = [str(x)[:240] for x in candidate.get(field, []) if str(x).strip()][:30]
@@ -4363,7 +4384,23 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             item["rule_history"] = history[-20:]
             item["rule_version"] = int(item.get("rule_version") or 0) + 1
         item.update(proposed)
-        if account_id and candidate_qualification in CAMPAIGN_QUALIFICATION_STATES:
+        if candidate_field_evidence:
+            for field, row in candidate_field_evidence.items():
+                if field in locked or not isinstance(row, dict):
+                    continue
+                if field in proposed or field in {"qualification_state", "qualification_basis"}:
+                    field_evidence[str(field)[:80]] = deepcopy(row)
+            item["field_evidence"] = field_evidence
+        if xhs_official_candidate:
+            incoming_detail_version = max(0, int(candidate.get("xhs_detail_version") or 0))
+            if incoming_detail_version > 0:
+                item["xhs_detail_status"] = str(candidate.get("xhs_detail_status") or "not_fetched")[:40]
+                item["xhs_detail_version"] = max(int(item.get("xhs_detail_version") or 0), incoming_detail_version)
+                item["xhs_detail_fetched_at"] = max(int(item.get("xhs_detail_fetched_at") or 0), int(candidate.get("xhs_detail_fetched_at") or 0))
+                item["xhs_detail_error"] = str(candidate.get("xhs_detail_error") or "")[:300]
+            elif not item.get("xhs_detail_status"):
+                item["xhs_detail_status"] = "not_fetched"
+        if account_id and candidate_qualification in CAMPAIGN_QUALIFICATION_STATES and "qualification_state" not in locked and not candidate_detail_failed:
             item["qualification_state"] = candidate_qualification
             item["qualification_basis"] = candidate_qualification_basis
         item["last_seen_at"] = now
@@ -4404,8 +4441,8 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
         states = item.setdefault("account_states", {})
         state = states.setdefault(account_id, {})
         state.update({"visible": True,
-                      "qualification_state": candidate_qualification if candidate_qualification in CAMPAIGN_QUALIFICATION_STATES else state.get("qualification_state", "unknown"),
-                      "qualification_basis": candidate_qualification_basis,
+                      "qualification_state": candidate_qualification if candidate_qualification in CAMPAIGN_QUALIFICATION_STATES and "qualification_state" not in locked and not candidate_detail_failed else state.get("qualification_state", "unknown"),
+                      "qualification_basis": candidate_qualification_basis if "qualification_state" not in locked and not candidate_detail_failed else state.get("qualification_basis", "unknown"),
                       "last_seen_at": now, "provider_id": provider_id})
     return item
 
@@ -4875,6 +4912,21 @@ async def api_campaign_verify(cid: str):
         raise HTTPException(409, "当前仅 B站支持单活动规则重新核验；其他平台请使用“刷新活动”。")
     try:
         candidate = await asyncio.to_thread(_CAMPAIGN_SOURCES.verify_bilibili_campaign, item)
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    items = _read_campaigns()
+    updated = _merge_campaign_candidate(items, candidate)
+    _write_campaigns(items)
+    return {**updated, "status": _campaign_effective_status(updated)}
+
+
+@app.post("/api/campaigns/{cid}/xhs-detail")
+async def api_campaign_xhs_detail(cid: str):
+    item = _campaign_by_id(cid)
+    if item.get("platform") != "xiaohongshu":
+        raise HTTPException(409, "当前接口仅用于小红书官方活动详情读取。")
+    try:
+        candidate = await asyncio.to_thread(_CAMPAIGN_SOURCES.verify_xiaohongshu_campaign, item)
     except WorkflowError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
     items = _read_campaigns()

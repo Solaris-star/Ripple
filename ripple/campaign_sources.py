@@ -1244,6 +1244,108 @@ class CampaignSourceService:
             return self._x_api(str(account["id"]))
         raise WorkflowError("X 活动发现尚未配置来源。", 409)
 
+    def _xiaohongshu_candidate(self, account: dict[str, Any], item: dict[str, Any], source_type: str) -> dict[str, Any]:
+        title = str(item.get("title") or "").strip()
+        url = _safe_url(str(item.get("url") or ""), ("xiaohongshu.com", "creator.xiaohongshu.com"))
+        topic_names = [str(x.get("name") or "")[:120] for x in item.get("topics", []) if isinstance(x, dict) and str(x.get("name") or "").strip()]
+        topic_ids = [str(x.get("id") or "")[:100] for x in item.get("topics", []) if isinstance(x, dict) and str(x.get("id") or "").strip()]
+        required_topics = [str(x)[:120] for x in item.get("required_topics", []) if str(x).strip()]
+        for topic in topic_names:
+            if topic and topic not in required_topics:
+                required_topics.append(topic)
+
+        prizes = [str(x)[:240] for x in item.get("prizes", []) if str(x).strip()][:30]
+        reward_rules = [str(x)[:500] for x in item.get("reward_rules", []) if str(x).strip()][:30]
+        promotion_summary = str(item.get("promotion_summary") or item.get("description") or "")[:1200]
+        reward_summary = str(item.get("reward_summary") or "")[:600]
+        if prizes:
+            reward_summary = "、".join(prizes[:4])[:600]
+
+        content_requirements = [str(x)[:500] for x in item.get("content_requirements", []) if str(x).strip()][:30]
+        submission_spec = deepcopy(item.get("submission_spec")) if isinstance(item.get("submission_spec"), dict) else {}
+        publish_url = _safe_url(str(item.get("publish_url") or ""), ("creator.xiaohongshu.com", "xiaohongshu.com"))
+        if publish_url and required_topics:
+            if not content_requirements:
+                content_requirements = [f"发布时带 #{topic} 话题" for topic in required_topics[:12]]
+            if not str(submission_spec.get("submission_method") or "").strip():
+                submission_spec["submission_method"] = "通过活动中心指定投稿入口发布并带指定话题"
+            if not isinstance(submission_spec.get("content_directions"), list) or not submission_spec.get("content_directions"):
+                submission_spec["content_directions"] = [f"围绕 #{topic} 创作" for topic in required_topics[:12]]
+            submission_spec.setdefault("formats", [])
+            submission_spec.setdefault("style_requirements", [])
+            submission_spec.setdefault("required_mentions", [])
+            submission_spec.setdefault("required_music", [])
+
+        qualification = str(item.get("qualification_state") or "unknown")
+        if qualification not in {"eligible", "ineligible", "unknown"}:
+            qualification = "unknown"
+        detail_status = str(item.get("xhs_detail_status") or "")
+        detail_version = max(0, int(item.get("xhs_detail_version") or 0))
+        authoritative_detail = detail_version >= 3 and detail_status in {"parsed", "no_structured_rules", "needs_visual_review"}
+        field_evidence = deepcopy(item.get("field_evidence")) if isinstance(item.get("field_evidence"), dict) else {}
+        if publish_url and submission_spec:
+            field_evidence.setdefault("submission_spec", {
+                "source": "xiaohongshu_activity_center_list",
+                "originals": [publish_url, *required_topics[:12]],
+            })
+            if content_requirements:
+                field_evidence.setdefault("content_requirements", {
+                    "source": "xiaohongshu_activity_center_list",
+                    "originals": content_requirements[:30],
+                })
+            if required_topics:
+                field_evidence.setdefault("required_topics", {
+                    "source": "xiaohongshu_activity_center_list",
+                    "originals": required_topics[:20],
+                })
+        if promotion_summary:
+            field_evidence.setdefault("summary", {
+                "source": "xiaohongshu_activity_center_list",
+                "originals": [promotion_summary],
+            })
+
+        return {
+            "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+            "external_id": ("xhs:" + str(item.get("external_id"))) if item.get("external_id") else "",
+            "title": title[:240], "organizer": "小红书创作服务平台", "organizer_type": "platform",
+            "activity_type": "创作活动", "reward_type": "", "reward_summary": reward_summary,
+            "summary": promotion_summary,
+            "starts_at": _date_from_unix(item.get("detail_start_time") or item.get("starts_at")),
+            "submit_deadline": _date_from_unix(item.get("detail_end_time") or item.get("ends_at")),
+            "eligibility": [str(x)[:240] for x in item.get("eligibility", []) if str(x).strip()][:20],
+            "content_requirements": content_requirements,
+            "prizes": prizes,
+            "winning_conditions": [str(x)[:500] for x in item.get("winning_conditions", []) if str(x).strip()][:30],
+            "reward_rules": reward_rules,
+            "required_topics": required_topics[:20],
+            "submission_spec": submission_spec,
+            "qualification_state": qualification,
+            "qualification_basis": str(item.get("qualification_basis") or "unknown")[:600],
+            "source_url": url or "https://creator.xiaohongshu.com/new/events",
+            "source_type": str(source_type or "creator_events"),
+            "source_status": "verified", "note": promotion_summary[:3000],
+            "account_id": str(account["id"]),
+            "field_evidence": field_evidence,
+            "xhs_detail_status": detail_status or "not_fetched",
+            "xhs_detail_version": detail_version,
+            "xhs_detail_fetched_at": max(0, int(item.get("xhs_detail_fetched_at") or 0)),
+            "xhs_detail_error": str(item.get("xhs_detail_error") or "")[:300],
+            "evidence": {
+                "kind": "platform_public_detail" if authoritative_detail else "creator_account_activity",
+                "account_id": str(account["id"]),
+                "activity_id": str(item.get("external_id") or "")[:160],
+                "page_id": str(item.get("page_id") or "")[:100],
+                "instance_id": str(item.get("instance_id") or "")[:100],
+                "topic_ids": topic_ids[:20],
+                "publish_url": publish_url,
+                "detail_source": str(item.get("detail_source") or "")[:160],
+                "detail_status": detail_status or "not_fetched",
+                "detail_version": detail_version,
+                "task_progress": item.get("task_progress") if isinstance(item.get("task_progress"), dict) else {},
+                "url": url or "https://creator.xiaohongshu.com/new/events",
+            },
+        }
+
     def _xiaohongshu(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         account, status = self._effective_account("xiaohongshu", str(state["xiaohongshu"].get("account_id") or ""))
         if status != "ready" or not account:
@@ -1254,50 +1356,37 @@ class CampaignSourceService:
             raise WorkflowError("小红书创作者活动列表接口本次未返回数据，请稍后重试。", 502)
         rows = []
         for item in payload.get("items", []):
-            title = str(item.get("title") or "").strip()
-            if not title:
+            if not isinstance(item, dict) or not str(item.get("title") or "").strip():
                 continue
-            url = _safe_url(str(item.get("url") or ""), ("xiaohongshu.com", "creator.xiaohongshu.com"))
-            topic_names = [str(x.get("name") or "")[:120] for x in item.get("topics", []) if isinstance(x, dict) and str(x.get("name") or "").strip()]
-            topic_ids = [str(x.get("id") or "")[:100] for x in item.get("topics", []) if isinstance(x, dict) and str(x.get("id") or "").strip()]
-            required_topics = [str(x)[:120] for x in item.get("required_topics", []) if str(x).strip()]
-            for topic in topic_names:
-                if topic and topic not in required_topics:
-                    required_topics.append(topic)
-            reward_summary = str(item.get("reward_summary") or item.get("description") or "")[:600]
-            qualification = str(item.get("qualification_state") or "unknown")
-            if qualification not in {"eligible", "ineligible", "unknown"}:
-                qualification = "unknown"
-            rows.append({
-                "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
-                "external_id": ("xhs:" + str(item.get("external_id"))) if item.get("external_id") else "",
-                "title": title[:240], "organizer": "小红书创作服务平台", "organizer_type": "platform",
-                "activity_type": "创作活动", "reward_type": "", "reward_summary": reward_summary,
-                "summary": str(item.get("description") or "")[:1200],
-                "starts_at": _date_from_unix(item.get("detail_start_time") or item.get("starts_at")),
-                "submit_deadline": _date_from_unix(item.get("detail_end_time") or item.get("ends_at")),
-                "eligibility": [str(x)[:240] for x in item.get("eligibility", []) if str(x).strip()][:20],
-                "content_requirements": [str(x)[:240] for x in item.get("content_requirements", []) if str(x).strip()][:30],
-                "prizes": [str(x)[:240] for x in item.get("prizes", []) if str(x).strip()][:30],
-                "winning_conditions": [str(x)[:240] for x in item.get("winning_conditions", []) if str(x).strip()][:30],
-                "reward_rules": [str(x)[:240] for x in item.get("reward_rules", []) if str(x).strip()][:30],
-                "required_topics": required_topics[:20],
-                "submission_spec": item.get("submission_spec") if isinstance(item.get("submission_spec"), dict) else {},
-                "qualification_state": qualification,
-                "qualification_basis": str(item.get("qualification_basis") or "unknown")[:600],
-                "source_url": url or "https://creator.xiaohongshu.com/new/events",
-                "source_type": str(payload.get("source") or "creator_events"),
-                "source_status": "verified", "note": str(item.get("description") or "")[:3000],
-                "account_id": str(account["id"]),
-                "evidence": {"kind": "creator_account_activity", "account_id": str(account["id"]),
-                             "activity_id": str(item.get("external_id") or "")[:160],
-                             "page_id": str(item.get("page_id") or "")[:100],
-                             "instance_id": str(item.get("instance_id") or "")[:100],
-                             "topic_ids": topic_ids[:20],
-                             "task_progress": item.get("task_progress") if isinstance(item.get("task_progress"), dict) else {},
-                             "url": url or "https://creator.xiaohongshu.com/new/events"},
-            })
+            rows.append(self._xiaohongshu_candidate(account, item, str(payload.get("source") or "creator_events")))
         return rows
+
+    def verify_xiaohongshu_campaign(self, campaign: dict[str, Any]) -> dict[str, Any]:
+        account_id = str(campaign.get("account_id") or "")
+        account, status = self._effective_account("xiaohongshu", account_id)
+        if status != "ready" or not account:
+            raise WorkflowError("小红书活动规则读取需要已连接的创作者账号。", 409)
+        ids = campaign.get("external_ids") if isinstance(campaign.get("external_ids"), dict) else {}
+        external_id = str(ids.get("xiaohongshu_creator_events") or "")
+        activity_id = external_id[4:] if external_id.startswith("xhs:") else external_id
+        url = _safe_url(str(campaign.get("source_url") or ""), ("xiaohongshu.com", "creator.xiaohongshu.com"))
+        if not url or url == "https://creator.xiaohongshu.com/new/events":
+            raise WorkflowError("该活动缺少可读取的官方详情链接。", 409)
+        detail = self.workspace.xhs_ops.event_detail(
+            str(account["id"]), url=url, activity_id=activity_id, force=True,
+        )
+        base = {
+            "external_id": activity_id,
+            "title": str(campaign.get("title") or "")[:240],
+            "url": url,
+            "starts_at": str(campaign.get("starts_at") or "")[:40],
+            "ends_at": str(campaign.get("submit_deadline") or "")[:40],
+            "description": str(campaign.get("summary") or campaign.get("note") or "")[:1200],
+            "promotion_summary": str(campaign.get("summary") or campaign.get("note") or "")[:600],
+            "topics": [{"id": "", "name": str(topic)[:120], "link": ""} for topic in campaign.get("required_topics", []) if str(topic).strip()],
+            **detail,
+        }
+        return self._xiaohongshu_candidate(account, base, "creator_event_detail")
 
     def _douyin_portal(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         account, status = self._effective_account("douyin", str(state["douyin"].get("account_id") or ""))

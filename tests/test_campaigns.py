@@ -204,6 +204,172 @@ def test_account_specific_campaign_qualification_is_projected_to_card_and_accoun
     assert "可执行活动任务" in row["account_states"]["xhs-account-1"]["qualification_basis"]
 
 
+def test_xhs_authoritative_detail_replaces_old_program_inference_and_promo_reward(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    row = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:44728", "title": "去阿秋店里坐坐",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+        "source_type": "creator_activity_center_api", "source_status": "verified",
+        "account_id": "xhs-account-1",
+        "reward_summary": "秋天开了店喊你来坐坐",
+        "qualification_state": "eligible", "qualification_basis": "旧解析器推断",
+        "submission_spec": {"formats": ["image_text", "video"], "submission_method": "通过活动页发布"},
+        "evidence": {"kind": "creator_account_activity", "account_id": "xhs-account-1"},
+    })
+    assert row["qualification_state"] == "eligible"
+    updated = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:44728", "title": "去阿秋店里坐坐",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+        "source_type": "creator_event_detail", "source_status": "verified",
+        "account_id": "xhs-account-1",
+        "reward_summary": "2000流量券、定制便携餐具包、定制阿秋薯公仔",
+        "prizes": ["2000流量券", "定制便携餐具包", "定制阿秋薯公仔"],
+        "winning_conditions": ["活动进度达到 10（进度单位以活动页说明为准）"],
+        "qualification_state": "unknown",
+        "qualification_basis": "任务可见，不代表满足全部参赛或领奖条件。",
+        "submission_spec": {"formats": [], "submission_method": "通过活动页带指定话题发布笔记"},
+        "field_evidence": {"prizes": {"source": "xhs_milestone_api", "originals": ["2000流量券"]}},
+        "xhs_detail_status": "parsed", "xhs_detail_version": 3, "xhs_detail_fetched_at": 20,
+        "evidence": {"kind": "platform_public_detail", "account_id": "xhs-account-1", "detail_version": 3},
+    })
+    assert updated["qualification_state"] == "unknown"
+    assert updated["submission_spec"]["formats"] == []
+    assert updated["reward_summary"].startswith("2000流量券")
+    assert updated["prizes"] == ["2000流量券", "定制便携餐具包", "定制阿秋薯公仔"]
+    assert updated["winning_conditions"] == ["活动进度达到 10（进度单位以活动页说明为准）"]
+    assert updated["field_evidence"]["prizes"]["source"] == "xhs_milestone_api"
+    assert updated["xhs_detail_status"] == "parsed"
+    assert updated["last_verified_at"] > 0
+
+
+def test_xhs_list_refresh_does_not_downgrade_existing_detail_status(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    detailed = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:44728", "title": "去阿秋店里坐坐",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+        "source_type": "creator_event_detail", "source_status": "verified",
+        "account_id": "xhs-account-1",
+        "prizes": ["2000流量券"], "reward_summary": "2000流量券",
+        "qualification_state": "unknown",
+        "xhs_detail_status": "parsed", "xhs_detail_version": 3, "xhs_detail_fetched_at": 20,
+        "evidence": {"kind": "platform_public_detail", "account_id": "xhs-account-1", "detail_version": 3},
+    })
+    assert detailed["xhs_detail_status"] == "parsed"
+    refreshed = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:44728", "title": "去阿秋店里坐坐",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+        "source_type": "creator_activity_center_api", "source_status": "verified",
+        "account_id": "xhs-account-1",
+        "summary": "秋天开了店喊你来坐坐",
+        "qualification_state": "unknown",
+        "xhs_detail_status": "not_fetched", "xhs_detail_version": 0,
+        "evidence": {"kind": "creator_account_activity", "account_id": "xhs-account-1"},
+    })
+    assert refreshed["xhs_detail_status"] == "parsed"
+    assert refreshed["xhs_detail_version"] == 3
+    assert refreshed["xhs_detail_fetched_at"] == 20
+    assert refreshed["prizes"] == ["2000流量券"]
+
+
+def test_xhs_visual_review_detail_clears_old_program_inference_without_claiming_rules(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:43010", "title": "Pick你的每周时刻",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page-pick",
+        "source_type": "creator_activity_center_api", "source_status": "verified",
+        "account_id": "xhs-account-1",
+        "qualification_state": "eligible", "qualification_basis": "旧解析器推断",
+        "submission_spec": {"formats": ["image_text", "video"], "submission_method": "旧推断"},
+        "evidence": {"kind": "creator_account_activity", "account_id": "xhs-account-1"},
+    })
+    updated = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:43010", "title": "Pick你的每周时刻",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page-pick",
+        "source_type": "creator_event_detail", "source_status": "verified",
+        "account_id": "xhs-account-1",
+        "qualification_state": "unknown",
+        "qualification_basis": "详情页已读取，但未返回明确资格结论。",
+        "submission_spec": {"formats": []},
+        "eligibility": [], "content_requirements": [], "prizes": [], "winning_conditions": [], "reward_rules": [],
+        "xhs_detail_status": "needs_visual_review", "xhs_detail_version": 3,
+        "evidence": {"kind": "platform_public_detail", "account_id": "xhs-account-1", "detail_version": 3},
+    })
+    assert updated["xhs_detail_status"] == "needs_visual_review"
+    assert updated["qualification_state"] == "unknown"
+    assert updated["submission_spec"]["formats"] == []
+    assert updated["eligibility"] == []
+    assert updated["winning_conditions"] == []
+
+
+def test_xhs_detail_refresh_preserves_user_confirmed_qualification_and_submission_spec(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    row = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:1", "title": "人工确认活动",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+        "source_type": "creator_activity_center_api", "source_status": "verified",
+        "account_id": "xhs-account-1", "qualification_state": "unknown",
+        "evidence": {"kind": "creator_account_activity", "account_id": "xhs-account-1"},
+    })
+    row["qualification_state"] = "eligible"
+    row["qualification_basis"] = "user_confirmed"
+    row["submission_spec"] = upstream.normalize_submission_spec({"formats": ["video"], "submission_method": "人工确认投稿方式"})
+    row["user_confirmed_fields"] = ["qualification_state", "submission_spec"]
+    updated = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:1", "title": "人工确认活动",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+        "source_type": "creator_event_detail", "source_status": "verified",
+        "account_id": "xhs-account-1", "qualification_state": "unknown",
+        "qualification_basis": "平台未返回完整资格结论。",
+        "submission_spec": {"formats": []},
+        "xhs_detail_status": "no_structured_rules", "xhs_detail_version": 3,
+        "evidence": {"kind": "platform_public_detail", "account_id": "xhs-account-1", "detail_version": 3},
+    })
+    assert updated["qualification_state"] == "eligible"
+    assert updated["qualification_basis"] == "user_confirmed"
+    assert updated["submission_spec"]["formats"] == ["video"]
+    assert updated["submission_spec"]["submission_method"] == "人工确认投稿方式"
+
+
+def test_xhs_detail_api_merges_single_campaign_refresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    item = {
+        "id": "xhs-detail-1", "title": "去阿秋店里坐坐", "platform": "xiaohongshu",
+        "platform_label": "小红书", "source_type": "creator_activity_center_api", "source_status": "verified",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1", "account_id": "a1",
+        "qualification_state": "unknown", "created_at": 1, "updated_at": 1,
+        "external_ids": {"xiaohongshu_creator_events": "xhs:44728"},
+    }
+    upstream._write_campaigns([item])
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "verify_xiaohongshu_campaign", lambda current: {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+        "external_id": "xhs:44728", "title": current["title"],
+        "source_url": current["source_url"], "source_type": "creator_event_detail",
+        "source_status": "verified", "account_id": "a1",
+        "prizes": ["2000流量券"], "reward_summary": "2000流量券",
+        "winning_conditions": ["活动进度达到 10（进度单位以活动页说明为准）"],
+        "qualification_state": "unknown", "submission_spec": {"formats": []},
+        "xhs_detail_status": "parsed", "xhs_detail_version": 3,
+        "evidence": {"kind": "platform_public_detail", "account_id": "a1"},
+    })
+    updated = asyncio.run(upstream.api_campaign_xhs_detail("xhs-detail-1"))
+    assert updated["prizes"] == ["2000流量券"]
+    assert updated["xhs_detail_status"] == "parsed"
+    assert upstream._read_campaigns()[0]["winning_conditions"]
+
+
+
 def test_xhs_official_activity_id_prevents_same_title_campaigns_from_merging(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     items = []

@@ -3,7 +3,7 @@ import {
   cancelCampaignEnrichment, configureCampaignSource, createCampaign, createIdea, createSchedule, enrichCampaign,
   fetchCampaignEnrichmentPreview, fetchCampaignEnrichmentStatus, fetchCampaignPage, fetchCampaignSources,
   fetchXCampaignEnrichmentStatus,
-  fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, runCampaignEnrichment,
+  fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, refreshXhsCampaignDetail, runCampaignEnrichment,
   saveCampaign, updateCampaign, verifyCampaign,
 } from '../lib/api';
 import type {
@@ -134,6 +134,11 @@ function sourceLabel(campaign: Campaign): string {
   return SOURCE_STATUS[campaign.source_status] || campaign.source_status || '来源未知';
 }
 
+function sourceVerificationLabel(campaign: Campaign): string {
+  const label = sourceLabel(campaign);
+  return campaign.platform === 'xiaohongshu' && campaign.source_status === 'verified' ? '列表已同步' : label;
+}
+
 function sourceName(campaign: Campaign): string {
   if (campaign.source_type === 'user_import') return '用户导入';
   if (campaign.platform === 'bilibili' && campaign.source_type === 'platform_public') return 'B站官方活动页';
@@ -151,6 +156,15 @@ function qualificationBadge(campaign: Campaign): { label: string; cls: string } 
   if (campaign.qualification_state === 'ineligible') return { label: '暂不符合', cls: 'bad' };
   if (campaign.eligibility?.length) return { label: '资格待核验', cls: 'warn' };
   return null;
+}
+
+function xhsDetailStatusText(campaign: Campaign): string {
+  if (campaign.platform !== 'xiaohongshu') return '';
+  if (campaign.xhs_detail_status === 'parsed') return '详情规则已读取';
+  if (campaign.xhs_detail_status === 'no_structured_rules') return '详情已读取 · 未发现结构化规则';
+  if (campaign.xhs_detail_status === 'needs_visual_review') return '详情已读取 · 图片物料待识别';
+  if (campaign.xhs_detail_status === 'failed') return '详情读取失败';
+  return '详情待读取';
 }
 
 function concise(values: string[] | undefined, fallback: string, limit = 2): string {
@@ -252,6 +266,7 @@ export default function CampaignsPage({
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [refreshing, setRefreshing] = useState(false);
   const [verifying, setVerifying] = useState(false);
+  const [xhsDetailRefreshing, setXhsDetailRefreshing] = useState('');
   const [enrichingId, setEnrichingId] = useState('');
   const [enrichmentPreview, setEnrichmentPreview] = useState<CampaignEnrichmentPreview | null>(null);
   const [enrichmentStatus, setEnrichmentStatus] = useState<CampaignEnrichmentStatus | null>(null);
@@ -524,6 +539,23 @@ export default function CampaignsPage({
       setError(e instanceof Error ? e.message : '活动规则核验失败');
     } finally {
       setVerifying(false);
+    }
+  };
+
+  const refreshXhsDetail = async (campaign: Campaign) => {
+    if (campaign.platform !== 'xiaohongshu' || xhsDetailRefreshing) return;
+    setXhsDetailRefreshing(campaign.id); setError('');
+    try {
+      const updated = await refreshXhsCampaignDetail(campaign.id);
+      setSelected((current) => current?.id === updated.id ? updated : current);
+      setCampaigns((rows) => rows.map((row) => row.id === updated.id ? updated : row));
+      if (updated.xhs_detail_status === 'parsed') showToast('已重新读取小红书规则详情');
+      else if (updated.xhs_detail_status === 'no_structured_rules') showToast('详情已读取，当前页面未提供可结构化的完整规则');
+      else showToast('详情读取完成，请查看规则状态');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '小红书规则详情读取失败');
+    } finally {
+      setXhsDetailRefreshing('');
     }
   };
 
@@ -959,10 +991,14 @@ export default function CampaignsPage({
           <div className="campaign-grid">
             {visible.map((campaign) => {
               const qualification = qualificationBadge(campaign);
-              const sourceText = sourceName(campaign) + ' · ' + sourceLabel(campaign);
+              const sourceText = sourceName(campaign) + ' · ' + sourceVerificationLabel(campaign);
               const specText = submissionSummary(campaign);
               const missing = campaign.missing_fields || [];
               const incomplete = missing.length > 0;
+              const xhsRuleStatus = campaign.platform === 'xiaohongshu' ? xhsDetailStatusText(campaign) : '';
+              const rewardText = campaign.prizes?.length || campaign.reward_summary
+                ? concise(campaign.prizes, campaign.reward_summary || '')
+                : campaign.reward_rules?.length ? concise(campaign.reward_rules, '') : '';
               const canAgentEnrich = campaign.platform === 'bilibili' && incomplete;
               return (
                 <article className="card campaign-card" key={campaign.id}>
@@ -986,9 +1022,9 @@ export default function CampaignsPage({
                     <div><small>来源</small><strong>{sourceText}</strong></div>
                     <div><small>参赛作品</small><span className={!specText ? 'campaign-fact-empty' : ''}>{specText || '—'}</span></div>
                     <div><small>参与条件</small><span className={!campaign.eligibility?.length ? 'campaign-fact-empty' : ''}>{campaign.eligibility?.length ? concise(campaign.eligibility, '') : '—'}</span></div>
-                    <div><small>奖品 / 奖励</small><span className={!(campaign.prizes?.length || campaign.reward_summary) ? 'campaign-fact-empty' : ''}>{campaign.prizes?.length || campaign.reward_summary ? concise(campaign.prizes, campaign.reward_summary || '') : '—'}</span></div>
+                    <div><small>奖品 / 奖励</small><span className={!rewardText ? 'campaign-fact-empty' : ''}>{rewardText || '—'}</span></div>
                     <div><small>获奖条件</small><span className={!campaign.winning_conditions?.length ? 'campaign-fact-empty' : ''}>{campaign.winning_conditions?.length ? concise(campaign.winning_conditions, '') : '—'}</span></div>
-                    <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{campaign.platform === 'x' && xEnrichmentStatus?.current === campaign.id ? '整理中…' : campaign.platform === 'x' && campaign.x_enrichment_status === 'failed' ? '整理失败，等待重试' : incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
+                    <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{campaign.platform === 'xiaohongshu' ? (xhsRuleStatus + (campaign.xhs_detail_status === 'parsed' && incomplete ? ' · 仍缺：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '')) : campaign.platform === 'x' && xEnrichmentStatus?.current === campaign.id ? '整理中…' : campaign.platform === 'x' && campaign.x_enrichment_status === 'failed' ? '整理失败，等待重试' : incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
                   </div>
                   <div className="campaign-actions">
                     <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看详情</button>
@@ -1081,10 +1117,11 @@ export default function CampaignsPage({
             <section><h4>指定话题 / 标签</h4>{selected.required_topics?.length ? <div className="campaign-topic-tags">{selected.required_topics.map((x) => <span key={x}>{x.startsWith('#') ? x : `# ${x}`}</span>)}</div> : <p className="campaign-unknown">未解析到指定话题。</p>}</section>
             <section><h4>AI 使用要求</h4><p className="campaign-copy">{selected.ai_policy === 'unknown' || !selected.ai_policy ? '原活动规则未说明 AI 使用要求。' : selected.ai_policy}</p></section>
             <section><h4>来源与核验</h4>
-              <p className="campaign-source-name"><strong>{sourceName(selected)}</strong> · {sourceLabel(selected)}</p>
+              <p className="campaign-source-name"><strong>{sourceName(selected)}</strong> · {sourceVerificationLabel(selected)}</p>
               {selected.source_url ? <a className="campaign-source-link" href={selected.source_url} target="_blank" rel="noreferrer">{selected.source_url}</a> : <p className="campaign-unknown">没有保存来源链接。</p>}
               <p className="campaign-verify">首次发现：{selected.discovered_at ? new Date(selected.discovered_at * 1000).toLocaleString('zh-CN') : '未知'} · 最后看到：{selected.last_seen_at ? new Date(selected.last_seen_at * 1000).toLocaleString('zh-CN') : '未知'}</p>
               <p className="campaign-verify">规则最近核验：{selected.last_verified_at ? new Date(selected.last_verified_at * 1000).toLocaleString('zh-CN') : '尚未完整核验'} · 规则版本 v{selected.rule_version}</p>
+              {selected.platform === 'xiaohongshu' && <p className="campaign-verify">详情解析：{xhsDetailStatusText(selected)}{selected.xhs_detail_fetched_at ? ' · ' + new Date(selected.xhs_detail_fetched_at * 1000).toLocaleString('zh-CN') : ''}{selected.xhs_detail_error ? ' · ' + selected.xhs_detail_error : ''}</p>}
             </section>
             <footer>
               <button className="btn btn-primary campaign-generate" disabled={selected.status === 'ended' || selected.status === 'cancelled'}
@@ -1093,6 +1130,7 @@ export default function CampaignsPage({
                 <button className="btn btn-sm" onClick={() => void addCalendar(selected)}><IconCalendar size={13} /> 加入选题日历</button>
                 {selected.source_url && <a className="btn btn-sm" href={selected.source_url} target="_blank" rel="noreferrer">打开原活动页</a>}
                 {selected.platform === 'bilibili' && <button className="btn btn-sm" disabled={verifying} onClick={() => void verifySelected()}><IconRefresh size={13} /> {verifying ? '核验中…' : '重新核验规则'}</button>}
+                {selected.platform === 'xiaohongshu' && <button className="btn btn-sm" disabled={!!xhsDetailRefreshing} onClick={() => void refreshXhsDetail(selected)}><IconRefresh size={13} /> {xhsDetailRefreshing === selected.id ? '读取中…' : selected.xhs_detail_status === 'not_fetched' ? '读取小红书规则' : '重新读取小红书规则'}</button>}
                 {selected.platform === 'bilibili' && (selected.missing_fields || []).length > 0 && <button className="btn btn-sm campaign-agent-button" disabled={!!enrichingId || agentBatchActive} onClick={() => void enrichOne(selected)}>✦ {enrichingId === selected.id ? 'Agent 补全中…' : 'Agent 补全'}</button>}
                 {selected.source_type === 'user_import' && <button className="btn btn-sm" onClick={() => openEdit(selected)}>编辑规则</button>}
               </div>

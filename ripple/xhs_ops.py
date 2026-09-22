@@ -187,6 +187,22 @@ class XhsOpsService:
         self._record_snapshot(account_id, 'events', payload)
         return payload
 
+    def event_detail(self, account_id: str, *, url: str, activity_id: str = '', force: bool = False) -> dict[str, Any]:
+        url = str(url or '').strip()
+        if not url or len(url) > 2048:
+            raise WorkflowError("小红书活动详情链接无效。", 422)
+        result = self._worker(account_id, 'event_detail', {
+            'url': url, 'activity_id': str(activity_id or '')[:160], 'force': bool(force),
+        })
+        payload = {
+            'source': 'creator_event_detail',
+            'sample_scope': f'creator_event:{str(activity_id or "")[:160]}',
+            'fetched_at': _now(),
+            **result['data'],
+        }
+        self._record_snapshot(account_id, 'event_detail', payload)
+        return payload
+
     def note(self, account_id: str, *, note_id: str = '', url: str = '') -> dict[str, Any]:
         note_id, locator = self._locator(account_id, note_id=note_id, url=url)
         result = self._worker(account_id, 'note', {'url': locator})
