@@ -79,6 +79,32 @@ def test_account_specific_campaign_qualification_is_projected_to_card_and_accoun
     assert "可执行活动任务" in row["account_states"]["xhs-account-1"]["qualification_basis"]
 
 
+def test_fresh_xhs_v2_refresh_removes_only_unsaved_legacy_creator_event_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    legacy = {
+        "id": "legacy-xhs", "title": "旧聚合活动", "platform": "xiaohongshu",
+        "source_type": "creator_events_api", "source_url": "https://creator.xiaohongshu.com/new/events",
+        "source_status": "verified", "saved": False, "created_at": 1, "updated_at": 1,
+    }
+    saved = {**legacy, "id": "saved-xhs", "title": "已收藏旧活动", "saved": True}
+    upstream._write_campaigns([legacy, saved])
+    payload = {"results": [{
+        "platform": "xiaohongshu", "status": "fresh", "items": [{
+            "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
+            "external_id": "xhs:44697", "title": "光遇联动狂欢月创作征集",
+            "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1",
+            "source_type": "creator_activity_center_api", "source_status": "verified",
+            "evidence": {"kind": "creator_account_activity"},
+        }],
+    }]}
+    result = upstream._merge_campaign_refresh(payload)
+    rows = upstream._read_campaigns()
+    assert result["merged"] == 1
+    assert all(row["id"] != "legacy-xhs" for row in rows)
+    assert any(row["id"] == "saved-xhs" for row in rows)
+    assert any(row.get("title") == "光遇联动狂欢月创作征集" for row in rows)
+
+
 def test_campaign_import_is_not_presented_as_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     created = asyncio.run(upstream.api_campaign_create(_campaign()))

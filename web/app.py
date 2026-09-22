@@ -4240,6 +4240,16 @@ def _merge_campaign_refresh(payload: dict) -> dict:
         if not isinstance(result, dict):
             continue
         platform = str(result.get("platform") or "")
+        if platform == "xiaohongshu" and result.get("status") == "fresh":
+            candidates = result.get("items", []) if isinstance(result.get("items"), list) else []
+            has_v2 = any(isinstance(row, dict) and str(row.get("source_type") or "") == "creator_activity_center_api" for row in candidates)
+            if has_v2:
+                items[:] = [row for row in items if not (
+                    row.get("platform") == "xiaohongshu"
+                    and row.get("source_type") in {"creator_events_api", "creator_events_dom"}
+                    and not bool(row.get("saved"))
+                    and str(row.get("source_url") or "").rstrip("/") == "https://creator.xiaohongshu.com/new/events"
+                )]
         if result.get("status") == "fresh":
             for candidate in result.get("items", []) if isinstance(result.get("items"), list) else []:
                 if isinstance(candidate, dict) and candidate.get("title") and candidate.get("platform"):
