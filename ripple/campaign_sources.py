@@ -1131,6 +1131,8 @@ class CampaignSourceService:
         if status != "ready" or not account:
             raise WorkflowError("小红书活动源需要已连接的创作者账号。", 409)
         payload = self.workspace.xhs_ops.events(str(account["id"]), 40, detail_limit=8)
+        if not payload.get("items") and payload.get("source") == "creator_events_dom" and not payload.get("api_observed"):
+            raise WorkflowError("小红书创作者活动列表接口本次未返回数据，请稍后重试。", 502)
         rows = []
         for item in payload.get("items", []):
             title = str(item.get("title") or "").strip()
@@ -1138,6 +1140,7 @@ class CampaignSourceService:
                 continue
             url = _safe_url(str(item.get("url") or ""), ("xiaohongshu.com", "creator.xiaohongshu.com"))
             topic_names = [str(x.get("name") or "")[:120] for x in item.get("topics", []) if isinstance(x, dict) and str(x.get("name") or "").strip()]
+            topic_ids = [str(x.get("id") or "")[:100] for x in item.get("topics", []) if isinstance(x, dict) and str(x.get("id") or "").strip()]
             required_topics = [str(x)[:120] for x in item.get("required_topics", []) if str(x).strip()]
             for topic in topic_names:
                 if topic and topic not in required_topics:
@@ -1171,6 +1174,7 @@ class CampaignSourceService:
                              "activity_id": str(item.get("external_id") or "")[:160],
                              "page_id": str(item.get("page_id") or "")[:100],
                              "instance_id": str(item.get("instance_id") or "")[:100],
+                             "topic_ids": topic_ids[:20],
                              "task_progress": item.get("task_progress") if isinstance(item.get("task_progress"), dict) else {},
                              "url": url or "https://creator.xiaohongshu.com/new/events"},
             })

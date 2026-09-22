@@ -182,7 +182,8 @@ function submissionSummary(campaign: Campaign): string {
   const formats = (spec.formats || []).map((key) => FORMAT_LABELS[key] || key).join(' / ');
   const min = formatSeconds(spec.duration_seconds?.min); const max = formatSeconds(spec.duration_seconds?.max);
   const duration = min && max ? `${min}～${max}` : min ? `≥ ${min}` : max ? `≤ ${max}` : '';
-  return [formats, duration].filter(Boolean).join(' · ');
+  const primary = [formats, duration].filter(Boolean).join(' · ');
+  return primary || spec.submission_method || spec.content_directions?.[0] || '';
 }
 
 function hasSubmissionSpec(campaign: Campaign): boolean {

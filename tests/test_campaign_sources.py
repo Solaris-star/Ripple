@@ -433,9 +433,29 @@ def test_xiaohongshu_source_uses_connected_creator_account_and_marks_account_evi
     rows = service._xiaohongshu(service._state())
     assert rows[0]["account_id"] == account["id"]
     assert rows[0]["evidence"]["kind"] == "creator_account_activity"
+    assert rows[0]["evidence"]["topic_ids"] == ["t1"]
     assert rows[0]["source_type"] == "creator_events_api_v2"
     assert rows[0]["required_topics"] == ["测试话题"]
     assert rows[0]["content_requirements"] == ["发布#测试话题 话题笔记"]
     assert rows[0]["prizes"] == ["参与投稿瓜分10W现金"]
     assert rows[0]["submission_spec"]["formats"] == ["image_text", "video"]
     assert rows[0]["qualification_state"] == "eligible"
+
+
+def test_xiaohongshu_source_treats_missing_api_and_empty_dom_as_transient_failure(source_service, monkeypatch):
+    workspace, service = source_service
+    account = workspace.accounts.create(AccountInput(
+        platform="xiaohongshu", label="创作者号", idempotency_key="xhs-empty-fixture",
+    ))
+    with workspace.store.transaction() as state:
+        state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u2"})
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda account_id, limit, detail_limit=8: {
+        "source": "creator_events_dom", "api_observed": False, "raw_count": 0, "items": [],
+    })
+    with pytest.raises(WorkflowError, match="活动列表接口本次未返回数据"):
+        service._xiaohongshu(service._state())
+
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda account_id, limit, detail_limit=8: {
+        "source": "creator_activity_center_api", "api_observed": True, "raw_count": 0, "items": [],
+    })
+    assert service._xiaohongshu(service._state()) == []

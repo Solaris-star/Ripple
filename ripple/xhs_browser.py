@@ -505,16 +505,18 @@ def creator_events(directory: Path, limit: int = 30, detail_limit: int = 8) -> d
         if 'login' in (page.url or '').lower() or ('登录' in body and ('扫码' in body or '手机号' in body)):
             raise XhsBrowserError('login_required')
 
+        api_observed = activity_payload is not None
         raw_count = 0
         items: list[dict[str, Any]] = []
-        if activity_payload:
+        if api_observed:
             values = ((activity_payload.get('data') or {}).get('activity_list') or [])
             raw_count = len(values) if isinstance(values, list) else 0
             items = _creator_activity_rows(activity_payload, limit=max(1, min(limit, 50)))
-        source = 'creator_activity_center_api'
+        source = 'creator_activity_center_api' if api_observed else 'creator_events_dom'
         if not items:
-            source = 'creator_events_dom'
             raw = page.evaluate(CREATOR_EVENTS_JS, max(1, min(limit, 50))) or []
+            if raw:
+                source = 'creator_events_dom'
             for row in raw:
                 if not isinstance(row, dict):
                     continue
@@ -581,7 +583,8 @@ def creator_events(directory: Path, limit: int = 30, detail_limit: int = 8) -> d
             _write_creator_detail_cache(directory, detail_cache)
         return {'items': items[:limit], 'source': source,
                 'page_url': 'https://creator.xiaohongshu.com/new/events',
-                'raw_count': raw_count, 'detail_count': detail_count, 'detail_fetched': detail_fetched}
+                'api_observed': api_observed, 'raw_count': raw_count,
+                'detail_count': detail_count, 'detail_fetched': detail_fetched}
     finally:
         _close(p, context)
 

@@ -4242,13 +4242,21 @@ def _merge_campaign_refresh(payload: dict) -> dict:
         platform = str(result.get("platform") or "")
         if platform == "xiaohongshu" and result.get("status") == "fresh":
             candidates = result.get("items", []) if isinstance(result.get("items"), list) else []
-            has_v2 = any(isinstance(row, dict) and str(row.get("source_type") or "") == "creator_activity_center_api" for row in candidates)
-            if has_v2:
+            topic_external_ids: set[str] = set()
+            for candidate in candidates:
+                if not isinstance(candidate, dict) or str(candidate.get("source_type") or "") != "creator_activity_center_api":
+                    continue
+                evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
+                for topic_id in evidence.get("topic_ids", []) if isinstance(evidence.get("topic_ids"), list) else []:
+                    topic_id = str(topic_id or "").strip()
+                    if topic_id:
+                        topic_external_ids.add("xhs:" + topic_id)
+            if topic_external_ids:
                 items[:] = [row for row in items if not (
                     row.get("platform") == "xiaohongshu"
                     and row.get("source_type") in {"creator_events_api", "creator_events_dom"}
                     and not bool(row.get("saved"))
-                    and str(row.get("source_url") or "").rstrip("/") == "https://creator.xiaohongshu.com/new/events"
+                    and str((row.get("external_ids") or {}).get("xiaohongshu_creator_events") or "") in topic_external_ids
                 )]
         if result.get("status") == "fresh":
             for candidate in result.get("items", []) if isinstance(result.get("items"), list) else []:
