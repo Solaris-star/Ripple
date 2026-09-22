@@ -501,8 +501,26 @@ export function runCampaignEnrichment(): Promise<{ started: boolean; reason?: st
 export function fetchCampaignEnrichmentStatus(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/enrichment/status'); }
 export function fetchXCampaignEnrichmentStatus(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/x-enrichment/status'); }
 export function cancelCampaignEnrichment(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/enrichment/cancel', { method: 'POST' }); }
-export function previewCampaignImport(url: string): Promise<{ draft: CampaignInput & Partial<Campaign>; agent_used: boolean; model: string; warning: string; evidence_fingerprint: string }> {
-  return request('/api/campaigns/import/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+export interface CampaignImportPreviewInput {
+  target_platform: CampaignPlatform;
+  input_kind: 'url' | 'text';
+  url?: string;
+  text?: string;
+  allow_agent?: boolean;
+}
+export interface CampaignImportPreviewResult {
+  draft: CampaignInput & Partial<Campaign>;
+  agent_used: boolean;
+  model: string;
+  warning: string;
+  evidence_fingerprint: string;
+  detected_platform?: CampaignPlatform | '';
+  field_evidence?: Record<string, unknown>;
+}
+export function previewCampaignImport(input: CampaignImportPreviewInput): Promise<CampaignImportPreviewResult> {
+  return request('/api/campaigns/import/preview', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
 }
 export function fetchCampaignSources(): Promise<CampaignSourceState> { return request('/api/campaigns/sources'); }
 export function configureCampaignSource(platform: CampaignPlatform, input: {

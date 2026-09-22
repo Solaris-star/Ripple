@@ -33,7 +33,12 @@ def test_public_source_state_has_bilibili_ready_without_configuration(source_ser
     assert bili["status"] == "ready"
     assert bili["automatic"] is True
     assert bili["billing"] == "free"
-    assert state["automatic_count"] == 1
+    assert state["automatic_count"] == 3
+    wechat = next(row for row in state["items"] if row["platform"] == "wechat")
+    channels = next(row for row in state["items"] if row["platform"] == "weixin-channels")
+    assert wechat["status"] == channels["status"] == "ready"
+    assert wechat["automatic"] is channels["automatic"] is True
+    assert wechat["billing"] == channels["billing"] == "free"
 
     assert bili["sync_interval_seconds"] == 30 * 60
     assert bili["next_sync_at"] == 0
@@ -46,6 +51,8 @@ def test_campaign_scheduler_intervals_and_failed_attempt_backoff(source_service,
     assert service.sync_interval("x") == 0  # Paid sources use daily slots.
     assert service.sync_interval("xiaohongshu") == 60 * 60
     assert service.sync_interval("douyin") == 60 * 60
+    assert service.sync_interval("wechat") == 6 * 60 * 60
+    assert service.sync_interval("weixin-channels") == 6 * 60 * 60
 
     state = service._state()
     now = int(time.time())
@@ -344,6 +351,15 @@ def test_bilibili_list_description_is_only_used_as_reward_when_it_is_reward_like
     assert _bili_reward_summary("32万奖励等你瓜分") == "32万奖励等你瓜分"
     assert _bili_reward_summary("参与活动可获流量扶持") == "参与活动可获流量扶持"
     assert _bili_reward_summary("从零开始的 bilibili only 特辑") == ""
+
+
+def test_generic_import_preserves_selected_platform_for_unsupported_url(source_service):
+    _, service = source_service
+    result = service.preview_import("weixin-channels", "url", url="https://example.com/activity")
+    assert result["draft"]["platform"] == "weixin-channels"
+    assert result["draft"]["source_url"] == "https://example.com/activity"
+    assert result["draft"]["title"] == ""
+    assert "手工填写" in result["warning"]
 
 
 def test_x_fallback_is_never_used_until_explicitly_enabled(source_service, monkeypatch):

@@ -29,6 +29,7 @@ from .ai_providers import AIProviderService
 from .campaign_enrichment import evidence_fingerprint, infer_submission_spec, normalize_submission_spec
 from .publishing import WorkflowError
 from .secrets import protect
+from .wechat_public_rules import can_parse_public_wechat_url, official_program_urls, preview_public_wechat_rule
 
 
 SYNC_INTERVALS = {
@@ -36,6 +37,8 @@ SYNC_INTERVALS = {
     "x": 0,  # Billed discovery uses daily slots, never a rolling interval.
     "xiaohongshu": 60 * 60,
     "douyin": 60 * 60,
+    "wechat": 6 * 60 * 60,
+    "weixin-channels": 6 * 60 * 60,
 }
 MAX_RESPONSE = 4 * 1024 * 1024
 CREATOR_WORDS = ("创作", "创作者", "征稿", "投稿", "激励", "奖金", "UP主", "视频", "内容", "挑战")
@@ -793,15 +796,15 @@ class CampaignSourceService:
             },
             {
                 "id": "wechat_campaigns", "platform": "wechat", "label": "微信公众号",
-                "status": "manual", "automatic": False, "mode": "manual",
-                "detail": "本阶段保留导入；公众号公告订阅源将在后续 Provider 中接入。",
-                "billing": "unknown", "last_sync": state["last_sync"].get("wechat", {}),
+                "status": "ready", "automatic": True, "mode": "official_public_rules",
+                "detail": "微信营销官方公开规则 · 无需登录；账号是否开通仍需账户内核验。",
+                "billing": "free", "last_sync": state["last_sync"].get("wechat", {}),
             },
             {
                 "id": "weixin_channels_campaigns", "platform": "weixin-channels", "label": "微信视频号",
-                "status": "manual", "automatic": False, "mode": "manual",
-                "detail": "本阶段保留导入；视频号活动源尚未确认稳定官方 Feed。",
-                "billing": "unknown", "last_sync": state["last_sync"].get("weixin-channels", {}),
+                "status": "ready", "automatic": True, "mode": "official_public_rules",
+                "detail": "微信营销 / 视频号团队公开规则 · 无需登录；受邀与收益状态需账户内核验。",
+                "billing": "free", "last_sync": state["last_sync"].get("weixin-channels", {}),
             },
         ]
         for row in rows:
@@ -990,6 +993,197 @@ class CampaignSourceService:
             "rule_evidence_fingerprint": evidence.get("evidence_fingerprint", ""),
             "_agent_evidence": evidence,
         }
+
+
+    @staticmethod
+    def _manual_import_draft(target_platform: str, *, url: str = "", text: str = "") -> dict[str, Any]:
+        labels = {
+            "x": "X", "xiaohongshu": "小红书", "douyin": "抖音", "bilibili": "B站",
+            "wechat": "微信公众号", "weixin-channels": "微信视频号",
+        }
+        clean_text = re.sub(r'\r\n?', '\n', str(text or '')).strip()[:20000]
+        first_line = next((line.strip() for line in clean_text.splitlines() if line.strip()), "")
+        summary = re.sub(r'\s+', ' ', clean_text)[:1200] if clean_text else ""
+        return {
+            "title": first_line[:240],
+            "platform": target_platform,
+            "platform_label": labels.get(target_platform, target_platform),
+            "organizer": "",
+            "organizer_type": "unknown",
+            "activity_type": "征稿/活动",
+            "reward_type": "",
+            "reward_summary": "",
+            "summary": summary,
+            "starts_at": "",
+            "signup_deadline": "",
+            "submit_deadline": "",
+            "stats_deadline": "",
+            "timezone": "",
+            "eligibility": [],
+            "qualification_state": "unknown",
+            "content_requirements": [],
+            "reward_rules": [],
+            "prizes": [],
+            "winning_conditions": [],
+            "required_topics": [],
+            "submission_spec": normalize_submission_spec({}),
+            "ai_policy": "unknown",
+            "source_url": str(url or "")[:2000],
+            "note": clean_text[:6000],
+            "status": "unknown",
+            "account_id": "",
+        }
+
+    def _preview_xiaohongshu_url(self, url: str) -> dict[str, Any]:
+        safe = _safe_url(str(url or ""), ("xiaohongshu.com", "creator.xiaohongshu.com"))
+        if not safe:
+            raise WorkflowError("小红书导入仅读取 xiaohongshu.com 官方详情链接。", 422)
+        base = self._manual_import_draft("xiaohongshu", url=safe)
+        existing = next((
+            row for row in _read_list(self.workspace.outputs / "_campaigns.json")
+            if row.get("platform") == "xiaohongshu" and str(row.get("source_url") or "") == safe
+        ), None)
+        if isinstance(existing, dict):
+            for field in (
+                "title", "organizer", "organizer_type", "activity_type", "reward_type", "reward_summary",
+                "summary", "starts_at", "signup_deadline", "submit_deadline", "stats_deadline", "timezone",
+                "eligibility", "content_requirements", "reward_rules", "prizes", "winning_conditions",
+                "required_topics", "submission_spec", "ai_policy", "note", "status", "account_id",
+            ):
+                if field in existing:
+                    base[field] = deepcopy(existing[field])
+        state = self._state()
+        account, status = self._effective_account(
+            "xiaohongshu", str(state["xiaohongshu"].get("account_id") or "")
+        )
+        if status != "ready" or not account or safe.rstrip("/") == "https://creator.xiaohongshu.com/new/events":
+            return {
+                "draft": base,
+                "evidence_text": "",
+                "evidence_fingerprint": "",
+                "warning": "已保留小红书链接；连接创作者账号并使用具体活动详情页后可读取更多规则。",
+                "detected_platform": "xiaohongshu",
+                "field_evidence": {},
+            }
+        detail = self.workspace.xhs_ops.event_detail(
+            str(account["id"]), url=safe, activity_id="", force=False,
+        )
+        for field in (
+            "eligibility", "content_requirements", "reward_rules", "prizes",
+            "winning_conditions", "required_topics", "submission_spec",
+        ):
+            if field in detail:
+                base[field] = deepcopy(detail[field])
+        base["qualification_state"] = str(detail.get("qualification_state") or "unknown")
+        if detail.get("qualification_basis"):
+            base["note"] = str(detail.get("qualification_basis") or "")[:6000]
+        if not base.get("title"):
+            base["title"] = "小红书创作活动（请确认标题）"
+        evidence_parts: list[str] = []
+        for field in ("eligibility", "content_requirements", "reward_rules", "prizes", "winning_conditions"):
+            value = detail.get(field)
+            if isinstance(value, list):
+                evidence_parts.extend(str(item) for item in value if str(item).strip())
+        evidence_text = "\n".join(evidence_parts)[:24000]
+        return {
+            "draft": base,
+            "evidence_text": evidence_text,
+            "evidence_fingerprint": evidence_fingerprint({"url": safe, "text": evidence_text}),
+            "warning": "已使用当前小红书创作者账号只读解析详情；标题、资格和图片规则仍请在创建前核对。",
+            "detected_platform": "xiaohongshu",
+            "field_evidence": deepcopy(detail.get("field_evidence")) if isinstance(detail.get("field_evidence"), dict) else {},
+        }
+
+    def preview_import(self, target_platform: str, input_kind: str, *, url: str = "", text: str = "") -> dict[str, Any]:
+        if target_platform not in {"x", "xiaohongshu", "douyin", "bilibili", "wechat", "weixin-channels"}:
+            raise WorkflowError("不支持的活动目标平台。", 422)
+        if input_kind == "text":
+            draft = self._manual_import_draft(target_platform, url=url, text=text)
+            evidence_text = str(text or "").strip()[:24000]
+            return {
+                "draft": draft,
+                "evidence_text": evidence_text,
+                "evidence_fingerprint": evidence_fingerprint({"platform": target_platform, "text": evidence_text}) if evidence_text else "",
+                "warning": "已保留你粘贴的规则原文；未自动猜测缺失字段。",
+                "detected_platform": "",
+                "field_evidence": {},
+            }
+        if input_kind != "url":
+            raise WorkflowError("导入方式只支持链接或粘贴原文。", 422)
+        raw_url = str(url or "").strip()
+        try:
+            parsed = urlsplit(raw_url)
+        except ValueError:
+            raise WorkflowError("活动链接格式无效。", 422) from None
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in {"http", "https"} or not host:
+            raise WorkflowError("活动链接只允许 http/https 地址。", 422)
+        if host == "bilibili.com" or host.endswith(".bilibili.com"):
+            draft = self.preview_bilibili_url(raw_url)
+            evidence = draft.pop("_agent_evidence", {}) if isinstance(draft.get("_agent_evidence"), dict) else {}
+            return {
+                "draft": draft,
+                "evidence_text": str(evidence.get("evidence_text") or "")[:24000],
+                "evidence_fingerprint": str(evidence.get("evidence_fingerprint") or ""),
+                "warning": "",
+                "detected_platform": "bilibili",
+                "field_evidence": {},
+            }
+        if host == "xiaohongshu.com" or host.endswith(".xiaohongshu.com"):
+            return self._preview_xiaohongshu_url(raw_url)
+        if can_parse_public_wechat_url(raw_url):
+            return preview_public_wechat_rule(raw_url, target_platform)
+        draft = self._manual_import_draft(target_platform, url=raw_url)
+        return {
+            "draft": draft,
+            "evidence_text": "",
+            "evidence_fingerprint": "",
+            "warning": "该链接尚未支持自动解析，已保留链接和当前平台；可粘贴规则原文或直接手工填写。",
+            "detected_platform": "",
+            "field_evidence": {},
+        }
+
+    def _wechat_public(self, platform: str) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for url in official_program_urls(platform):
+            parsed = preview_public_wechat_rule(url, platform)
+            draft = parsed["draft"]
+            fingerprint = str(parsed.get("evidence_fingerprint") or "")
+            external = hashlib.sha256(url.encode("utf-8")).hexdigest()[:20]
+            rows.append({
+                "provider_id": "wechat_public_rules",
+                "platform": platform,
+                "external_id": f"{platform}:official:{external}",
+                "title": str(draft.get("title") or "")[:240],
+                "organizer": str(draft.get("organizer") or "微信")[:160],
+                "organizer_type": str(draft.get("organizer_type") or "platform")[:40],
+                "activity_type": str(draft.get("activity_type") or "长期创作变现计划")[:80],
+                "reward_type": str(draft.get("reward_type") or "")[:120],
+                "reward_summary": str(draft.get("reward_summary") or "")[:600],
+                "summary": str(draft.get("summary") or "")[:3000],
+                "starts_at": "", "signup_deadline": "", "submit_deadline": "", "stats_deadline": "",
+                "timezone": str(draft.get("timezone") or "Asia/Shanghai")[:80],
+                "eligibility": list(draft.get("eligibility") or [])[:20],
+                "content_requirements": list(draft.get("content_requirements") or [])[:30],
+                "reward_rules": list(draft.get("reward_rules") or [])[:30],
+                "prizes": [], "winning_conditions": [],
+                "required_topics": list(draft.get("required_topics") or [])[:20],
+                "submission_spec": deepcopy(draft.get("submission_spec") or {}),
+                "qualification_state": "unknown",
+                "qualification_basis": "微信官方公开规则已读取；当前账号是否开通、受邀及实际收益需账号内核验。",
+                "source_url": url,
+                "source_type": "wechat_public_official",
+                "source_status": "verified",
+                "note": str(draft.get("note") or "")[:3000],
+                "field_evidence": deepcopy(parsed.get("field_evidence")) if isinstance(parsed.get("field_evidence"), dict) else {},
+                "evidence": {
+                    "kind": "platform_public_detail",
+                    "provider": "wechat_public_rules",
+                    "evidence_fingerprint": fingerprint,
+                    "url": url,
+                },
+            })
+        return rows
 
     def verify_bilibili_campaign(self, campaign: dict[str, Any]) -> dict[str, Any]:
         url = _safe_url(str(campaign.get("source_url") or ""), ("bilibili.com", "www.bilibili.com"))
@@ -1563,7 +1757,7 @@ class CampaignSourceService:
                             fallback_used = True
                     elif platform == "xiaohongshu":
                         items = self._xiaohongshu(state); provider = "xiaohongshu_creator_events"
-                    else:
+                    elif platform == "douyin":
                         try:
                             items = self._douyin_portal(state); provider = "douyin_creator_portal"
                         except WorkflowError:
@@ -1572,6 +1766,8 @@ class CampaignSourceService:
                             if not paid_slot and not (force and allow_paid):
                                 raise WorkflowError("免费后台读取失败；收费备用将在 09:00、14:00、20:00（北京时间）尝试，当前未调用。", 503) from None
                             items = self._tikhub(); provider = "tikhub_douyin"; fallback_used = True
+                    else:
+                        items = self._wechat_public(platform); provider = "wechat_public_rules"
                     self._record_sync(platform, status="fresh", count=len(items), provider=provider,
                                       fallback_used=fallback_used)
                     results.append({"platform": platform, "status": "fresh", "items": items,

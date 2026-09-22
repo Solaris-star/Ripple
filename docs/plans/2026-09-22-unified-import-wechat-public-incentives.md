@@ -1,6 +1,6 @@
 # Plan: 通用活动导入与微信官方公开激励规则
 
-状态：PLAN，待用户确认实现。本轮只读代码与公开官方资料；业务基线27f1e81，工作区开始时干净。未调用模型、未登录微信、未刷新生产活动、未重启。
+状态：EXECUTED / PRE-RESTART VALIDATED。业务基线27f1e81；实现已完成并通过自动化及匿名官方页验证，待本次提交后自动重启本地 Ripple 做运行态验收。
 
 ## Goal / Non-goals
 
@@ -107,6 +107,21 @@ Will NOT touch：其他平台自动采集、费用时段账本、小红书官方
 - 兼容已有B站导入：保留B站特定提取器并新增回归，通用化不能降低其规则精度。
 - 扩大URL入口带来SSRF和提示注入风险：受限分发与安全下载必须先于开放读取，未知站点先仅保存输入。
 - 回滚仅回退本次代码与新规则源配置，不删已创建活动、用户手工编辑或收藏；新字段保持向后兼容。
+
+## Execution result（2026-09-22）
+
+状态：代码与自动化/匿名官方页验证完成；提交后自动重启本地 Ripple 并补记运行态验收。
+
+- “补充导入”已改为通用入口：当前频道自动预填目标平台，可选择链接或粘贴规则原文；手工填写继续继承当前平台。前端不再把解析结果强制改成 bilibili。
+- 后端预览增加 target_platform / input_kind / allow_agent。allow_agent 默认 false；免费解析不会自动调用模型。显式勾选后仅把当前已读取原文交给默认模型做结构化整理，不给模型联网/浏览器/工具权限，字段仍经现有证据过滤。
+- B站旧链接解析器保留；小红书官方详情复用现有隔离账号只读解析；不支持自动解析的普通链接只保存平台+URL并要求手工确认，不生成假标题。
+- 新增微信第一方公开规则读取器：白名单 HTTPS 官方页面，微信营销文档用匿名临时浏览器渲染，视频号团队静态页用只读 HTTP；不复用用户 Cookie/账号 Profile。浏览器只放行腾讯/微信静态资源域的 GET/HEAD，请求失败不会假装规则为空。
+- 微信公众号流量主和微信视频号创作分成计划成为免费官方公开规则源；公开规则与个人账号资格分离，qualification_state 始终 unknown，是否受邀/开通/收益需账号内核验。来源每6小时免费复核，不改变付费调度。
+- 长期计划不再套比赛字段：卡片显示“收益方式/收益规则”，无日期时显示“长期计划 · 未公布截止日期”，不会要求奖品/获奖条件才算规则完整。
+- 匿名实读通过：ad.weixin.qq.com/docs/45 解析出公众号流量主、100人门槛、平台规范、程序化广告/返佣/互选收入；docs/273 解析出视频号创作分成、100人、原创/规范、分批邀请、视频原创声明；docs/76 解析出创作分成和视频号互选两类变现方式。未据此判定当前账号已具备资格。
+- 直接调用新预览API读取 docs/45：agent_used=false，draft.platform=wechat，qualification_state=unknown；_campaigns.json 前后 SHA256 一致。视频号官方候选 source_type=wechat_public_official，资格 unknown。
+- scripts/campaign_import_smoke.py 通过：公众号/视频号频道继承平台、B站固定文案移除、URL/原文双模式、Agent 默认关闭、预览不创建 Campaign、返回草稿保持频道；所有 POST 被拦截。
+- 定向回归最终 67 passed；全量 pytest 488 passed，1 个既有 Starlette TestClient deprecation warning；npm run build 通过，仅有既有 >500kB chunk warning。
 
 ## Open questions
 

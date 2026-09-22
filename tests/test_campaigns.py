@@ -629,17 +629,17 @@ def test_campaign_source_capabilities_only_claim_bilibili_without_configuration(
             {"platform": "x", "automatic": False, "status": "needs_config"},
             {"platform": "xiaohongshu", "automatic": False, "status": "needs_config"},
             {"platform": "douyin", "automatic": False, "status": "needs_config"},
-            {"platform": "wechat", "automatic": False, "status": "manual"},
-            {"platform": "weixin-channels", "automatic": False, "status": "manual"},
+            {"platform": "wechat", "automatic": True, "status": "ready"},
+            {"platform": "weixin-channels", "automatic": True, "status": "ready"},
         ],
-        "automatic_count": 1,
+        "automatic_count": 3,
     }
     monkeypatch.setattr(upstream, "_ensure_ai_provider_migration", lambda: None)
     monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "public_state", lambda: state)
     result = asyncio.run(upstream.api_campaign_sources())
     assert len(result["items"]) == 6
-    assert result["automatic_count"] == 1
-    assert [item["platform"] for item in result["items"] if item["automatic"]] == ["bilibili"]
+    assert result["automatic_count"] == 3
+    assert [item["platform"] for item in result["items"] if item["automatic"]] == ["bilibili", "wechat", "weixin-channels"]
 
 
 def test_structured_idea_keeps_campaign_and_trend_context(tmp_path, monkeypatch):
@@ -827,18 +827,52 @@ def test_campaign_agent_fetch_failure_does_not_call_model(tmp_path, monkeypatch)
     assert calls == []
 
 
-def test_bilibili_url_preview_does_not_create_campaign(tmp_path, monkeypatch):
+def test_import_preview_keeps_target_platform_and_does_not_call_agent_by_default(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
-    monkeypatch.setattr(upstream, "_campaign_agent_model", lambda: "")
-    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "preview_bilibili_url", lambda url: {
-        "title": "预览活动", "platform": "bilibili", "organizer": "B站", "activity_type": "创作活动",
-        "source_url": url, "source_type": "user_import", "eligibility": [], "content_requirements": [],
-        "prizes": [], "winning_conditions": [], "reward_rules": [], "required_topics": [], "submission_spec": {},
-        "_agent_evidence": {"evidence_fingerprint": "fp", "evidence_text": "投稿活动"},
+    calls = []
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "preview_import", lambda platform, kind, **kwargs: {
+        "draft": {
+            "title": "公众号公开激励", "platform": platform, "organizer": "微信",
+            "activity_type": "长期创作变现计划", "source_url": kwargs.get("url", ""),
+            "eligibility": ["公开规则"], "content_requirements": [], "prizes": [],
+            "winning_conditions": [], "reward_rules": ["广告分成"], "required_topics": [],
+            "submission_spec": {}, "qualification_state": "unknown",
+        },
+        "evidence_text": "公开规则 广告分成", "evidence_fingerprint": "fp",
+        "warning": "", "detected_platform": platform, "field_evidence": {},
     })
-    result = asyncio.run(upstream.api_campaign_import_preview(upstream.CampaignImportPreviewInput(url="https://www.bilibili.com/blackboard/import.html")))
-    assert result["draft"]["title"] == "预览活动"
+    monkeypatch.setattr(upstream._AI_PROVIDERS, "prompt_route", lambda *args, **kwargs: calls.append(1) or {})
+    result = asyncio.run(upstream.api_campaign_import_preview(upstream.CampaignImportPreviewInput(
+        target_platform="wechat", input_kind="url", url="https://ad.weixin.qq.com/docs/45",
+    )))
+    assert result["draft"]["platform"] == "wechat"
+    assert result["draft"]["title"] == "公众号公开激励"
     assert result["agent_used"] is False
+    assert calls == []
+    assert upstream._read_campaigns() == []
+
+
+def test_import_preview_only_calls_model_when_explicitly_allowed(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "preview_import", lambda platform, kind, **kwargs: {
+        "draft": {"title": "原始标题", "platform": platform, "source_url": "", "eligibility": [],
+                  "content_requirements": [], "prizes": [], "winning_conditions": [], "reward_rules": [],
+                  "required_topics": [], "submission_spec": {}, "qualification_state": "unknown"},
+        "evidence_text": "活动名称：原始标题\n参与条件：需原创",
+        "evidence_fingerprint": "fp", "warning": "", "detected_platform": "", "field_evidence": {},
+    })
+    monkeypatch.setattr(upstream._AI_PROVIDERS, "resolved", lambda *args, **kwargs: {"model": "fixture-model"})
+    calls = []
+    monkeypatch.setattr(upstream._AI_PROVIDERS, "prompt_route", lambda *args, **kwargs: (
+        calls.append((args, kwargs)) or {"model": "fixture-model", "text": '{"eligibility":["需原创"],"field_evidence":{"eligibility":["参与条件：需原创"]}}'}
+    ))
+    result = asyncio.run(upstream.api_campaign_import_preview(upstream.CampaignImportPreviewInput(
+        target_platform="wechat", input_kind="text", text="活动名称：原始标题\n参与条件：需原创", allow_agent=True,
+    )))
+    assert result["agent_used"] is True
+    assert result["draft"]["platform"] == "wechat"
+    assert result["draft"]["eligibility"] == ["需原创"]
+    assert len(calls) == 1
     assert upstream._read_campaigns() == []
 
 

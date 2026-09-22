@@ -163,12 +163,17 @@ def test_douyin_fallback_never_piggybacks_on_hourly_or_free_manual(service, monk
 def test_unconfigured_platforms_and_invalid_scopes_make_no_requests(service, monkeypatch):
     def forbidden(*args, **kwargs):
         pytest.fail('unrelated platform called')
-    for name in ('_bilibili', '_xiaohongshu', '_x_method', '_douyin_portal', '_tikhub'):
+    for name in ('_bilibili', '_xiaohongshu', '_x_method', '_tikhub'):
         monkeypatch.setattr(service, name, forbidden)
-    for name in ('douyin', 'wechat', 'weixin-channels'):
+    values = service.refresh(['douyin'], force=True)['results']
+    assert len(values) == 1 and values[0]['platform'] == 'douyin'
+    assert values[0]['status'] == 'needs_config'
+    wechat_calls = []
+    monkeypatch.setattr(service, '_wechat_public', lambda platform: wechat_calls.append(platform) or [])
+    for name in ('wechat', 'weixin-channels'):
         values = service.refresh([name], force=True)['results']
-        assert len(values) == 1 and values[0]['platform'] == name
-        assert values[0]['status'] in {'needs_config', 'manual'}
+        assert values == [{'platform': name, 'status': 'fresh', 'items': [], 'count': 0, 'provider': 'wechat_public_rules', 'rules_allowed': False, 'fallback_used': False}]
+    assert wechat_calls == ['wechat', 'weixin-channels']
     for invalid in ([], ['unknown'], ['all']):
         with pytest.raises(WorkflowError) as exc:
             service.refresh(invalid, force=True)

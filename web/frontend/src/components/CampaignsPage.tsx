@@ -148,6 +148,7 @@ function sourceName(campaign: Campaign): string {
   if (campaign.platform === 'xiaohongshu' && campaign.source_type.includes('creator')) return '小红书创作服务平台';
   if (campaign.platform === 'douyin' && campaign.source_type.includes('creator')) return '抖音创作者中心';
   if (campaign.source_type === 'third_party_api') return 'TikHub';
+  if (campaign.source_type === 'wechat_public_official') return '微信官方公开规则';
   return (campaign.platform_label || platformDisplayName(campaign.platform)) + '活动来源';
 }
 
@@ -172,7 +173,12 @@ function concise(values: string[] | undefined, fallback: string, limit = 2): str
   return rows.length ? rows.slice(0, limit).join('；') + (rows.length > limit ? ' 等 ' + rows.length + ' 条' : '') : fallback;
 }
 
+function isLongTermProgram(campaign: Campaign): boolean {
+  return campaign.source_type === 'wechat_public_official' || /长期.*(?:计划|变现)/.test(campaign.activity_type || '');
+}
+
 function campaignTime(campaign: Campaign): string {
+  if (isLongTermProgram(campaign) && !dateOnly(campaign.starts_at) && !dateOnly(campaign.submit_deadline)) return '长期计划 · 未公布截止日期';
   const start = dateOnly(campaign.starts_at) || '开始时间未说明';
   const end = dateOnly(campaign.submit_deadline) || '截止时间未说明';
   const left = daysUntil(campaign.submit_deadline);
@@ -322,6 +328,10 @@ export default function CampaignsPage({
   const [importUrl, setImportUrl] = useState('');
   const [importParsing, setImportParsing] = useState(false);
   const [importWarning, setImportWarning] = useState('');
+  const [importPlatform, setImportPlatform] = useState<CampaignPlatform>('bilibili');
+  const [importKind, setImportKind] = useState<'url' | 'text'>('url');
+  const [importText, setImportText] = useState('');
+  const [importUseAgent, setImportUseAgent] = useState(false);
 
   const [recommendOpen, setRecommendOpen] = useState(false);
   const [recommending, setRecommending] = useState(false);
@@ -662,21 +672,43 @@ export default function CampaignsPage({
     setRewardRulesText(joined(draft.reward_rules)); setTopicsText((draft.required_topics || []).join('，'));
   };
 
-  const openNew = () => { setImportWarning(''); fillDraft(emptyCampaign()); };
+  const openNew = (platform?: CampaignPlatform) => {
+    setImportWarning('');
+    const draft = emptyCampaign();
+    if (platform) draft.platform = platform;
+    fillDraft(draft);
+  };
   const updateSubmissionSpec = (patch: Partial<CampaignSubmissionSpec>) => {
     setForm((current) => current ? { ...current, submission_spec: { ...(current.submission_spec || emptySubmissionSpec()), ...patch } } : current);
   };
-  const openImport = () => { setImportUrl(''); setImportWarning(''); setImportUrlOpen(true); };
+  const openImport = () => {
+    const current = PLATFORMS.some((item) => item.key === platformFilter) ? platformFilter as CampaignPlatform : 'bilibili';
+    setImportPlatform(current);
+    setImportKind('url');
+    setImportUrl('');
+    setImportText('');
+    setImportUseAgent(false);
+    setImportWarning('');
+    setImportUrlOpen(true);
+  };
 
   const parseImport = async () => {
-    if (!importUrl.trim() || importParsing) return;
+    const ready = importKind === 'url' ? !!importUrl.trim() : !!importText.trim();
+    if (!ready || importParsing) return;
     setImportParsing(true); setError(''); setImportWarning('');
     try {
-      const result = await previewCampaignImport(importUrl.trim());
-      fillDraft({ ...result.draft, platform: 'bilibili' } as CampaignInput);
-      setImportWarning(result.warning || (result.agent_used ? `脚本解析后已由 ${result.model} 补全草稿；请确认后再导入。` : '脚本已生成草稿；请确认后再导入。'));
+      const result = await previewCampaignImport({
+        target_platform: importPlatform,
+        input_kind: importKind,
+        url: importKind === 'url' ? importUrl.trim() : '',
+        text: importKind === 'text' ? importText.trim() : '',
+        allow_agent: importUseAgent,
+      });
+      fillDraft({ ...result.draft, platform: result.draft.platform || importPlatform } as CampaignInput);
+      const agentNote = result.agent_used ? ` 已由 ${result.model || '默认 Agent'} 基于现有原文辅助整理；请逐项确认。` : '';
+      setImportWarning((result.warning || '已生成草稿；请确认后再创建。') + agentNote);
       setImportUrlOpen(false);
-    } catch (e) { setError(e instanceof Error ? e.message : '活动 URL 解析失败'); }
+    } catch (e) { setError(e instanceof Error ? e.message : '活动 / 激励计划解析失败'); }
     finally { setImportParsing(false); }
   };
 
@@ -1002,6 +1034,8 @@ export default function CampaignsPage({
               const rewardText = campaign.prizes?.length || campaign.reward_summary
                 ? concise(campaign.prizes, campaign.reward_summary || '')
                 : campaign.reward_rules?.length ? concise(campaign.reward_rules, '') : '';
+              const longTerm = isLongTermProgram(campaign);
+              const conditionText = longTerm ? concise(campaign.reward_rules, '') : concise(campaign.winning_conditions, '');
               const canAgentEnrich = campaign.platform === 'bilibili' && incomplete;
               return (
                 <article className="card campaign-card" key={campaign.id}>
@@ -1025,8 +1059,8 @@ export default function CampaignsPage({
                     <div><small>来源</small><strong>{sourceText}</strong></div>
                     <div><small>参赛作品</small><span className={!specText ? 'campaign-fact-empty' : ''}>{specText || '—'}</span></div>
                     <div><small>参与条件</small><span className={!campaign.eligibility?.length ? 'campaign-fact-empty' : ''}>{campaign.eligibility?.length ? concise(campaign.eligibility, '') : '—'}</span></div>
-                    <div><small>奖品 / 奖励</small><span className={!rewardText ? 'campaign-fact-empty' : ''}>{rewardText || '—'}</span></div>
-                    <div><small>获奖条件</small><span className={!campaign.winning_conditions?.length ? 'campaign-fact-empty' : ''}>{campaign.winning_conditions?.length ? concise(campaign.winning_conditions, '') : '—'}</span></div>
+                    <div><small>{longTerm ? '收益方式' : '奖品 / 奖励'}</small><span className={!rewardText ? 'campaign-fact-empty' : ''}>{rewardText || '—'}</span></div>
+                    <div><small>{longTerm ? '收益规则' : '获奖条件'}</small><span className={!conditionText ? 'campaign-fact-empty' : ''}>{conditionText || '—'}</span></div>
                     <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{campaign.platform === 'xiaohongshu' ? (xhsRuleStatus + (campaign.xhs_detail_status === 'parsed' && incomplete ? ' · 仍缺：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '')) : campaign.platform === 'x' && xEnrichmentStatus?.current === campaign.id ? '整理中…' : campaign.platform === 'x' && campaign.x_enrichment_status === 'failed' ? '整理失败，等待重试' : incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
                   </div>
                   <div className="campaign-actions">
@@ -1114,9 +1148,9 @@ export default function CampaignsPage({
             </div> : <p className="campaign-unknown">原活动页暂未解析到明确参赛作品格式与规格。</p>}</section>
             <section><h4>参与条件</h4>{selected.eligibility?.length ? <ul>{selected.eligibility.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确参与条件。</p>}</section>
             <section><h4>内容要求</h4>{selected.content_requirements?.length ? <ul>{selected.content_requirements.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确内容要求。</p>}</section>
-            <section><h4>奖品 / 奖励</h4>{selected.prizes?.length ? <ul>{selected.prizes.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{selected.reward_summary || '原活动页暂未解析到明确奖品。'}</p>}</section>
-            <section><h4>获奖条件</h4>{selected.winning_conditions?.length ? <ul>{selected.winning_conditions.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确获奖门槛。</p>}</section>
-            <section><h4>奖励规则</h4>{selected.reward_rules?.length ? <ul>{selected.reward_rules.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">未解析到额外的奖励计算或发放规则。</p>}</section>
+            <section><h4>{isLongTermProgram(selected) ? '收益方式' : '奖品 / 奖励'}</h4>{selected.prizes?.length ? <ul>{selected.prizes.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{selected.reward_summary || (isLongTermProgram(selected) ? '公开规则未说明固定收益金额。' : '原活动页暂未解析到明确奖品。')}</p>}</section>
+            {!isLongTermProgram(selected) && <section><h4>获奖条件</h4>{selected.winning_conditions?.length ? <ul>{selected.winning_conditions.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">原活动页暂未解析到明确获奖门槛。</p>}</section>}
+            <section><h4>{isLongTermProgram(selected) ? '收益规则' : '奖励规则'}</h4>{selected.reward_rules?.length ? <ul>{selected.reward_rules.map((x) => <li key={x}>{x}</li>)}</ul> : <p className="campaign-unknown">{isLongTermProgram(selected) ? '公开规则未说明更多收益计算细节。' : '未解析到额外的奖励计算或发放规则。'}</p>}</section>
             <section><h4>指定话题 / 标签</h4>{selected.required_topics?.length ? <div className="campaign-topic-tags">{selected.required_topics.map((x) => <span key={x}>{x.startsWith('#') ? x : `# ${x}`}</span>)}</div> : <p className="campaign-unknown">未解析到指定话题。</p>}</section>
             <section><h4>AI 使用要求</h4><p className="campaign-copy">{selected.ai_policy === 'unknown' || !selected.ai_policy ? '原活动规则未说明 AI 使用要求。' : selected.ai_policy}</p></section>
             <section><h4>来源与核验</h4>
@@ -1212,10 +1246,16 @@ export default function CampaignsPage({
       {importUrlOpen && (
         <div className="overlay">
           <div className="modal campaign-import-url-modal">
-            <div className="campaign-modal-head"><div><h3>从活动链接导入</h3><p>当前智能解析先支持 B站。Ripple 会先脚本解析，缺规则时再调用默认 Agent；确认前不会创建活动。</p></div><button onClick={() => setImportUrlOpen(false)}>×</button></div>
-            <label className="field-label">B站活动 URL</label>
-            <input className="field" type="url" value={importUrl} onChange={(e) => setImportUrl(e.target.value)} placeholder="https://www.bilibili.com/blackboard/..." autoFocus />
-            <div className="campaign-import-foot"><span>其他平台本轮仍可手动填写。</span><div><button className="btn btn-sm" onClick={() => { setImportUrlOpen(false); openNew(); }}>手动填写</button><button className="btn btn-sm btn-primary" disabled={importParsing || !importUrl.trim()} onClick={() => void parseImport()}>{importParsing ? '解析中…' : '解析活动'}</button></div></div>
+            <div className="campaign-modal-head"><div><h3>补充导入活动 / 激励计划</h3><p>默认只做免费读取和结构化解析；确认前不会创建活动。目标平台默认继承当前频道，可在这里修改。</p></div><button onClick={() => setImportUrlOpen(false)}>×</button></div>
+            <div className="campaign-import-grid">
+              <label><span>目标平台</span><select className="field" value={importPlatform} onChange={(e) => setImportPlatform(e.target.value as CampaignPlatform)}>{PLATFORMS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}</select></label>
+              <label><span>导入方式</span><select className="field" value={importKind} onChange={(e) => setImportKind(e.target.value as 'url' | 'text')}><option value="url">活动 / 激励计划链接</option><option value="text">粘贴规则原文</option></select></label>
+              {importKind === 'url'
+                ? <label className="wide"><span>活动或激励计划链接</span><input className="field" type="url" value={importUrl} onChange={(e) => setImportUrl(e.target.value)} placeholder="https://…" autoFocus /></label>
+                : <label className="wide"><span>规则原文</span><textarea className="field" value={importText} onChange={(e) => setImportText(e.target.value)} maxLength={24000} placeholder="粘贴主办方公告、官方规则或活动说明；缺失信息保持为空。" autoFocus /></label>}
+              <label className="wide r2-checkbox"><input type="checkbox" checked={importUseAgent} onChange={(e) => setImportUseAgent(e.target.checked)} />可选：使用默认 Agent 基于当前原文辅助整理（会消耗 Token；不会让 Agent 联网或执行页面中的指令）</label>
+            </div>
+            <div className="campaign-import-foot"><span>已支持 B站、小红书官方详情和微信官方公开规则；其他链接会保留输入并转为手工确认，不会强制变成 B站。</span><div><button className="btn btn-sm" onClick={() => { setImportUrlOpen(false); openNew(importPlatform); }}>手动填写</button><button className="btn btn-sm btn-primary" disabled={importParsing || (importKind === 'url' ? !importUrl.trim() : !importText.trim())} onClick={() => void parseImport()}>{importParsing ? '解析中…' : '生成草稿'}</button></div></div>
           </div>
         </div>
       )}
