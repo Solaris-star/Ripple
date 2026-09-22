@@ -824,7 +824,7 @@ export default function CampaignsPage({
             {source.cost_note && <small>{source.cost_note}</small>}
             {lastSuccess > 0 && <small>最近成功采集：{new Date(lastSuccess * 1000).toLocaleString('zh-CN')}{sync?.last_success_count != null ? ` · ${sync.last_success_count} 条` : ''}</small>}
             {source.automatic && nextRun > 0 ? <small>距离下次采集：<b className="campaign-sync-countdown">{formatCountdown(remaining)}</b></small> : null}
-            {sync?.error && <small className="error">上次尝试：{lastAttempt ? new Date(lastAttempt * 1000).toLocaleString('zh-CN') : '未知'} · {sync.error}</small>}
+            {sync?.error && <small className="error">上次采集失败：{lastAttempt ? new Date(lastAttempt * 1000).toLocaleString('zh-CN') : '未知'} · {sync.error}</small>}
             <div className="campaign-source-status-actions">
               {configurable && <button className="r2-text-button" onClick={() => openSourceEditor(source)}>配置</button>}
             </div>
