@@ -4086,6 +4086,10 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
         )
     )
     account_id = str(candidate.get("account_id") or "")[:80]
+    candidate_qualification = str(candidate.get("qualification_state") or "unknown")
+    if candidate_qualification not in CAMPAIGN_QUALIFICATION_STATES:
+        candidate_qualification = "unknown"
+    candidate_qualification_basis = str(candidate.get("qualification_basis") or "unknown")[:600]
     if existing is None:
         item = {
             "id": uuid.uuid4().hex[:12],
@@ -4104,8 +4108,8 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "stats_deadline": str(candidate.get("stats_deadline") or "")[:40],
             "timezone": "",
             "eligibility": [str(x)[:240] for x in candidate.get("eligibility", []) if str(x).strip()][:20],
-            "qualification_state": "unknown",
-            "qualification_basis": "unknown",
+            "qualification_state": candidate_qualification,
+            "qualification_basis": candidate_qualification_basis,
             "content_requirements": [str(x)[:240] for x in candidate.get("content_requirements", []) if str(x).strip()][:30],
             "prizes": [str(x)[:240] for x in candidate.get("prizes", []) if str(x).strip()][:30],
             "winning_conditions": [str(x)[:240] for x in candidate.get("winning_conditions", []) if str(x).strip()][:30],
@@ -4181,6 +4185,9 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             item["rule_history"] = history[-20:]
             item["rule_version"] = int(item.get("rule_version") or 0) + 1
         item.update(proposed)
+        if account_id and candidate_qualification in CAMPAIGN_QUALIFICATION_STATES:
+            item["qualification_state"] = candidate_qualification
+            item["qualification_basis"] = candidate_qualification_basis
         item["last_seen_at"] = now
         if rule_verified:
             item["last_verified_at"] = now
@@ -4218,7 +4225,9 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
     if account_id:
         states = item.setdefault("account_states", {})
         state = states.setdefault(account_id, {})
-        state.update({"visible": True, "qualification_state": state.get("qualification_state", "unknown"),
+        state.update({"visible": True,
+                      "qualification_state": candidate_qualification if candidate_qualification in CAMPAIGN_QUALIFICATION_STATES else state.get("qualification_state", "unknown"),
+                      "qualification_basis": candidate_qualification_basis,
                       "last_seen_at": now, "provider_id": provider_id})
     return item
 

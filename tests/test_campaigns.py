@@ -61,6 +61,24 @@ def test_running_agent_status_is_recovered_after_server_restart(tmp_path, monkey
     assert row["missing_fields"]
 
 
+def test_account_specific_campaign_qualification_is_projected_to_card_and_account_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    row = upstream._merge_campaign_candidate(items, {
+        "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu", "external_id": "xhs:44697",
+        "title": "光遇联动狂欢月创作征集", "organizer": "小红书创作服务平台",
+        "source_url": "https://fe.xiaohongshu.com/ditto/vincent/page1", "source_type": "creator_events_api_v2",
+        "source_status": "verified", "account_id": "xhs-account-1",
+        "qualification_state": "eligible", "qualification_basis": "创作者后台已向当前账号返回可执行活动任务。",
+        "content_requirements": ["发布#光遇 话题笔记"], "submission_spec": {"formats": ["image_text", "video"]},
+        "evidence": {"kind": "creator_account_activity", "account_id": "xhs-account-1"},
+    })
+    assert row["qualification_state"] == "eligible"
+    assert "可执行活动任务" in row["qualification_basis"]
+    assert row["account_states"]["xhs-account-1"]["qualification_state"] == "eligible"
+    assert "可执行活动任务" in row["account_states"]["xhs-account-1"]["qualification_basis"]
+
+
 def test_campaign_import_is_not_presented_as_verified(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     created = asyncio.run(upstream.api_campaign_create(_campaign()))

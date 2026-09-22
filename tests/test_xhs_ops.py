@@ -11,7 +11,7 @@ from ripple.accounts import AccountInput
 from ripple.api import install
 from ripple.publishing import WorkflowError
 from ripple.workspace import WorkspaceService
-from ripple.xhs_browser import _metrics, parse_note_url, public_note_url
+from ripple.xhs_browser import _creator_activity_rows, _creator_task_detail, _metrics, parse_note_url, public_note_url
 
 
 def connected_service(tmp_path: Path) -> tuple[WorkspaceService, str]:
@@ -46,6 +46,44 @@ def fake_read_result(action: str) -> dict:
     if action == "comments":
         return {"state": "success", "data": {"note_id": "note123", "count": 1, "comments": [{"id": "c1", "nickname": "读者", "content": "怎么做？", "time": 1, "time_str": "", "like": "2", "parent": ""}], "_locators": [{"note_id": "note123", "url": locator}]}}
     raise AssertionError(action)
+
+
+def test_creator_activity_rows_use_activity_list_only_and_keep_topics_nested():
+    payload = {"data": {"activity_list": [{
+        "activity_id": 44697, "activity_name": "光遇联动狂欢月创作征集",
+        "page_id": "page1", "instance_id": 327001,
+        "start_time": 1790000000000, "end_time": 1791000000000,
+        "activity_link": "https://fe.xiaohongshu.com/ditto/vincent/page1?resource_instance_id=327001",
+        "activity_reward": "参与投稿瓜分10W现金",
+        "topic_infos": [{"id": "topic1", "name": "光遇", "link": "xhsdiscover://topic/v2/topic1"}],
+    }]}}
+    rows = _creator_activity_rows(payload, limit=20)
+    assert len(rows) == 1
+    assert rows[0]["external_id"] == "44697"
+    assert rows[0]["title"] == "光遇联动狂欢月创作征集"
+    assert rows[0]["reward_summary"] == "参与投稿瓜分10W现金"
+    assert rows[0]["topics"] == [{"id": "topic1", "name": "光遇", "link": "xhsdiscover://topic/v2/topic1"}]
+
+
+def test_creator_task_detail_maps_publish_topic_rewards_and_account_eligibility():
+    payload = {"data": {"enabled": 1, "status": 1, "score_name": "积分", "tasks": [
+        {"event_type": "follow_user", "name": "关注@闪耀暖暖 官方账号", "description": "可获得10积分", "finished": False,
+         "status": {"button_name": "去关注"}, "progress_info": {"current": 0, "total": 1}, "extend_field": {}},
+        {"event_type": "post_note", "name": "发布#闪耀暖暖进组了 话题笔记", "description": "可获得10积分, 已完成 0/3", "finished": False,
+         "status": {"button_name": "去发布"}, "progress_info": {"current": 0, "total": 3},
+         "extend_field": {"publish_note_topic": '[{"name":"闪耀暖暖进组了"}]'}},
+        {"event_type": "booster", "name": "邀请好友助力", "description": "可获得10积分", "finished": False,
+         "status": {"button_name": "去邀请"}, "progress_info": {"current": 0, "total": 3},
+         "extend_field": {"booster_invite_card": '{"title":"参与投稿瓜分10W现金！","desc":"闪耀暖暖有奖主题活动开启！参与活动赢丰厚好礼！"}'}},
+    ]}}
+    detail = _creator_task_detail(payload, "参与投稿瓜分10W现金")
+    assert detail["qualification_state"] == "eligible"
+    assert detail["required_topics"] == ["闪耀暖暖进组了"]
+    assert detail["content_requirements"] == ["发布#闪耀暖暖进组了 话题笔记"]
+    assert detail["submission_spec"]["formats"] == ["image_text", "video"]
+    assert detail["submission_spec"]["submission_method"] == "通过活动页带指定话题发布笔记"
+    assert any("关注@闪耀暖暖" in row for row in detail["reward_rules"])
+    assert any("瓜分10W现金" in row for row in detail["prizes"])
 
 
 def test_note_url_and_metrics_are_public_safe():

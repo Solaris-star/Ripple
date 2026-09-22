@@ -7,6 +7,7 @@ private profile. Public projections are sanitized by :mod:`xhs_ops`.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
 
 XHS_HOSTS = {"xiaohongshu.com", "www.xiaohongshu.com", "creator.xiaohongshu.com"}
 NOTE_PATH_RE = re.compile(r"/(?:explore|discovery/item|item)/([0-9A-Za-z]+)")
+CREATOR_DETAIL_CACHE_TTL = 24 * 60 * 60
 CARD_JS = r"""(limit) => {
   const seen = new Set(); const out = [];
   const anchors = Array.from(document.querySelectorAll("a[href*='/explore/'],a[href*='/discovery/item/'],a[href*='/item/']"));
@@ -121,6 +123,146 @@ def _campaign_candidates(value: Any, *, limit: int = 50) -> list[dict[str, Any]]
 
     walk(value)
     return rows[:limit]
+
+def _creator_activity_rows(value: Any, *, limit: int = 50) -> list[dict[str, Any]]:
+    if not isinstance(value, dict):
+        return []
+    data = value.get('data') if isinstance(value.get('data'), dict) else {}
+    values = data.get('activity_list') if isinstance(data.get('activity_list'), list) else []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, dict):
+            continue
+        activity_id = str(raw.get('activity_id') or '').strip()[:160]
+        title = str(raw.get('activity_name') or '').strip()[:240]
+        if not activity_id or not title or activity_id in seen:
+            continue
+        seen.add(activity_id)
+        topics: list[dict[str, str]] = []
+        for topic in raw.get('topic_infos') if isinstance(raw.get('topic_infos'), list) else []:
+            if not isinstance(topic, dict):
+                continue
+            name = str(topic.get('name') or '').strip()[:120]
+            if name:
+                topics.append({'id': str(topic.get('id') or '')[:100], 'name': name,
+                               'link': str(topic.get('link') or '')[:2048]})
+        rows.append({
+            'external_id': activity_id, 'title': title,
+            'url': str(raw.get('activity_link') or '')[:2048],
+            'starts_at': raw.get('start_time') or '', 'ends_at': raw.get('end_time') or '',
+            'description': str(raw.get('activity_reward') or '')[:1200],
+            'reward_summary': str(raw.get('activity_reward') or '')[:600],
+            'page_id': str(raw.get('page_id') or '')[:100],
+            'instance_id': str(raw.get('instance_id') or '')[:100],
+            'publish_url': str(raw.get('pc_post_link') or '')[:2048],
+            'activity_status': int(raw.get('activity_status') or 0),
+            'topics': topics[:20],
+        })
+        if len(rows) >= limit:
+            break
+    return rows
+
+def _creator_task_detail(value: Any, body: str = '') -> dict[str, Any]:
+    data = value.get('data') if isinstance(value, dict) and isinstance(value.get('data'), dict) else {}
+    tasks = data.get('tasks') if isinstance(data.get('tasks'), list) else []
+    topics: list[str] = []
+    content_requirements: list[str] = []
+    reward_rules: list[str] = []
+    prizes: list[str] = []
+    account_tasks: list[dict[str, Any]] = []
+    post_note = False
+    for task in tasks[:100]:
+        if not isinstance(task, dict):
+            continue
+        name = re.sub(r'\s+', ' ', str(task.get('name') or '')).strip()[:240]
+        desc = re.sub(r'\s+', ' ', str(task.get('description') or '')).strip()[:240]
+        event_type = str(task.get('event_type') or '')[:80]
+        finished = bool(task.get('finished'))
+        status = task.get('status') if isinstance(task.get('status'), dict) else {}
+        account_tasks.append({'name': name, 'event_type': event_type, 'finished': finished,
+                              'button_name': str(status.get('button_name') or '')[:80],
+                              'progress': task.get('progress_info') if isinstance(task.get('progress_info'), dict) else {}})
+        if name and desc:
+            rule = f'{name}：{desc}'
+            if rule not in reward_rules:
+                reward_rules.append(rule)
+        if event_type == 'post_note':
+            post_note = True
+            if name and name not in content_requirements:
+                content_requirements.append(name)
+            for match in re.findall(r'#([^#\s]+)', name):
+                topic = match.strip('，。；;、')[:120]
+                if topic and topic not in topics:
+                    topics.append(topic)
+            extend = task.get('extend_field') if isinstance(task.get('extend_field'), dict) else {}
+            raw_topics = extend.get('publish_note_topic')
+            if isinstance(raw_topics, str) and raw_topics.strip():
+                try:
+                    parsed = json.loads(raw_topics)
+                except (ValueError, TypeError):
+                    parsed = []
+                if isinstance(parsed, list):
+                    for row in parsed:
+                        if isinstance(row, dict):
+                            topic = str(row.get('name') or '').strip()[:120]
+                            if topic and topic not in topics:
+                                topics.append(topic)
+        extend = task.get('extend_field') if isinstance(task.get('extend_field'), dict) else {}
+        invite = extend.get('booster_invite_card')
+        if isinstance(invite, str) and invite.strip():
+            try:
+                invite = json.loads(invite)
+            except (ValueError, TypeError):
+                invite = {}
+        if isinstance(invite, dict):
+            for key in ('title', 'desc'):
+                text = re.sub(r'\s+', ' ', str(invite.get(key) or '')).strip()[:300]
+                if text and re.search(r'(现金|奖金|奖池|瓜分|奖品|礼包|流量|积分|奖励)', text) and text not in prizes:
+                    prizes.append(text)
+    completed = sum(1 for row in account_tasks if row.get('finished') is True)
+    enabled = int(data.get('enabled') or 0) == 1 and int(data.get('status') or 0) == 1
+    qualification_state = 'eligible' if enabled and post_note else 'unknown'
+    return {
+        'eligibility': [],
+        'content_requirements': content_requirements[:30], 'required_topics': topics[:20],
+        'reward_rules': reward_rules[:30], 'prizes': prizes[:20], 'winning_conditions': [],
+        'submission_spec': {'formats': ['image_text', 'video'] if post_note else [],
+                            'content_directions': [f'围绕 #{topic} 创作' for topic in topics[:12]],
+                            'style_requirements': [],
+                            'submission_method': '通过活动页带指定话题发布笔记' if post_note else '',
+                            'required_mentions': [], 'required_music': []},
+        'qualification_state': qualification_state,
+        'qualification_basis': '创作者后台已向当前账号返回可执行投稿任务。' if qualification_state == 'eligible' else '活动对当前账号可见，但平台未返回明确的账号参赛资格结论。',
+        'account_tasks': account_tasks[:50],
+        'task_progress': {'total': len(account_tasks), 'completed': completed,
+                          'pending': max(0, len(account_tasks) - completed),
+                          'score_name': str(data.get('score_name') or '')[:80]},
+        'detail_source': 'creator_task_api' if tasks else 'creator_event_page',
+        'detail_start_time': data.get('start_time') or '', 'detail_end_time': data.get('end_time') or '',
+    }
+
+def _creator_detail_cache_path(directory: Path) -> Path:
+    return directory / 'xhs-creator-event-details.json'
+
+
+def _read_creator_detail_cache(directory: Path) -> dict[str, Any]:
+    path = _creator_detail_cache_path(directory)
+    try:
+        if not path.is_file() or path.stat().st_size > 4 * 1024 * 1024:
+            return {}
+        value = json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _write_creator_detail_cache(directory: Path, value: dict[str, Any]) -> None:
+    path = _creator_detail_cache_path(directory)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix('.tmp')
+    temp.write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
+    os.replace(temp, path)
 
 COMMENT_TARGET_COUNT_JS = r"""([id,nickname,content]) => {
   const uniq=[];
@@ -334,60 +476,112 @@ def account_notes(directory: Path, limit: int) -> dict[str, Any]:
         _close(p, context)
 
 
-def creator_events(directory: Path, limit: int = 30) -> dict[str, Any]:
+def creator_events(directory: Path, limit: int = 30, detail_limit: int = 8) -> dict[str, Any]:
     p, context, page = _launch(directory)
-    payloads: list[Any] = []
+    activity_payload: dict[str, Any] | None = None
     try:
         def on_response(response):
-            lower = response.url.lower()
-            if not any(token in lower for token in ("event", "activity", "campaign", "mission", "task", "inspire")):
+            nonlocal activity_payload
+            if '/creator/activity_center/list' not in response.url:
                 return
             try:
-                if "json" in (response.headers.get("content-type") or "").lower():
-                    value = response.json()
-                    if isinstance(value, (dict, list)) and len(payloads) < 40:
-                        payloads.append(value)
+                if 'json' not in (response.headers.get('content-type') or '').lower():
+                    return
+                value = response.json()
+                if isinstance(value, dict) and isinstance(value.get('data'), dict) and isinstance(value['data'].get('activity_list'), list):
+                    activity_payload = value
             except Exception:
                 pass
 
-        page.on("response", on_response)
-        _goto(page, "https://creator.xiaohongshu.com/new/events", wait=2600)
-        body = ""
+        page.on('response', on_response)
+        _goto(page, 'https://creator.xiaohongshu.com/new/events', wait=2600)
+        try: page.remove_listener('response', on_response)
+        except Exception: pass
+        body = ''
         try:
-            body = (page.locator("body").inner_text(timeout=1500) or "")[:5000]
+            body = (page.locator('body').inner_text(timeout=1500) or '')[:5000]
         except Exception:
             pass
-        if "login" in (page.url or "").lower() or ("登录" in body and ("扫码" in body or "手机号" in body)):
-            raise XhsBrowserError("login_required")
-        for _ in range(2):
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(700)
+        if 'login' in (page.url or '').lower() or ('登录' in body and ('扫码' in body or '手机号' in body)):
+            raise XhsBrowserError('login_required')
+
+        raw_count = 0
         items: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for payload in payloads:
-            for row in _campaign_candidates(payload, limit=max(limit * 2, 30)):
-                key = (row.get("external_id") or row.get("url") or row.get("title") or "").casefold()
-                if key and key not in seen:
-                    seen.add(key); items.append(row)
-                    if len(items) >= limit: break
-            if len(items) >= limit: break
-        source = "creator_events_api"
+        if activity_payload:
+            values = ((activity_payload.get('data') or {}).get('activity_list') or [])
+            raw_count = len(values) if isinstance(values, list) else 0
+            items = _creator_activity_rows(activity_payload, limit=max(1, min(limit, 50)))
+        source = 'creator_activity_center_api'
         if not items:
-            source = "creator_events_dom"
+            source = 'creator_events_dom'
             raw = page.evaluate(CREATOR_EVENTS_JS, max(1, min(limit, 50))) or []
             for row in raw:
-                if not isinstance(row, dict): continue
-                title = str(row.get("title") or "").strip()[:240]
-                if not title: continue
-                items.append({
-                    "external_id": "",
-                    "title": title,
-                    "url": str(row.get("url") or "")[:2048],
-                    "starts_at": "",
-                    "ends_at": "",
-                    "description": str(row.get("text") or "")[:3000],
-                })
-        return {"items": items[:limit], "source": source, "page_url": (page.url or "")[:2048]}
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get('title') or '').strip()[:240]
+                if not title:
+                    continue
+                items.append({'external_id': '', 'title': title, 'url': str(row.get('url') or '')[:2048],
+                              'starts_at': '', 'ends_at': '', 'description': str(row.get('text') or '')[:3000]})
+
+        detail_cache = _read_creator_detail_cache(directory)
+        cache_changed = False
+        now = int(time.time())
+        detail_count = 0
+        detail_fetched = 0
+        fetch_budget = max(0, min(int(detail_limit), 20))
+        for item in items:
+            cache_key = str(item.get('external_id') or item.get('page_id') or '')[:160]
+            url = str(item.get('url') or '')
+            cached = detail_cache.get(cache_key) if cache_key else None
+            if (isinstance(cached, dict) and cached.get('url') == url
+                    and now - int(cached.get('at') or 0) < CREATOR_DETAIL_CACHE_TTL
+                    and isinstance(cached.get('detail'), dict)):
+                item.update(cached['detail'])
+                detail_count += 1
+                continue
+            if detail_fetched >= fetch_budget:
+                continue
+            try:
+                parsed = urlsplit(url)
+            except ValueError:
+                continue
+            if parsed.scheme != 'https' or not parsed.hostname or not _host_ok(parsed.hostname):
+                continue
+            task_payload: dict[str, Any] | None = None
+            def on_detail(response):
+                nonlocal task_payload
+                if 'preview_task_list' not in response.url:
+                    return
+                try:
+                    value = response.json()
+                    if isinstance(value, dict):
+                        task_payload = value
+                except Exception:
+                    pass
+            page.on('response', on_detail)
+            try:
+                _goto(page, url, wait=3000)
+                if task_payload:
+                    detail = _creator_task_detail(task_payload)
+                    item.update(detail)
+                    detail_count += 1
+                    if cache_key and detail.get('detail_source') == 'creator_task_api':
+                        detail_cache[cache_key] = {'at': now, 'url': url, 'detail': detail}
+                        cache_changed = True
+            except Exception:
+                pass
+            finally:
+                try: page.remove_listener('response', on_detail)
+                except Exception: pass
+            detail_fetched += 1
+        if cache_changed:
+            if len(detail_cache) > 200:
+                detail_cache = dict(sorted(detail_cache.items(), key=lambda pair: int((pair[1] or {}).get('at') or 0), reverse=True)[:200])
+            _write_creator_detail_cache(directory, detail_cache)
+        return {'items': items[:limit], 'source': source,
+                'page_url': 'https://creator.xiaohongshu.com/new/events',
+                'raw_count': raw_count, 'detail_count': detail_count, 'detail_fetched': detail_fetched}
     finally:
         _close(p, context)
 
@@ -581,7 +775,7 @@ def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
     if action=='feed': return feed(directory,limit)
     if action=='search': return search(directory,str(params.get('query') or ''),limit)
     if action=='notes': return account_notes(directory,limit)
-    if action=='events': return creator_events(directory,limit)
+    if action=='events': return creator_events(directory,limit,max(0,min(int(params.get('detail_limit') or 8),20)))
     if action=='note': return note_detail(directory,str(params.get('url') or ''))
     if action=='comments': return comments(directory,str(params.get('url') or ''),limit)
     if action=='reply': return reply(directory,str(params.get('url') or ''),list(params.get('items') or []))

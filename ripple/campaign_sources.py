@@ -1130,26 +1130,48 @@ class CampaignSourceService:
         account, status = self._effective_account("xiaohongshu", str(state["xiaohongshu"].get("account_id") or ""))
         if status != "ready" or not account:
             raise WorkflowError("小红书活动源需要已连接的创作者账号。", 409)
-        payload = self.workspace.xhs_ops.events(str(account["id"]), 40)
+        payload = self.workspace.xhs_ops.events(str(account["id"]), 40, detail_limit=8)
         rows = []
         for item in payload.get("items", []):
             title = str(item.get("title") or "").strip()
             if not title:
                 continue
             url = _safe_url(str(item.get("url") or ""), ("xiaohongshu.com", "creator.xiaohongshu.com"))
+            topic_names = [str(x.get("name") or "")[:120] for x in item.get("topics", []) if isinstance(x, dict) and str(x.get("name") or "").strip()]
+            required_topics = [str(x)[:120] for x in item.get("required_topics", []) if str(x).strip()]
+            for topic in topic_names:
+                if topic and topic not in required_topics:
+                    required_topics.append(topic)
+            reward_summary = str(item.get("reward_summary") or item.get("description") or "")[:600]
+            qualification = str(item.get("qualification_state") or "unknown")
+            if qualification not in {"eligible", "ineligible", "unknown"}:
+                qualification = "unknown"
             rows.append({
                 "provider_id": "xiaohongshu_creator_events", "platform": "xiaohongshu",
                 "external_id": ("xhs:" + str(item.get("external_id"))) if item.get("external_id") else "",
                 "title": title[:240], "organizer": "小红书创作服务平台", "organizer_type": "platform",
-                "activity_type": "创作活动", "reward_type": "", "reward_summary": "",
+                "activity_type": "创作活动", "reward_type": "", "reward_summary": reward_summary,
                 "summary": str(item.get("description") or "")[:1200],
-                "starts_at": _date_from_unix(item.get("starts_at")),
-                "submit_deadline": _date_from_unix(item.get("ends_at")),
+                "starts_at": _date_from_unix(item.get("detail_start_time") or item.get("starts_at")),
+                "submit_deadline": _date_from_unix(item.get("detail_end_time") or item.get("ends_at")),
+                "eligibility": [str(x)[:240] for x in item.get("eligibility", []) if str(x).strip()][:20],
+                "content_requirements": [str(x)[:240] for x in item.get("content_requirements", []) if str(x).strip()][:30],
+                "prizes": [str(x)[:240] for x in item.get("prizes", []) if str(x).strip()][:30],
+                "winning_conditions": [str(x)[:240] for x in item.get("winning_conditions", []) if str(x).strip()][:30],
+                "reward_rules": [str(x)[:240] for x in item.get("reward_rules", []) if str(x).strip()][:30],
+                "required_topics": required_topics[:20],
+                "submission_spec": item.get("submission_spec") if isinstance(item.get("submission_spec"), dict) else {},
+                "qualification_state": qualification,
+                "qualification_basis": str(item.get("qualification_basis") or "unknown")[:600],
                 "source_url": url or "https://creator.xiaohongshu.com/new/events",
                 "source_type": str(payload.get("source") or "creator_events"),
                 "source_status": "verified", "note": str(item.get("description") or "")[:3000],
                 "account_id": str(account["id"]),
-                "evidence": {"kind": "creator_account", "account_id": str(account["id"]),
+                "evidence": {"kind": "creator_account_activity", "account_id": str(account["id"]),
+                             "activity_id": str(item.get("external_id") or "")[:160],
+                             "page_id": str(item.get("page_id") or "")[:100],
+                             "instance_id": str(item.get("instance_id") or "")[:100],
+                             "task_progress": item.get("task_progress") if isinstance(item.get("task_progress"), dict) else {},
                              "url": url or "https://creator.xiaohongshu.com/new/events"},
             })
         return rows

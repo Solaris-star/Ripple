@@ -413,12 +413,29 @@ def test_xiaohongshu_source_uses_connected_creator_account_and_marks_account_evi
     ))
     with workspace.store.transaction() as state:
         state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u1"})
-    monkeypatch.setattr(workspace.xhs_ops, "events", lambda account_id, limit: {
-        "source": "creator_events_api",
-        "items": [{"external_id": "x1", "title": "小红书创作活动", "url": "https://creator.xiaohongshu.com/new/events",
-                   "starts_at": "", "ends_at": "", "description": "官方创作服务平台活动"}],
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda account_id, limit, detail_limit=5: {
+        "source": "creator_events_api_v2", "raw_count": 250, "detail_count": 1,
+        "items": [{
+            "external_id": "x1", "title": "小红书创作活动",
+            "url": "https://fe.xiaohongshu.com/ditto/vincent/page1?resource_instance_id=1",
+            "starts_at": 1790000000000, "ends_at": 1791000000000,
+            "description": "参与投稿瓜分10W现金", "reward_summary": "参与投稿瓜分10W现金",
+            "topics": [{"id": "t1", "name": "测试话题", "link": "xhsdiscover://topic/v2/t1"}],
+            "content_requirements": ["发布#测试话题 话题笔记"],
+            "prizes": ["参与投稿瓜分10W现金"],
+            "reward_rules": ["发布#测试话题 话题笔记：可获得10积分"],
+            "required_topics": ["测试话题"],
+            "submission_spec": {"formats": ["image_text", "video"], "submission_method": "通过活动页带指定话题发布笔记"},
+            "qualification_state": "eligible", "qualification_basis": "创作者后台已向当前账号返回可执行活动任务。",
+            "page_id": "page1", "instance_id": "1",
+        }],
     })
     rows = service._xiaohongshu(service._state())
     assert rows[0]["account_id"] == account["id"]
-    assert rows[0]["evidence"]["kind"] == "creator_account"
-    assert rows[0]["source_type"] == "creator_events_api"
+    assert rows[0]["evidence"]["kind"] == "creator_account_activity"
+    assert rows[0]["source_type"] == "creator_events_api_v2"
+    assert rows[0]["required_topics"] == ["测试话题"]
+    assert rows[0]["content_requirements"] == ["发布#测试话题 话题笔记"]
+    assert rows[0]["prizes"] == ["参与投稿瓜分10W现金"]
+    assert rows[0]["submission_spec"]["formats"] == ["image_text", "video"]
+    assert rows[0]["qualification_state"] == "eligible"
