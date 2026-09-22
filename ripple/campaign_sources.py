@@ -22,6 +22,9 @@ import uuid
 
 import httpx
 
+from filelock import FileLock, Timeout as FileLockTimeout
+
+from .campaign_schedule import CampaignPaidSchedule, DAILY_TIMES, TIMEZONE
 from .ai_providers import AIProviderService
 from .campaign_enrichment import evidence_fingerprint, infer_submission_spec, normalize_submission_spec
 from .publishing import WorkflowError
@@ -30,7 +33,7 @@ from .secrets import protect
 
 SYNC_INTERVALS = {
     "bilibili": 30 * 60,
-    "x": 2 * 60 * 60,
+    "x": 0,  # Billed discovery uses daily slots, never a rolling interval.
     "xiaohongshu": 60 * 60,
     "douyin": 60 * 60,
 }
@@ -472,6 +475,8 @@ class CampaignSourceService:
         self.secret_path = workspace.private / "integrations" / "campaign-source-tikhub.secret"
         self.bilibili_detail_cache_path = workspace.private / "integrations" / "campaign-bilibili-details.json"
         self._lock = threading.Lock()
+        self.paid_schedule = CampaignPaidSchedule(workspace.private / "integrations" / "campaign-paid-slots.json")
+        self._refresh_lock_path = workspace.private / "integrations" / "campaign-refresh.lock"
 
     def _empty(self) -> dict[str, Any]:
         return {
@@ -716,7 +721,21 @@ class CampaignSourceService:
     def sync_interval(self, platform: str) -> int:
         return int(SYNC_INTERVALS.get(platform, 60 * 60))
 
+    def _paid_only(self, platform: str) -> bool:
+        if platform == "x":
+            return True
+        if platform == "douyin":
+            cfg = self._state()["douyin"]
+            _, status = self._effective_account("douyin", str(cfg.get("account_id") or ""))
+            return status != "ready" and bool(cfg.get("tikhub_enabled")) and bool(self._tikhub_key())
+        return False
+
+    def _paid_key(self, platform: str) -> str:
+        return {"x": "x:discovery", "bilibili": "bilibili:rules", "douyin": "douyin:fallback"}.get(platform, "")
+
     def next_sync_at(self, platform: str) -> int:
+        if self._paid_only(platform):
+            return self.paid_schedule.next_at(self._paid_key(platform))
         row = self._state()["last_sync"].get(platform, {})
         at = int(row.get("last_attempt_at") or row.get("at") or 0)
         return at + self.sync_interval(platform) if at else 0
@@ -787,8 +806,21 @@ class CampaignSourceService:
         ]
         for row in rows:
             platform = str(row.get("platform") or "")
-            row["sync_interval_seconds"] = self.sync_interval(platform)
+            paid_only = self._paid_only(platform)
+            row["sync_interval_seconds"] = 0 if paid_only else self.sync_interval(platform)
             row["next_sync_at"] = self.next_sync_at(platform) if row.get("automatic") else 0
+            row["schedule"] = {
+                "mode": "daily_slots" if paid_only else "interval" if row.get("automatic") else "manual",
+                "timezone": TIMEZONE, "times": list(DAILY_TIMES),
+                "interval_seconds": row["sync_interval_seconds"],
+                "next_run_at": row["next_sync_at"],
+                "cost": "paid" if paid_only else "free_primary",
+            }
+            if platform == "bilibili":
+                row["schedule"]["paid_note"] = "自动 Agent 规则补全仅在 09:00、14:00、20:00（北京时间）执行"
+            if platform == "douyin" and tikhub_enabled:
+                row["schedule"]["paid_note"] = "收费备用仅在 09:00、14:00、20:00（北京时间）自动尝试"
+            row["last_sync"] = {**row.get("last_sync", {}), "next_run_at": row["next_sync_at"]}
         return {"items": rows, "automatic_count": sum(1 for row in rows if row["automatic"]),
                 "revision": state["revision"], "server_now": int(time.time())}
 
@@ -800,7 +832,7 @@ class CampaignSourceService:
         success_count = int(count) if status == "fresh" else int(previous.get("last_success_count") or (previous.get("count") if previous.get("status") == "fresh" else 0) or 0)
         state["last_sync"][platform] = {
             "at": now, "last_attempt_at": now, "last_success_at": success_at,
-            "last_success_count": success_count, "next_run_at": now + self.sync_interval(platform),
+            "last_success_count": success_count,
             "status": status, "count": int(count), "error": str(error or "")[:300],
             "provider": provider, "fallback_used": bool(fallback_used),
         }
@@ -811,6 +843,12 @@ class CampaignSourceService:
         # Successful and failed attempts both observe the platform interval.
         # Manual force refresh is the explicit bypass; the background scheduler
         # must never hammer a broken or paid provider every two seconds.
+        if self._paid_only(platform):
+            return not self.paid_schedule.available(self._paid_key(platform))
+        if platform == "bilibili" and self.paid_schedule.available("bilibili:rules"):
+            return False
+        if platform == "douyin" and self._state()["douyin"].get("tikhub_enabled") and self.paid_schedule.available("douyin:fallback"):
+            return False
         return bool(
             float(row.get("last_attempt_at") or row.get("at") or 0) > 0
             and time.time() - float(row.get("last_attempt_at") or row.get("at") or 0) < self.sync_interval(platform)
@@ -1469,17 +1507,44 @@ class CampaignSourceService:
             })
         return rows
 
-    def refresh(self, platforms: list[str] | None = None, *, force: bool = False) -> dict[str, Any]:
-        wanted = [p for p in (platforms or ["bilibili", "x", "xiaohongshu", "douyin"])
-                  if p in {"bilibili", "x", "xiaohongshu", "douyin"}]
-        state = self._state()
+    def refresh(self, platforms: list[str] | None = None, *, force: bool = False,
+                allow_paid: bool = False) -> dict[str, Any]:
+        capabilities = {row["platform"]: row for row in self.public_state()["items"]}
+        if platforms is not None and (not platforms or any(p not in capabilities for p in platforms)):
+            raise WorkflowError("必须明确选择有效的活动平台，空列表不会刷新全部来源。", 422)
+        wanted = list(dict.fromkeys(platforms)) if platforms is not None else [
+            p for p, row in capabilities.items() if row.get("automatic")
+        ]
         results = []
-        with self._lock:
+        self._refresh_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # Do not queue duplicate refreshes behind a slow browser/model call.
+        lock = FileLock(str(self._refresh_lock_path), timeout=0)
+        try:
+            lock.acquire()
+        except FileLockTimeout:
+            return {"results": [{"platform": p, "status": "busy", "items": [], "count": 0,
+                                  "error": "活动采集正在执行，请稍后重试。"} for p in wanted],
+                    "sources": self.public_state()}
+        try:
+            state = self._state()
+            admitted_at = time.time()
+            recent = {p: self._recent(p) for p in wanted if capabilities[p].get("automatic")}
             for platform in wanted:
-                if not force and self._recent(platform):
+                capability = capabilities[platform]
+                if not capability.get("automatic"):
+                    results.append({"platform": platform, "status": capability.get("status", "manual"),
+                                    "items": [], "count": 0, "error": capability.get("detail", "来源未就绪")})
+                    continue
+                if not force and recent.get(platform):
                     results.append({"platform": platform, "status": "cached", "items": [], "count": 0})
                     continue
                 try:
+                    paid_key = self._paid_key(platform)
+                    # Capture one admission time for the whole serial batch.
+                    paid_slot = self.paid_schedule.claim(paid_key, admitted_at) if paid_key and (not force or platform == "x") else False
+                    if self._paid_only(platform) and not force and not paid_slot:
+                        results.append({"platform": platform, "status": "cached", "items": [], "count": 0})
+                        continue
                     fallback_used = False
                     provider = ""
                     if platform == "bilibili":
@@ -1504,18 +1569,23 @@ class CampaignSourceService:
                         except WorkflowError:
                             if not state["douyin"].get("tikhub_enabled") or not self._tikhub_key():
                                 raise
+                            if not paid_slot and not (force and allow_paid):
+                                raise WorkflowError("免费后台读取失败；收费备用将在 09:00、14:00、20:00（北京时间）尝试，当前未调用。", 503) from None
                             items = self._tikhub(); provider = "tikhub_douyin"; fallback_used = True
                     self._record_sync(platform, status="fresh", count=len(items), provider=provider,
                                       fallback_used=fallback_used)
                     results.append({"platform": platform, "status": "fresh", "items": items,
                                     "count": len(items), "provider": provider,
+                                    "rules_allowed": bool(paid_slot or (platform == "x" and force and allow_paid)),
                                     "fallback_used": fallback_used})
-                except WorkflowError as exc:
+                except (WorkflowError, OSError, ValueError) as exc:
                     previous = self._state()["last_sync"].get(platform, {})
-                    status = "stale" if previous.get("status") == "fresh" or previous.get("count") else (
-                        "needs_login" if exc.status == 409 else "error")
+                    status = "stale" if previous.get("last_success_at") or previous.get("count") else (
+                        "needs_login" if isinstance(exc, WorkflowError) and exc.status == 409 else "error")
                     self._record_sync(platform, status=status, count=int(previous.get("count") or 0),
                                       error=str(exc), provider=str(previous.get("provider") or ""))
                     results.append({"platform": platform, "status": status, "items": [], "count": 0,
                                     "error": str(exc)[:300]})
+        finally:
+            lock.release()
         return {"results": results, "sources": self.public_state()}

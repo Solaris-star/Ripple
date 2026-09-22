@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   cancelCampaignEnrichment, configureCampaignSource, createCampaign, createIdea, createSchedule, enrichCampaign,
-  fetchCampaignEnrichmentPreview, fetchCampaignEnrichmentStatus, fetchCampaignPage, fetchCampaignSources,
+  fetchCampaignEnrichmentStatus, fetchCampaignPage, fetchCampaignSources,
   fetchXCampaignEnrichmentStatus,
-  fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, refreshXhsCampaignDetail, runCampaignEnrichment,
+  fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, refreshXhsCampaignDetail,
   saveCampaign, updateCampaign, verifyCampaign,
 } from '../lib/api';
 import type {
-  Campaign, CampaignEnrichmentPreview, CampaignEnrichmentStatus, CampaignInput, CampaignListSort, CampaignPageResponse, CampaignPlatform,
+  Campaign, CampaignEnrichmentStatus, CampaignInput, CampaignListSort, CampaignPageResponse, CampaignPlatform,
   CampaignSourceCapability, CampaignSubmissionSpec, IdeaRecommendation, IdeaRecommendResponse,
   PersonaItem, TopicUseContext, TrendGroup,
 } from '../lib/api';
@@ -264,11 +264,12 @@ export default function CampaignsPage({
   const [toast, setToast] = useState('');
   const [selected, setSelected] = useState<Campaign | null>(null);
   const [accounts, setAccounts] = useState<Account[]>([]);
-  const [refreshing, setRefreshing] = useState(false);
+  const [refreshingPlatforms, setRefreshingPlatforms] = useState<string[]>([]);
+  const refreshInFlightRef = useRef(new Set<string>());
+  const currentViewRef = useRef('');
   const [verifying, setVerifying] = useState(false);
   const [xhsDetailRefreshing, setXhsDetailRefreshing] = useState('');
   const [enrichingId, setEnrichingId] = useState('');
-  const [enrichmentPreview, setEnrichmentPreview] = useState<CampaignEnrichmentPreview | null>(null);
   const [enrichmentStatus, setEnrichmentStatus] = useState<CampaignEnrichmentStatus | null>(null);
   const [xEnrichmentStatus, setXEnrichmentStatus] = useState<CampaignEnrichmentStatus | null>(null);
   const enrichmentPhase = enrichmentStatus?.status || '';
@@ -298,6 +299,15 @@ export default function CampaignsPage({
   const [qualificationFilter, setQualificationFilter] = useState('all');
   const [accountFilter, setAccountFilter] = useState('all');
   const [sortMode, setSortMode] = useState<CampaignListSort>('recommend');
+  const currentSource = sources.find((source) => source.platform === platformFilter);
+  const refreshTargets = sources.filter((source) => source.automatic && (platformFilter === 'all' || source.platform === platformFilter)).map((source) => source.platform);
+  const refreshing = refreshTargets.some((platform) => refreshingPlatforms.includes(platform));
+  const canRefresh = refreshTargets.length > 0;
+  const refreshLabel = platformFilter === 'all' ? '刷新全部活动' : `刷新${platformLabel(platformFilter)}活动`;
+  const paidRefresh = sources.some((source) => refreshTargets.includes(source.platform) && (source.schedule?.cost === 'paid' || source.platform === 'x' || source.status === 'ready_fallback'));
+  const refreshHint = paidRefresh ? '当前范围包含收费来源，手动刷新会额外消耗 Token / 接口额度。' : '仅刷新当前范围的免费来源，不额外启动付费 Agent 或收费备用。';
+  const viewKey = JSON.stringify([platformFilter, accountFilter, sortMode, page, typeFilter, rewardFilter, deadlineFilter, qualificationFilter]);
+  currentViewRef.current = viewKey;
 
   const [form, setForm] = useState<CampaignInput | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
@@ -494,37 +504,38 @@ export default function CampaignsPage({
   }, []);
 
   const refreshNow = async () => {
-    if (refreshing) return;
-    const platforms = Array.from(new Set(sources.filter((source) => source.automatic).map((source) => source.platform)));
-    if (!platforms.length) { showToast('当前没有已就绪的自动活动源'); return; }
-    setRefreshing(true); setError('');
+    const platforms = [...refreshTargets];
+    const originView = viewKey;
+    if (!platforms.length) { showToast(currentSource?.detail || '当前范围没有已就绪的活动源'); return; }
+    if (platforms.some((platform) => refreshInFlightRef.current.has(platform))) return;
+    platforms.forEach((platform) => refreshInFlightRef.current.add(platform));
+    setRefreshingPlatforms(Array.from(refreshInFlightRef.current)); setError('');
     try {
-      const result = await refreshCampaigns(platforms, true);
-      setSelected((current) => current ? result.campaigns.find((row) => row.id === current.id) || current : null);
+      const result = await refreshCampaigns(platforms, true, paidRefresh);
       setSources(result.sources.items || []);
       setAutomaticCount(result.sources.automatic_count || 0);
-      setSourcesLoaded(true);
-      sourcesLoadedRef.current = true;
-      clearRetry();
-      setReconnecting(false);
-      setConnectionIssue('');
+      setSourcesLoaded(true); sourcesLoadedRef.current = true;
+      if (currentViewRef.current !== originView) return;
+      setSelected((current) => current ? result.campaigns.find((row) => row.id === current.id) || current : null);
+      clearRetry(); setReconnecting(false); setConnectionIssue('');
       const fresh = result.results.filter((row) => row.status === 'fresh');
-      const stale = result.results.filter((row) => row.status !== 'fresh' && row.status !== 'cached');
-      showToast(`已刷新 ${fresh.length} 个来源${stale.length ? `，${stale.length} 个来源需要处理` : ''}`);
-
-      if (platformFilter === 'xiaohongshu') {
-        snapshotIdRef.current = '';
-        setSnapshotChanged(false);
-        if (page !== 1) setPage(1);
-        else await load(false);
-      } else {
-        await load(false);
+      const failed = result.results.filter((row) => !['fresh', 'cached'].includes(row.status));
+      showToast(`${refreshLabel}：${fresh.length} 个来源完成${failed.length ? `，${failed.length} 个来源需要处理` : ''}`);
+      if (failed.length) setError(failed.map((row) => `${platformLabel(row.platform)}：${row.error || row.status}`).join('；'));
+      if (platformFilter === 'xiaohongshu' && fresh.some((row) => row.platform === 'xiaohongshu')) {
+        snapshotIdRef.current = ''; setSnapshotChanged(false);
+        if (page !== 1) setPage(1); else await loadRef.current(false);
+      } else if (fresh.length) {
+        await loadRef.current(false);
       }
     } catch (e) {
+      if (currentViewRef.current !== originView) return;
       if (isNetworkError(e)) markConnectionFailure();
       else setError(e instanceof Error ? e.message : '活动刷新失败');
+    } finally {
+      platforms.forEach((platform) => refreshInFlightRef.current.delete(platform));
+      setRefreshingPlatforms(Array.from(refreshInFlightRef.current));
     }
-    finally { setRefreshing(false); }
   };
 
   const verifySelected = async () => {
@@ -570,18 +581,6 @@ export default function CampaignsPage({
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Agent 补全失败');
     } finally { setEnrichingId(''); }
-  };
-
-  const openEnrichmentPreview = async () => {
-    try { setEnrichmentPreview(await fetchCampaignEnrichmentPreview()); }
-    catch (e) { setError(e instanceof Error ? e.message : '无法读取 Agent 补全预览'); }
-  };
-
-  const startGlobalEnrichment = async () => {
-    try {
-      const result = await runCampaignEnrichment(); setEnrichmentStatus(result.status); setEnrichmentPreview(null);
-      if (!result.started) showToast('当前没有需要 Agent 补全的 B站活动');
-    } catch (e) { setError(e instanceof Error ? e.message : '无法启动 Agent 补全'); }
   };
 
   const cancelGlobalEnrichment = async () => {
@@ -852,10 +851,9 @@ export default function CampaignsPage({
           <p className="page-subtitle">聚合 X、小红书、抖音、B站、微信公众号、微信视频号的创作活动与激励活动，结合热点生成选题灵感。</p>
         </div>
         <div className="campaign-head-actions">
-          <button className="btn btn-sm btn-primary" title="立即重新检查已启用的活动源；单个活动规则可在详情中单独重新核验" disabled={refreshing || loading || !sourcesLoaded} onClick={() => void refreshNow()}>
-            <IconRefresh size={13} /> {refreshing ? '刷新中…' : '刷新活动'}
+          <button className="btn btn-sm btn-primary" title={canRefresh ? refreshHint : currentSource?.detail || '当前没有已就绪来源'} disabled={refreshing || loading || !sourcesLoaded || !canRefresh} onClick={() => void refreshNow()}>
+            <IconRefresh size={13} /> {refreshing ? '刷新中…' : refreshLabel}
           </button>
-          <button className="btn btn-sm" onClick={() => void openEnrichmentPreview()} disabled={agentBatchActive}>✦ Agent 补全缺失规则</button>
           <button className="btn btn-sm" onClick={openImport}>+ 补充导入</button>
         </div>
       </div>
@@ -870,7 +868,7 @@ export default function CampaignsPage({
         <IconRefresh size={15} />
         <div>
           <strong>{sourcesLoaded ? `已就绪 ${automaticCount} 个自动活动源` : '活动源状态暂时无法读取'}</strong>
-          <span>活动源由 Ripple 后端定时同步，页面无需保持打开；右上角“刷新活动”可随时手动重新检查。收费备用源未经显式启用不会调用。</span>
+          <span>免费来源定期同步；消耗 Token / 接口额度的自动任务仅在北京时间 09:00、14:00、20:00 执行。手动刷新只处理当前平台范围，收费备用须明确启用。</span>
         </div>
         {enrichmentStatus && ['running', 'queued', 'cancelling'].includes(enrichmentStatus.status) && <div className="campaign-agent-progress"><strong>Agent 补全 {enrichmentStatus.done}/{enrichmentStatus.total}</strong><span>{enrichmentStatus.failed ? `失败 ${enrichmentStatus.failed} · ` : ''}按活动串行处理，避免重复 Token 消耗</span><button className="r2-text-button" onClick={() => void cancelGlobalEnrichment()}>取消</button></div>}
         {xEnrichmentStatus && ['running', 'queued'].includes(xEnrichmentStatus.status) && <div className="campaign-agent-progress"><strong>X 规则整理 {xEnrichmentStatus.done}/{xEnrichmentStatus.total}</strong><span>{xEnrichmentStatus.failed ? `失败 ${xEnrichmentStatus.failed} · ` : ''}逐条中文整理，已处理活动不会自动重复消耗 Token</span></div>}
@@ -881,7 +879,7 @@ export default function CampaignsPage({
           const now = clock + serverOffset;
           const lastSuccess = sync?.last_success_at || (sync?.status === 'fresh' ? sync.at : 0) || 0;
           const lastAttempt = sync?.last_attempt_at || sync?.at || 0;
-          const nextRun = sync?.next_run_at || source.next_sync_at || 0;
+          const nextRun = source.schedule?.next_run_at || source.next_sync_at || sync?.next_run_at || 0;
           const remaining = nextRun ? Math.max(0, nextRun - now) : 0;
           const configurable = ['x', 'xiaohongshu', 'douyin'].includes(source.platform);
           const selectedSource = platformFilter === source.platform;
@@ -902,10 +900,11 @@ export default function CampaignsPage({
               <span>{SOURCE_HEALTH[source.status || ''] || source.status || (source.automatic ? '自动同步' : '支持导入')}</span>
             </div>
             <p>{source.detail}</p>
-            {source.automatic && source.sync_interval_seconds ? <small>自动频率：{syncIntervalLabel(source.sync_interval_seconds)}</small> : null}
+            {source.automatic && <small>自动频率：{!source.schedule ? '等待后端加载采集计划' : source.schedule.mode === 'daily_slots' ? `每日 ${(source.schedule.times || []).join(' / ')}（北京时间）` : `每 ${syncIntervalLabel(source.sync_interval_seconds)}（免费来源）`}</small>}
+            {source.schedule?.paid_note && <small>{source.schedule.paid_note}</small>}
             {source.cost_note && <small>{source.cost_note}</small>}
             {lastSuccess > 0 && <small>最近成功采集：{new Date(lastSuccess * 1000).toLocaleString('zh-CN')}{sync?.last_success_count != null ? ` · ${sync.last_success_count} 条` : ''}</small>}
-            {source.automatic && nextRun > 0 ? <small>距离下次采集：<b className="campaign-sync-countdown">{formatCountdown(remaining)}</b></small> : null}
+            {source.automatic && nextRun > 0 ? <small>下次采集：{new Date(nextRun * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}（北京时间） · <b className="campaign-sync-countdown">{formatCountdown(remaining)}</b></small> : null}
             {sync?.error && <small className="error">上次采集失败：{lastAttempt ? new Date(lastAttempt * 1000).toLocaleString('zh-CN') : '未知'} · {sync.error}</small>}
             <div className="campaign-source-status-actions">
               {configurable && <button className="r2-text-button" onClick={() => openSourceEditor(source)}>配置</button>}
@@ -983,9 +982,13 @@ export default function CampaignsPage({
           {campaignsLoaded && visible.length === 0 && (
             <div className="campaign-empty">
               <IconCompass size={28} />
-              <strong>{hasSourceRows ? '当前筛选条件没有匹配活动' : '还没有已确认的创作活动'}</strong>
-              <p>{hasSourceRows ? '调整筛选条件继续查看。' : '可点击“刷新活动”从已就绪的数据源自动获取；手动导入用于补充遗漏活动。Ripple 不会用虚构活动填充这里。'}</p>
-              {!hasSourceRows && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing || !sourcesLoaded} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openImport}>补充导入</button></div>}
+              <strong>{hasSourceRows ? '当前筛选条件没有匹配活动' : currentSource && !currentSource.automatic ? `${currentSource.label}活动源尚未就绪` : '还没有已确认的创作活动'}</strong>
+              <p>{hasSourceRows ? '调整筛选条件继续查看。' : currentSource && !currentSource.automatic ? currentSource.detail : '手动刷新只获取当前范围的活动，不会调用其他平台。'}</p>
+              {!hasSourceRows && <div style={{ display: 'flex', gap: 8 }}>
+                {canRefresh && <button className="btn btn-primary btn-sm" title={refreshHint} disabled={refreshing || !sourcesLoaded} onClick={() => void refreshNow()}>{refreshing ? '刷新中…' : refreshLabel}</button>}
+                {currentSource && !currentSource.automatic && ['x', 'xiaohongshu', 'douyin'].includes(currentSource.platform) && <button className="btn btn-primary btn-sm" onClick={() => openSourceEditor(currentSource)}>配置{currentSource.label}活动源</button>}
+                <button className="btn btn-sm" onClick={openImport}>补充导入</button>
+              </div>}
             </div>
           )}
           <div className="campaign-grid">
@@ -1213,17 +1216,6 @@ export default function CampaignsPage({
             <label className="field-label">B站活动 URL</label>
             <input className="field" type="url" value={importUrl} onChange={(e) => setImportUrl(e.target.value)} placeholder="https://www.bilibili.com/blackboard/..." autoFocus />
             <div className="campaign-import-foot"><span>其他平台本轮仍可手动填写。</span><div><button className="btn btn-sm" onClick={() => { setImportUrlOpen(false); openNew(); }}>手动填写</button><button className="btn btn-sm btn-primary" disabled={importParsing || !importUrl.trim()} onClick={() => void parseImport()}>{importParsing ? '解析中…' : '解析活动'}</button></div></div>
-          </div>
-        </div>
-      )}
-
-      {enrichmentPreview && (
-        <div className="overlay">
-          <div className="modal campaign-agent-preview-modal">
-            <div className="campaign-modal-head"><div><h3>Agent 补全 B站缺失规则</h3><p>只处理从未分析或规则证据已变化的活动；同一页面证据不会自动重复消耗 Token。</p></div><button onClick={() => setEnrichmentPreview(null)}>×</button></div>
-            <div className="campaign-agent-preview-summary"><strong>{enrichmentPreview.count} 个活动待补全</strong><span>模型：{enrichmentPreview.model || '未配置默认 Ripple Agent'}</span></div>
-            <div className="campaign-agent-preview-list">{enrichmentPreview.items.slice(0, 20).map((item) => <div key={item.id}><strong>{item.title}</strong><span>{item.missing_fields.map((key) => MISSING_LABELS[key] || key).join('、')}</span></div>)}</div>
-            <div className="campaign-import-foot"><span>{enrichmentPreview.note}</span><div>{!enrichmentPreview.ready && <button className="btn btn-sm" onClick={onOpenSettings}>配置默认 Agent</button>}<button className="btn btn-sm btn-primary" disabled={!enrichmentPreview.ready || enrichmentPreview.count === 0} onClick={() => void startGlobalEnrichment()}>开始补全</button></div></div>
           </div>
         </div>
       )}

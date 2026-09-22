@@ -39,10 +39,11 @@ def test_public_source_state_has_bilibili_ready_without_configuration(source_ser
     assert bili["next_sync_at"] == 0
 
 
-def test_campaign_scheduler_intervals_and_failed_attempt_backoff(source_service):
+def test_campaign_scheduler_intervals_and_failed_attempt_backoff(source_service, monkeypatch):
     _, service = source_service
+    monkeypatch.setattr(time, "time", lambda: 1790042460)  # Outside a paid window.
     assert service.sync_interval("bilibili") == 30 * 60
-    assert service.sync_interval("x") == 2 * 60 * 60
+    assert service.sync_interval("x") == 0  # Paid sources use daily slots.
     assert service.sync_interval("xiaohongshu") == 60 * 60
     assert service.sync_interval("douyin") == 60 * 60
 
@@ -348,6 +349,7 @@ def test_bilibili_list_description_is_only_used_as_reward_when_it_is_reward_like
 def test_x_fallback_is_never_used_until_explicitly_enabled(source_service, monkeypatch):
     _, service = source_service
     service.configure("x", {"method": "prompt", "fallback_method": "x_api", "fallback_enabled": False})
+    monkeypatch.setattr(service, "_x_method_state", lambda *args: ("ready", "test source"))
     calls = []
 
     def fake_method(method, state):
@@ -377,11 +379,14 @@ def test_tikhub_fallback_is_opt_in_even_when_creator_portal_fails(source_service
 
     first = service.refresh(["douyin"], force=True)
     assert calls == []
-    assert first["results"][0]["status"] == "needs_login"
+    assert first["results"][0]["status"] == "needs_config"
 
     service.configure("douyin", {"tikhub_enabled": True})
     monkeypatch.setattr(service, "_tikhub_key", lambda: "configured")
-    second = service.refresh(["douyin"], force=True)
+    blocked = service.refresh(["douyin"], force=True)
+    assert calls == []
+    assert blocked["results"][0]["status"] == "error"
+    second = service.refresh(["douyin"], force=True, allow_paid=True)
     assert calls == ["tikhub"]
     assert second["results"][0]["status"] == "fresh"
     assert second["results"][0]["fallback_used"] is True

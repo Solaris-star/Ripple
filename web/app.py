@@ -4080,8 +4080,9 @@ class CampaignSourceConfigInput(BaseModel):
 
 class CampaignRefreshInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    platforms: list[str] = Field(default_factory=list, max_length=6)
+    platforms: list[str] | None = Field(default=None, min_length=1, max_length=6)
     force: bool = False
+    allow_paid: bool = False
 
 
 class CampaignEnrichInput(BaseModel):
@@ -4771,16 +4772,24 @@ def _start_x_enrichment_batch(ids: list[str]) -> bool:
     return True
 
 
+def _campaign_run_scoped_rules(payload: dict) -> None:
+    # Paid work is admitted by the source service, never by a general UI refresh.
+    allowed = {row.get("platform") for row in payload.get("results", [])
+               if row.get("status") == "fresh" and row.get("rules_allowed") is True}
+    if "bilibili" in allowed:
+        _start_campaign_agent_batch([row["id"] for row in _campaign_enrichment_candidates(limit=3)], automatic=True)
+    if "x" in allowed:
+        _start_x_enrichment_batch([row["id"] for row in _x_enrichment_candidates(limit=3)])
+
+
 def _campaign_scheduler_tick() -> dict:
     due = _CAMPAIGN_SOURCES.due_platforms()
     if due:
         payload = _CAMPAIGN_SOURCES.refresh(due, force=False)
         merged = _merge_campaign_refresh(payload)
-        if any(row.get("platform") == "bilibili" and row.get("status") == "fresh" for row in payload.get("results", [])):
-            _start_campaign_agent_batch([row["id"] for row in _campaign_enrichment_candidates(limit=3)], automatic=True)
+        _campaign_run_scoped_rules(payload)
     else:
         merged = {"merged": 0, "total": len(_read_campaigns()), "stale_platforms": []}
-    _start_x_enrichment_batch([row["id"] for row in _x_enrichment_candidates(limit=3)])
     return {"due": due, **merged}
 
 
@@ -4805,11 +4814,12 @@ async def api_campaign_source_configure(platform: str, req: CampaignSourceConfig
 @app.post("/api/campaigns/refresh")
 async def api_campaign_refresh(req: CampaignRefreshInput):
     _ensure_ai_provider_migration()
-    payload = await asyncio.to_thread(_CAMPAIGN_SOURCES.refresh, req.platforms or None, force=req.force)
+    try:
+        payload = await asyncio.to_thread(_CAMPAIGN_SOURCES.refresh, req.platforms, force=req.force, allow_paid=req.allow_paid)
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
     merged = _merge_campaign_refresh(payload)
-    if any(row.get("platform") == "bilibili" and row.get("status") == "fresh" for row in payload.get("results", [])):
-        _start_campaign_agent_batch([row["id"] for row in _campaign_enrichment_candidates(limit=3)], automatic=True)
-    _start_x_enrichment_batch([row["id"] for row in _x_enrichment_candidates(limit=3)])
+    _campaign_run_scoped_rules(payload)
     return {**payload, **merged, "campaigns": [{**item, "status": _campaign_effective_status(item)} for item in _read_campaigns()]}
 
 

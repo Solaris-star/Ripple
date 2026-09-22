@@ -592,7 +592,7 @@ def test_x_enrichment_failure_is_backed_off_and_does_not_loop(tmp_path, monkeypa
 
 
 
-def test_scheduler_processes_existing_x_rule_queue_even_when_no_source_is_due(monkeypatch):
+def test_scheduler_does_not_spend_tokens_when_no_source_is_due(monkeypatch):
     monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "due_platforms", lambda: [])
     monkeypatch.setattr(upstream, "_x_enrichment_candidates", lambda limit=3: [{"id": "x1"}, {"id": "x2"}])
     started = []
@@ -600,7 +600,7 @@ def test_scheduler_processes_existing_x_rule_queue_even_when_no_source_is_due(mo
     monkeypatch.setattr(upstream, "_read_campaigns", lambda: [{"id": "x1"}, {"id": "x2"}])
     result = upstream._campaign_scheduler_tick()
     assert result["due"] == []
-    assert started == [["x1", "x2"]]
+    assert started == []
 
 
 def test_campaign_edit_bumps_rule_version_and_keeps_import_provenance(tmp_path, monkeypatch):

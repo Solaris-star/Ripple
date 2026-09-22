@@ -406,6 +406,15 @@ export interface CampaignSourceSyncState {
   at?: number; last_attempt_at?: number; last_success_at?: number; last_success_count?: number; next_run_at?: number;
   status?: string; count?: number; error?: string; provider?: string; fallback_used?: boolean;
 }
+export interface CampaignCollectionSchedule {
+  mode: 'interval' | 'daily_slots' | 'manual';
+  timezone: string;
+  times: string[];
+  interval_seconds: number;
+  next_run_at: number;
+  cost: 'paid' | 'free_primary';
+  paid_note?: string;
+}
 export interface CampaignSourceCapability {
   id?: string;
   platform: CampaignPlatform;
@@ -425,6 +434,7 @@ export interface CampaignSourceCapability {
   tikhub_api_key_set?: boolean;
   last_sync?: CampaignSourceSyncState;
   sync_interval_seconds?: number;
+  schedule?: CampaignCollectionSchedule;
   next_sync_at?: number;
 }
 export interface CampaignSourceState { items: CampaignSourceCapability[]; automatic_count: number; revision?: number; server_now?: number; }
@@ -503,9 +513,9 @@ export function configureCampaignSource(platform: CampaignPlatform, input: {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
   });
 }
-export function refreshCampaigns(platforms: CampaignPlatform[] = [], force = false): Promise<CampaignRefreshResult> {
+export function refreshCampaigns(platforms?: CampaignPlatform[], force = false, allowPaid = false): Promise<CampaignRefreshResult> {
   return request<CampaignRefreshResult>('/api/campaigns/refresh', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platforms, force }),
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platforms, force, allow_paid: allowPaid }),
   }).then((result) => ({ ...result, campaigns: result.campaigns.map(normalizeCampaign) }));
 }
 export function createCampaign(item: CampaignInput): Promise<Campaign> {
