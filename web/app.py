@@ -4051,11 +4051,14 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
     external_id = str(candidate.get("external_id") or "")[:200]
     evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
     evidence_kind = str(evidence.get("kind") or "")
+    candidate_source_status = str(candidate.get("source_status") or "verified")[:40]
     authoritative_rules = evidence_kind == "platform_public_detail"
-    rule_verified = evidence_kind not in {"", "platform_public_list"} or any(
-        candidate.get(field) for field in (
-            "eligibility", "content_requirements", "prizes", "winning_conditions",
-            "reward_rules", "required_topics", "submission_spec",
+    rule_verified = candidate_source_status == "verified" and (
+        evidence_kind not in {"", "platform_public_list"} or any(
+            candidate.get(field) for field in (
+                "eligibility", "content_requirements", "prizes", "winning_conditions",
+                "reward_rules", "required_topics", "submission_spec",
+            )
         )
     )
     account_id = str(candidate.get("account_id") or "")[:80]
@@ -4094,7 +4097,7 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "ai_policy": "unknown",
             "source_url": str(candidate.get("source_url") or "")[:2000],
             "source_type": str(candidate.get("source_type") or "automatic")[:80],
-            "source_status": "verified",
+            "source_status": candidate_source_status,
             "discovered_at": now,
             "last_seen_at": now,
             "last_verified_at": now if rule_verified else 0,
@@ -4156,7 +4159,8 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
         item["last_seen_at"] = now
         if rule_verified:
             item["last_verified_at"] = now
-        item["source_status"] = "verified"
+        if candidate_source_status == "verified" or item.get("source_status") != "verified":
+            item["source_status"] = candidate_source_status
         item["updated_at"] = now
         if not item.get("source_url") and candidate.get("source_url"):
             item["source_url"] = str(candidate["source_url"])[:2000]
@@ -4182,7 +4186,7 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
         "external_id": external_id,
         "source_url": str(candidate.get("source_url") or "")[:2000],
         "fetched_at": now,
-        "status": "verified",
+        "status": candidate_source_status,
         "evidence": evidence,
     })
     item["source_evidence"] = source_rows[-20:]

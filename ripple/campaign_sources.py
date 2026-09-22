@@ -454,6 +454,13 @@ class CampaignSourceService:
                     state[key].update(raw[key]) if key != "last_sync" else state.__setitem__("last_sync", raw[key])
             state["revision"] = max(0, int(raw.get("revision") or 0))
             state["updated_at"] = str(raw.get("updated_at") or state["updated_at"])
+            legacy_xai = state["x"].get("method") == "xai" or state["x"].get("fallback_method") == "xai"
+            if state["x"].get("method") == "xai":
+                state["x"]["method"] = "prompt"
+            if state["x"].get("fallback_method") == "xai":
+                state["x"]["fallback_method"] = "prompt"
+            if legacy_xai:
+                state["last_sync"].pop("x", None)
         return state
 
     def _write(self, state: dict[str, Any]) -> None:
@@ -482,17 +489,22 @@ class CampaignSourceService:
         state = self._state()
         if platform == "x":
             method = str(value.get("method") or "")
-            if method not in {"", "xai", "x_api"}:
-                raise WorkflowError("X 活动源只支持 xAI X Search 或 X Developer API。", 422)
+            method = "prompt" if method == "xai" else method
+            if method not in {"", "prompt", "x_search", "x_api"}:
+                raise WorkflowError("X 活动源只支持 Grok Prompt、原生 X Search Tool 或 X Developer API。", 422)
             fallback = str(value.get("fallback_method") or "")
-            if fallback not in {"", "xai", "x_api"} or fallback == method:
+            fallback = "prompt" if fallback == "xai" else fallback
+            if fallback not in {"", "prompt", "x_search", "x_api"} or fallback == method:
                 fallback = ""
+            previous_method = str(state["x"].get("method") or "")
             state["x"].update({
                 "method": method,
                 "x_api_account_id": str(value.get("x_api_account_id") or "")[:32],
                 "fallback_method": fallback,
                 "fallback_enabled": bool(value.get("fallback_enabled") and fallback),
             })
+            if method != previous_method:
+                state["last_sync"].pop("x", None)
         elif platform == "xiaohongshu":
             state["xiaohongshu"]["account_id"] = str(value.get("account_id") or "")[:32]
         elif platform == "douyin":
@@ -527,18 +539,23 @@ class CampaignSourceService:
         return None, "needs_login" if rows else "needs_config"
 
     def _x_method_state(self, method: str, state: dict[str, Any]) -> tuple[str, str]:
-        if method == "xai":
+        if method == "prompt":
+            cfg = self.ai.resolved("x_campaign_discovery", fallback_to_default=False)
+            if not cfg:
+                return "needs_config", "请在 AI Provider 中配置“X 活动发现”路由。"
+            return "ready", f"{cfg.get('provider_name')} / {cfg.get('model')} · Prompt"
+        if method == "x_search":
             cfg = self.ai.resolved("x_campaign_discovery", fallback_to_default=False)
             if not cfg:
                 return "needs_config", "请在 AI Provider 中配置“X 活动发现”路由。"
             evidence = ((cfg.get("capability_evidence") or {}).get("x_search") or {})
             if (cfg.get("capabilities") or {}).get("x_search") != "verified" or evidence.get("model_id") != cfg.get("model"):
-                return "needs_config", "请先对“X 活动发现”绑定的模型执行一次严格 X Search 能力测试。"
-            return "ready", f"{cfg.get('provider_name')} / {cfg.get('model')}"
+                return "needs_config", "原生 X Search Tool 模式需要先执行严格 X Search 能力测试。"
+            return "ready", f"{cfg.get('provider_name')} / {cfg.get('model')} · 原生 X Search Tool"
         if method == "x_api":
             account, status = self._effective_account("x", str(state["x"].get("x_api_account_id") or ""), adapter="x-api")
             return status, (account.get("label") if account else "请选择已连接的 X Developer API 账号")
-        return "needs_config", "选择 xAI X Search 或 X Developer API。"
+        return "needs_config", "选择 Grok Prompt、原生 X Search Tool 或 X Developer API。"
 
     def sync_interval(self, platform: str) -> int:
         return int(SYNC_INTERVALS.get(platform, 60 * 60))
@@ -571,8 +588,8 @@ class CampaignSourceService:
                 "id": "x_campaigns", "platform": "x", "label": "X",
                 "status": x_status, "automatic": x_status == "ready", "mode": x_method or "unconfigured",
                 "detail": x_detail,
-                "billing": "paid_or_plan_dependent" if x_method in {"xai", "x_api"} else "unknown",
-                "cost_note": "xAI X Search 按检索内容计费；X Developer API 取决于开发者计划与额度。",
+                "billing": "paid_or_plan_dependent" if x_method in {"prompt", "x_search", "x_api"} else "unknown",
+                "cost_note": "Prompt 模式按模型 Provider 计费；原生 X Search Tool 与 X Developer API 按对应服务商规则计费。",
                 "method": x_method,
                 "x_api_account_id": str(state["x"].get("x_api_account_id") or ""),
                 "fallback_method": str(state["x"].get("fallback_method") or ""),
@@ -897,7 +914,51 @@ class CampaignSourceService:
             _atomic(self.bilibili_detail_cache_path, bounded)
         return rows[:100]
 
-    def _x_xai(self) -> list[dict[str, Any]]:
+    def _x_prompt(self) -> list[dict[str, Any]]:
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=7)
+        prompt = (
+            f"你是 Ripple 的 X 创作活动发现器。当前日期 {end.isoformat()}。"
+            f"请使用这个模型或网关自身具备的 X/实时搜索能力，查找 {start.isoformat()} 至 {end.isoformat()} 最近发布、"
+            "且现在仍可能值得创作者参与的真实创作活动、征集、挑战、创作者激励。"
+            "优先 X 官方、品牌官方、创作者项目官方账号。每条必须给出真实的 x.com 或 twitter.com /status/ 帖子 URL。"
+            "如果当前模型实际上无法访问 X 或无法确认真实帖子，禁止编造，返回 search_available=false 和空 campaigns。"
+            "不要猜测奖励、截止日期、资格或主办方；原帖没写就留空。只输出 JSON，不要 Markdown："
+            '{"search_available":true,"reason":"","campaigns":[{"title":"","organizer":"","source_url":"https://x.com/.../status/...",'
+            '"external_id":"","description":"","published_at":"","submit_deadline":"","reward_summary":""}]}'
+        )
+        result = self.ai.prompt_route("x_campaign_discovery", prompt, timeout=90, max_tokens=2800)
+        parsed = _json_fragment(result.get("text", ""))
+        if isinstance(parsed, dict) and parsed.get("search_available") is False:
+            return []
+        values = parsed.get("campaigns", []) if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
+        rows = []
+        for item in values[:50] if isinstance(values, list) else []:
+            if not isinstance(item, dict):
+                continue
+            url = _safe_url(str(item.get("source_url") or item.get("url") or ""),
+                            ("x.com", "twitter.com"))
+            title = str(item.get("title") or "").strip()
+            if not url or not title or not re.search(r"/status/\d+", url):
+                continue
+            match = re.search(r"/status/(\d+)", url)
+            external = str(item.get("external_id") or (match.group(1) if match else ""))[:160]
+            rows.append({
+                "provider_id": "x_model_prompt", "platform": "x", "external_id": f"x:{external}" if external else "",
+                "title": title[:240], "organizer": str(item.get("organizer") or "")[:160],
+                "organizer_type": "unknown", "activity_type": "创作活动",
+                "reward_type": "", "reward_summary": str(item.get("reward_summary") or "")[:600],
+                "summary": str(item.get("description") or "")[:1200],
+                "starts_at": str(item.get("published_at") or "")[:40],
+                "submit_deadline": str(item.get("submit_deadline") or "")[:40],
+                "source_url": url, "source_type": "x_model_prompt", "source_status": "model_reported",
+                "note": str(item.get("description") or "")[:3000],
+                "evidence": {"kind": "model_prompt_x_post", "url": url,
+                             "provider": result.get("provider_id", ""), "model": result.get("model", "")},
+            })
+        return rows
+
+    def _x_search_tool(self) -> list[dict[str, Any]]:
         end = datetime.now(timezone.utc).date()
         start = end - timedelta(days=7)
         prompt = (
@@ -960,8 +1021,10 @@ class CampaignSourceService:
         return rows
 
     def _x_method(self, method: str, state: dict[str, Any]) -> list[dict[str, Any]]:
-        if method == "xai":
-            return self._x_xai()
+        if method == "prompt":
+            return self._x_prompt()
+        if method == "x_search":
+            return self._x_search_tool()
         if method == "x_api":
             account, status = self._effective_account("x", str(state["x"].get("x_api_account_id") or ""), adapter="x-api")
             if status != "ready" or not account:
@@ -1097,13 +1160,13 @@ class CampaignSourceService:
                         method = str(state["x"].get("method") or "")
                         try:
                             items = self._x_method(method, state)
-                            provider = "xai_x_search" if method == "xai" else "x_developer_api"
+                            provider = "x_model_prompt" if method == "prompt" else "xai_x_search" if method == "x_search" else "x_developer_api"
                         except WorkflowError:
                             fallback = str(state["x"].get("fallback_method") or "")
                             if not state["x"].get("fallback_enabled") or not fallback:
                                 raise
                             items = self._x_method(fallback, state)
-                            provider = "xai_x_search" if fallback == "xai" else "x_developer_api"
+                            provider = "x_model_prompt" if fallback == "prompt" else "xai_x_search" if fallback == "x_search" else "x_developer_api"
                             fallback_used = True
                     elif platform == "xiaohongshu":
                         items = self._xiaohongshu(state); provider = "xiaohongshu_creator_events"

@@ -77,6 +77,31 @@ def test_campaign_import_is_not_presented_as_verified(tmp_path, monkeypatch):
     assert rows[0]["source_status"] == "imported"
 
 
+def test_model_prompt_candidate_is_not_presented_as_verified(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    row = upstream._merge_campaign_candidate(items, {
+        "provider_id": "x_model_prompt", "platform": "x", "external_id": "x:123",
+        "title": "X Creator Challenge", "organizer": "@brand",
+        "source_url": "https://x.com/brand/status/123", "source_type": "x_model_prompt",
+        "source_status": "model_reported", "summary": "Model-reported activity",
+        "evidence": {"kind": "model_prompt_x_post", "url": "https://x.com/brand/status/123"},
+    })
+    assert row["source_status"] == "model_reported"
+    assert row["last_verified_at"] == 0
+    assert row["source_evidence"][0]["status"] == "model_reported"
+
+    upgraded = upstream._merge_campaign_candidate(items, {
+        "provider_id": "x_developer_api", "platform": "x", "external_id": "x:123",
+        "title": "X Creator Challenge", "organizer": "@brand",
+        "source_url": "https://x.com/brand/status/123", "source_type": "x_developer_api",
+        "source_status": "verified", "summary": "API verified",
+        "evidence": {"kind": "x_post", "url": "https://x.com/brand/status/123"},
+    })
+    assert upgraded["source_status"] == "verified"
+    assert upgraded["last_verified_at"] > 0
+
+
 def test_campaign_edit_bumps_rule_version_and_keeps_import_provenance(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     created = asyncio.run(upstream.api_campaign_create(_campaign()))

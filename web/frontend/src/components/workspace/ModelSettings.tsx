@@ -189,7 +189,7 @@ export default function ModelSettings() {
               <option value="">未单独配置{purpose.id !== 'default_agent' ? '（回退默认 Agent）' : ''}</option>
               {routeOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
-            {purpose.id === 'x_campaign_discovery' && <small className="r2-muted">可绑定 xAI 或兼容网关中的 Grok 模型；是否可用于采集由真实 X Search 能力测试决定。X Developer API 在活动数据源中配置。</small>}
+            {purpose.id === 'x_campaign_discovery' && <small className="r2-muted">绑定 Grok / 搜索模型后，活动广场默认以固定 Prompt 定时发现 X 活动；无需 X Search Tool 测试。只有选择“原生 X Search Tool”数据源模式时才需要严格能力测试。</small>}
             {purpose.id === 'default_agent' && <small className="r2-muted">B站活动规则补全默认跟随这里的模型；脚本能解析完整时不会调用模型。</small>}
           </label>;
         })}

@@ -156,9 +156,48 @@ def test_bilibili_task_templates_extract_creation_tasks_rewards_and_live_specs()
     assert result["submission_spec"]["original_required"] is True
 
 
-def test_x_source_accepts_verified_x_search_capability_from_compatible_gateway(source_service, monkeypatch):
+def test_x_prompt_source_is_ready_with_only_bound_model(source_service, monkeypatch):
+    _, service = source_service
+    service.configure("x", {"method": "prompt"})
+    monkeypatch.setattr(service.ai, "resolved", lambda *args, **kwargs: {
+        "provider_id": "gateway", "provider_name": "Grok Gateway", "kind": "openai-compatible",
+        "model": "grok-4.5-search", "capabilities": {"x_search": "unknown"},
+    })
+    state = service.public_state()
+    x = next(row for row in state["items"] if row["platform"] == "x")
+    assert x["status"] == "ready"
+    assert x["automatic"] is True
+    assert x["mode"] == "prompt"
+    assert "Prompt" in x["detail"]
+
+
+def test_legacy_xai_source_alias_migrates_to_prompt(source_service):
     _, service = source_service
     service.configure("x", {"method": "xai"})
+    state = service._state()
+    assert state["x"]["method"] == "prompt"
+
+
+def test_x_prompt_results_are_model_reported_and_require_status_url(source_service, monkeypatch):
+    _, service = source_service
+    monkeypatch.setattr(service.ai, "prompt_route", lambda *args, **kwargs: {
+        "provider_id": "gateway", "model": "grok-search",
+        "text": json.dumps({"search_available": True, "campaigns": [
+            {"title": "Creator Challenge", "organizer": "@brand", "source_url": "https://x.com/brand/status/123", "description": "Join now"},
+            {"title": "Bad Link", "source_url": "https://x.com/brand"},
+        ]}),
+    })
+    rows = service._x_prompt()
+    assert len(rows) == 1
+    assert rows[0]["external_id"] == "x:123"
+    assert rows[0]["source_type"] == "x_model_prompt"
+    assert rows[0]["source_status"] == "model_reported"
+    assert rows[0]["evidence"]["kind"] == "model_prompt_x_post"
+
+
+def test_x_source_accepts_verified_x_search_capability_from_compatible_gateway(source_service, monkeypatch):
+    _, service = source_service
+    service.configure("x", {"method": "x_search"})
     monkeypatch.setattr(service.ai, "resolved", lambda *args, **kwargs: {
         "provider_id": "gateway", "provider_name": "Grok Gateway", "kind": "openai-compatible",
         "model": "grok-4.5-search", "capabilities": {"x_search": "verified"},
@@ -211,24 +250,24 @@ def test_bilibili_list_description_is_only_used_as_reward_when_it_is_reward_like
 
 def test_x_fallback_is_never_used_until_explicitly_enabled(source_service, monkeypatch):
     _, service = source_service
-    service.configure("x", {"method": "xai", "fallback_method": "x_api", "fallback_enabled": False})
+    service.configure("x", {"method": "prompt", "fallback_method": "x_api", "fallback_enabled": False})
     calls = []
 
     def fake_method(method, state):
         calls.append(method)
-        if method == "xai":
+        if method == "prompt":
             raise WorkflowError("primary failed", 502)
         return []
 
     monkeypatch.setattr(service, "_x_method", fake_method)
     first = service.refresh(["x"], force=True)
-    assert calls == ["xai"]
+    assert calls == ["prompt"]
     assert first["results"][0]["status"] == "error"
 
-    service.configure("x", {"method": "xai", "fallback_method": "x_api", "fallback_enabled": True})
+    service.configure("x", {"method": "prompt", "fallback_method": "x_api", "fallback_enabled": True})
     calls.clear()
     second = service.refresh(["x"], force=True)
-    assert calls == ["xai", "x_api"]
+    assert calls == ["prompt", "x_api"]
     assert second["results"][0]["status"] == "fresh"
     assert second["results"][0]["fallback_used"] is True
 

@@ -64,6 +64,40 @@ def test_multiple_ai_providers_and_purpose_routes_are_independent(tmp_path, monk
     assert service.resolved("x_campaign_discovery", fallback_to_default=False)["provider_id"] == xai["id"]
 
 
+def test_prompt_route_uses_bound_model_without_x_search_capability(tmp_path, monkeypatch):
+    from ripple import ai_providers
+    monkeypatch.setattr(ai_providers, "protect", fake_protect)
+    service = AIProviderService(tmp_path / "private")
+    state = service.upsert(
+        name="Search Model Gateway", kind="openai-compatible", base_url="https://gateway.example/v1",
+        api_key="secret", models=["grok-search"], default_model="grok-search",
+    )
+    provider = state["providers"][0]
+    service.set_route("x_campaign_discovery", provider["id"], "grok-search")
+    seen = []
+
+    class Response:
+        content = b'{"choices":[{"message":{"content":"{\\"campaigns\\":[]}"}}]}'
+        def raise_for_status(self): return None
+        def json(self): return {"choices": [{"message": {"content": '{"campaigns":[]}'}}]}
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def post(self, url, headers=None, json=None):
+            seen.append((url, json))
+            return Response()
+
+    monkeypatch.setattr(ai_providers.httpx, "Client", Client)
+    result = service.prompt_route("x_campaign_discovery", "find campaigns")
+    assert result["text"] == '{"campaigns":[]}'
+    assert result["model"] == "grok-search"
+    assert seen[0][0] == "https://gateway.example/v1/chat/completions"
+    assert seen[0][1]["model"] == "grok-search"
+    assert "tools" not in seen[0][1]
+
+
 def test_openai_compatible_grok_gateway_can_verify_and_use_x_search(tmp_path, monkeypatch):
     from ripple import ai_providers
     monkeypatch.setattr(ai_providers, "protect", fake_protect)

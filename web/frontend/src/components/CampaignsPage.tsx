@@ -49,6 +49,7 @@ const STATUS: Record<string, string> = {
 const SOURCE_STATUS: Record<string, string> = {
   imported: '未核验',
   verified: '已核验',
+  model_reported: '模型检索',
   stale: '待复核',
   unavailable: '来源不可用',
 };
@@ -135,6 +136,7 @@ function sourceLabel(campaign: Campaign): string {
 function sourceName(campaign: Campaign): string {
   if (campaign.source_type === 'user_import') return '用户导入';
   if (campaign.platform === 'bilibili' && campaign.source_type === 'platform_public') return 'B站官方活动页';
+  if (campaign.source_type === 'x_model_prompt') return 'Grok / 搜索模型';
   if (campaign.source_type === 'x_search') return 'xAI · X Search';
   if (campaign.source_type === 'x_developer_api') return 'X Developer API';
   if (campaign.platform === 'xiaohongshu' && campaign.source_type.includes('creator')) return '小红书创作服务平台';
@@ -923,11 +925,16 @@ export default function CampaignsPage({
                 setSourceDraft({ ...sourceDraft, method, fallback_method: sourceDraft.fallback_method === method ? '' : sourceDraft.fallback_method });
               }}>
                 <option value="">未启用</option>
-                <option value="xai">Grok / xAI · X Search</option>
+                <option value="prompt">Grok / 搜索模型 · Prompt</option>
+                <option value="x_search">原生 X Search Tool</option>
                 <option value="x_api">X Developer API</option>
               </select>
-              {sourceDraft.method === 'xai' && <div className="campaign-source-config-note">
-                xAI 方式使用“设置 → AI / Agent Provider”里的「X 活动发现」路由，并要求 X Search 能力测试通过。X Search 可能产生调用费用。
+              {sourceDraft.method === 'prompt' && <div className="campaign-source-config-note">
+                默认推荐：Ripple 每 2 小时把固定活动发现 Prompt 发给“X 活动发现”绑定的 Grok / 搜索模型，由模型或网关自行搜索 X 并返回 JSON。无需 X Search Tool 能力测试。
+                <button className="r2-text-button" onClick={onOpenSettings}>打开模型设置</button>
+              </div>}
+              {sourceDraft.method === 'x_search' && <div className="campaign-source-config-note">
+                高级模式：直接调用 Provider 的 <code>/responses + x_search</code>。只有严格 X Search 能力测试通过后才会自动采集，可能产生额外搜索费用。
                 <button className="r2-text-button" onClick={onOpenSettings}>打开模型设置</button>
               </div>}
               {(sourceDraft.method === 'x_api' || sourceDraft.fallback_method === 'x_api') && <>
@@ -940,8 +947,8 @@ export default function CampaignsPage({
               {sourceDraft.method && <label className="r2-checkbox campaign-source-fallback"><input type="checkbox" checked={sourceDraft.fallback_enabled} onChange={(e) => setSourceDraft({
                 ...sourceDraft,
                 fallback_enabled: e.target.checked,
-                fallback_method: e.target.checked ? (sourceDraft.method === 'xai' ? 'x_api' : 'xai') : '',
-              })} />主来源失败时允许使用 {sourceDraft.method === 'xai' ? 'X Developer API' : 'xAI X Search'} 备用源</label>}
+                fallback_method: e.target.checked ? (sourceDraft.method === 'x_api' ? 'prompt' : 'x_api') : '',
+              })} />主来源失败时允许使用 {sourceDraft.method === 'x_api' ? 'Grok Prompt' : 'X Developer API'} 备用源</label>}
               {sourceDraft.fallback_enabled && <p className="campaign-source-config-warning">备用源只有在你显式启用后才会调用；涉及的 API/搜索费用按对应服务商规则计算。</p>}
             </>}
             {sourceEditor.platform === 'xiaohongshu' && <>

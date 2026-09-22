@@ -147,6 +147,27 @@ def _extract_response_text(data: dict[str, Any]) -> str:
                 chunks.append(text.strip())
     return "\n".join(chunks).strip()
 
+def _extract_chat_text(data: dict[str, Any]) -> str:
+    choices = data.get("choices") if isinstance(data, dict) else None
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") if isinstance(first.get("message"), dict) else {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+        return "\n".join(chunks).strip()
+    text = first.get("text")
+    return text.strip() if isinstance(text, str) else ""
+
+
 
 class AIProviderService:
     def __init__(self, private: Path):
@@ -472,6 +493,42 @@ class AIProviderService:
         else:
             self._update_capability(provider_id, capability, "verified" if ok else "failed")
         return {"ok": bool(ok), "capability": capability, "provider_id": provider_id, "model_id": model_id}
+
+    def prompt_route(self, purpose: str, prompt: str, *, timeout: int = 90, max_tokens: int = 2600) -> dict[str, Any]:
+        cfg = self.resolved(purpose, fallback_to_default=False)
+        if not cfg:
+            raise WorkflowError(f"尚未配置 {PURPOSES.get(purpose, purpose)} 的模型路由。", 409)
+        payload = {
+            "model": cfg["model"],
+            "messages": [{"role": "user", "content": str(prompt or "")[:24000]}],
+            "temperature": 0,
+            "max_tokens": max(200, min(int(max_tokens), 6000)),
+        }
+        try:
+            with httpx.Client(timeout=httpx.Timeout(max(15, min(int(timeout), 180)), connect=8), trust_env=False,
+                              follow_redirects=False) as client:
+                response = client.post(cfg["base_url"].rstrip("/") + "/chat/completions",
+                    headers={"Authorization": "Bearer " + cfg["api_key"]}, json=payload)
+                response.raise_for_status()
+                if len(response.content) > MAX_RESPONSE:
+                    raise WorkflowError("模型 Prompt 响应超过安全上限。", 502)
+                data = response.json()
+        except WorkflowError:
+            raise
+        except httpx.TimeoutException:
+            raise WorkflowError(f"{PURPOSES.get(purpose, purpose)} Prompt 请求超时；请检查模型搜索速度或网关超时设置。", 504) from None
+        except httpx.HTTPStatusError as exc:
+            raise WorkflowError(f"{PURPOSES.get(purpose, purpose)} Prompt 返回 HTTP {exc.response.status_code}。", 502) from None
+        except httpx.ConnectError:
+            raise WorkflowError(f"无法连接 {PURPOSES.get(purpose, purpose)} Provider。", 502) from None
+        except httpx.HTTPError:
+            raise WorkflowError(f"{PURPOSES.get(purpose, purpose)} Prompt 请求失败。", 502) from None
+        except (ValueError, TypeError):
+            raise WorkflowError(f"{PURPOSES.get(purpose, purpose)} Prompt 返回了无法解析的响应。", 502) from None
+        text = _extract_chat_text(data)
+        if not text:
+            raise WorkflowError(f"{PURPOSES.get(purpose, purpose)} 模型没有返回文本结果。", 502)
+        return {"text": text, "raw": data, "provider_id": cfg["provider_id"], "model": cfg["model"]}
 
     def x_search(self, prompt: str, *, from_date: str = "", to_date: str = "",
                  allowed_handles: list[str] | None = None, max_handles: int = 20) -> dict[str, Any]:
