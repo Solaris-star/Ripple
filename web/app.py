@@ -4075,9 +4075,9 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "reward_summary": str(candidate.get("reward_summary") or "")[:600],
             "summary": str(candidate.get("summary") or "")[:3000],
             "starts_at": str(candidate.get("starts_at") or "")[:40],
-            "signup_deadline": "",
+            "signup_deadline": str(candidate.get("signup_deadline") or "")[:40],
             "submit_deadline": str(candidate.get("submit_deadline") or "")[:40],
-            "stats_deadline": "",
+            "stats_deadline": str(candidate.get("stats_deadline") or "")[:40],
             "timezone": "",
             "eligibility": [str(x)[:240] for x in candidate.get("eligibility", []) if str(x).strip()][:20],
             "qualification_state": "unknown",
@@ -4094,7 +4094,7 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             "agent_model": "", "agent_run_id": "", "agent_error": "",
             "agent_attempt_fingerprint": "", "agent_attempt_count": 0, "agent_next_retry_at": 0,
             "user_confirmed_fields": [],
-            "ai_policy": "unknown",
+            "ai_policy": str(candidate.get("ai_policy") or "unknown")[:600],
             "source_url": str(candidate.get("source_url") or "")[:2000],
             "source_type": str(candidate.get("source_type") or "automatic")[:80],
             "source_status": candidate_source_status,
@@ -4122,7 +4122,8 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
         locked = {str(x) for x in item.get("user_confirmed_fields", []) if str(x)}
         field_evidence = item.get("field_evidence") if isinstance(item.get("field_evidence"), dict) else {}
         rule_fields = ("title", "organizer", "organizer_type", "activity_type", "reward_type",
-                       "reward_summary", "summary", "starts_at", "submit_deadline", "source_url", "note")
+                       "reward_summary", "summary", "starts_at", "signup_deadline", "submit_deadline", "stats_deadline",
+                       "ai_policy", "source_url", "note")
         proposed = {}
         for field in rule_fields:
             incoming = str(candidate.get(field) or "").strip()

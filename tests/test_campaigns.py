@@ -102,6 +102,42 @@ def test_model_prompt_candidate_is_not_presented_as_verified(tmp_path, monkeypat
     assert upgraded["last_verified_at"] > 0
 
 
+def test_x_model_prompt_completeness_uses_real_rule_fields(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    complete = upstream._merge_campaign_candidate(items, {
+        "provider_id": "x_model_prompt", "platform": "x", "external_id": "x:complete",
+        "title": "Vizard Agent Challenge", "organizer": "@vizard_ai",
+        "source_url": "https://x.com/vizard_ai/status/456", "source_type": "x_model_prompt",
+        "source_status": "model_reported", "summary": "活动规则中文摘要",
+        "starts_at": "2026-09-18", "signup_deadline": "2026-09-20", "submit_deadline": "2026-10-06",
+        "stats_deadline": "2026-10-10", "eligibility": ["免费参与"],
+        "content_requirements": ["按赛道要求提交作品"], "prizes": ["3,000 美元现金"],
+        "winning_conditions": ["各赛道冠军按活动规则评选"], "reward_rules": ["冠军各获得 500 美元"],
+        "required_topics": ["#VizardAgentChallenge"], "submission_spec": {"formats": ["video"]},
+        "ai_policy": "原帖未说明 AI 使用要求",
+        "evidence": {"kind": "model_prompt_x_post", "url": "https://x.com/vizard_ai/status/456"},
+    })
+    assert complete["source_status"] == "model_reported"
+    assert complete["missing_fields"] == []
+    assert complete["enrichment_status"] == "complete"
+    assert complete["signup_deadline"] == "2026-09-20"
+    assert complete["stats_deadline"] == "2026-10-10"
+    assert complete["ai_policy"] == "原帖未说明 AI 使用要求"
+    assert complete["submission_spec"]["formats"] == ["video"]
+
+    incomplete = upstream._merge_campaign_candidate(items, {
+        "provider_id": "x_model_prompt", "platform": "x", "external_id": "x:incomplete",
+        "title": "规则缺失活动", "organizer": "@brand",
+        "source_url": "https://x.com/brand/status/789", "source_type": "x_model_prompt",
+        "source_status": "model_reported", "reward_summary": "500 美元奖金",
+        "evidence": {"kind": "model_prompt_x_post", "url": "https://x.com/brand/status/789"},
+    })
+    assert set(incomplete["missing_fields"]) == {"eligibility", "submission_spec", "winning_conditions"}
+    assert incomplete["enrichment_status"] == "incomplete"
+    assert incomplete["last_verified_at"] == 0
+
+
 def test_campaign_edit_bumps_rule_version_and_keeps_import_provenance(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     created = asyncio.run(upstream.api_campaign_create(_campaign()))

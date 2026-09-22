@@ -786,7 +786,8 @@ export default function CampaignsPage({
               const sourceText = sourceName(campaign) + ' · ' + sourceLabel(campaign);
               const specText = submissionSummary(campaign);
               const missing = campaign.missing_fields || [];
-              const incomplete = campaign.platform === 'bilibili' && missing.length > 0;
+              const incomplete = missing.length > 0;
+              const canAgentEnrich = campaign.platform === 'bilibili' && incomplete;
               return (
                 <article className="card campaign-card" key={campaign.id}>
                   <div className="campaign-card-top">
@@ -815,7 +816,7 @@ export default function CampaignsPage({
                   </div>
                   <div className="campaign-actions">
                     <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看详情</button>
-                    {incomplete
+                    {canAgentEnrich
                       ? <button className="btn btn-sm campaign-agent-button" disabled={!!enrichingId || agentBatchActive || campaign.enrichment_status === 'running'} onClick={() => void enrichOne(campaign)}>✦ {enrichingId === campaign.id || campaign.enrichment_status === 'running' ? 'Agent 补全中…' : 'Agent 补全'}</button>
                       : <span className="campaign-action-placeholder" aria-hidden="true" />}
                     <button className="btn btn-sm btn-primary" disabled={campaign.status === 'ended' || campaign.status === 'cancelled'}
