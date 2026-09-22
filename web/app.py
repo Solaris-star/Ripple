@@ -4258,10 +4258,20 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
     evidence = candidate.get("evidence") if isinstance(candidate.get("evidence"), dict) else {}
     evidence_kind = str(evidence.get("kind") or "")
     candidate_source_status = str(candidate.get("source_status") or "verified")[:40]
-    authoritative_rules = evidence_kind == "platform_public_detail"
     xhs_official_candidate = (
         str(candidate.get("platform") or "") == "xiaohongshu"
         and provider_id == "xiaohongshu_creator_events"
+    )
+    xhs_detail_status = str(candidate.get("xhs_detail_status") or "")
+    xhs_detail_version = max(0, int(candidate.get("xhs_detail_version") or 0))
+    xhs_detail_observed = (
+        xhs_official_candidate
+        and evidence_kind == "platform_public_detail"
+        and xhs_detail_version >= 3
+        and xhs_detail_status in {"parsed", "no_structured_rules", "needs_visual_review"}
+    )
+    authoritative_rules = evidence_kind == "platform_public_detail" and (
+        not xhs_official_candidate or xhs_detail_status in {"parsed", "no_structured_rules"}
     )
     rule_verified = candidate_source_status == "verified" and (
         authoritative_rules if xhs_official_candidate else (
@@ -4372,8 +4382,14 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             elif incoming:
                 proposed[field] = incoming
         incoming_spec = normalize_submission_spec(candidate.get("submission_spec"))
-        if "submission_spec" not in locked and submission_spec_has_data(incoming_spec):
-            proposed["submission_spec"] = incoming_spec
+        if "submission_spec" not in locked:
+            if submission_spec_has_data(incoming_spec):
+                proposed["submission_spec"] = incoming_spec
+            elif xhs_detail_observed and not manual:
+                current_spec = normalize_submission_spec(item.get("submission_spec"))
+                if current_spec.get("formats"):
+                    current_spec["formats"] = []
+                    proposed["submission_spec"] = current_spec
         incoming_fp = str(candidate.get("rule_evidence_fingerprint") or "")[:80]
         if incoming_fp:
             proposed["rule_evidence_fingerprint"] = incoming_fp

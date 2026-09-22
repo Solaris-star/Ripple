@@ -310,6 +310,9 @@ def test_xhs_visual_review_detail_clears_old_program_inference_without_claiming_
     assert updated["winning_conditions"] == []
 
 
+    assert updated["last_verified_at"] == 0
+
+
 def test_xhs_detail_refresh_preserves_user_confirmed_qualification_and_submission_spec(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
     items = []
