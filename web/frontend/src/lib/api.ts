@@ -365,6 +365,38 @@ export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<
   'starts_at' | 'signup_deadline' | 'submit_deadline' | 'stats_deadline' | 'timezone' |
   'eligibility' | 'qualification_state' | 'content_requirements' | 'prizes' | 'winning_conditions' | 'reward_rules' |
   'required_topics' | 'submission_spec' | 'ai_policy' | 'source_url' | 'note' | 'status' | 'account_id'>>;
+export type CampaignListSort = 'recommend' | 'new' | 'deadline' | 'saved' | 'default' | 'latest';
+export interface CampaignPageResponse {
+  items: Campaign[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  range_start: number;
+  range_end: number;
+  sort: CampaignListSort;
+  platform: string;
+  account_id: string;
+  snapshot_id: string;
+  fetched_at: string;
+  source_status: string;
+  source_total: number;
+  truncated: boolean;
+  missing_source_items: number;
+  stats: { active: number; soon: number; saved: number };
+  filter_options: { activity_types: string[]; reward_types: string[] };
+}
+export interface CampaignPageParams {
+  platform?: string;
+  account_id?: string;
+  sort?: CampaignListSort;
+  page?: number;
+  activity_type?: string;
+  reward_type?: string;
+  deadline?: string;
+  qualification?: string;
+  snapshot_id?: string;
+}
 export interface CampaignSourceSyncState {
   at?: number; last_attempt_at?: number; last_success_at?: number; last_success_count?: number; next_run_at?: number;
   status?: string; count?: number; error?: string; provider?: string; fallback_used?: boolean;
@@ -420,6 +452,18 @@ function normalizeCampaign(item: Campaign): Campaign {
 }
 export function fetchCampaigns(): Promise<Campaign[]> {
   return request<Campaign[]>('/api/campaigns').then((items) => items.map(normalizeCampaign));
+}
+export function fetchCampaignPage(params: CampaignPageParams = {}): Promise<CampaignPageResponse> {
+  const query = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '' && value !== 'all') query.set(key, String(value));
+  }
+  return request<CampaignPageResponse>(`/api/campaigns/page?${query.toString()}`).then((value) => ({
+    ...value,
+    items: (value.items || []).map(normalizeCampaign),
+    stats: value.stats || { active: 0, soon: 0, saved: 0 },
+    filter_options: value.filter_options || { activity_types: [], reward_types: [] },
+  }));
 }
 export function fetchCampaign(id: string): Promise<Campaign> {
   return request<Campaign>(`/api/campaigns/${encodeURIComponent(id)}`).then(normalizeCampaign);

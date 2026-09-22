@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import html as html_lib
+import hashlib
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
@@ -477,7 +478,7 @@ class CampaignSourceService:
             "schema": 2,
             "revision": 0,
             "x": {"method": "", "x_api_account_id": "", "fallback_method": "", "fallback_enabled": False},
-            "xiaohongshu": {"account_id": ""},
+            "xiaohongshu": {"account_id": "", "official_snapshots": {}},
             "douyin": {"account_id": "", "tikhub_enabled": False},
             "last_sync": {},
             "updated_at": _now(),
@@ -507,6 +508,123 @@ class CampaignSourceService:
         state["revision"] = int(state.get("revision") or 0) + 1
         state["updated_at"] = _now()
         _atomic(self.path, state)
+
+    def _record_xhs_official_snapshots(self, account_id: str, payload: dict[str, Any]) -> None:
+        account_id = str(account_id or '')[:32]
+        if not account_id:
+            return
+        state = self._state()
+        snapshots = state['xiaohongshu'].get('official_snapshots')
+        if not isinstance(snapshots, dict):
+            snapshots = {}
+        account_snapshots = deepcopy(snapshots.get(account_id)) if isinstance(snapshots.get(account_id), dict) else {}
+        orders = payload.get('orders') if isinstance(payload.get('orders'), dict) else {}
+        attempted_at = int(time.time())
+        fetched_at = str(payload.get('fetched_at') or _now())[:80]
+
+        for sort_name in ('default', 'latest'):
+            incoming = orders.get(sort_name) if isinstance(orders.get(sort_name), dict) else {}
+            if incoming.get('observed') is True:
+                ids: list[str] = []
+                seen: set[str] = set()
+                for raw in incoming.get('activity_ids', []) if isinstance(incoming.get('activity_ids'), list) else []:
+                    activity_id = str(raw or '').strip()[:160]
+                    if not activity_id:
+                        continue
+                    external_id = activity_id if activity_id.startswith('xhs:') else 'xhs:' + activity_id
+                    if external_id not in seen:
+                        seen.add(external_id)
+                        ids.append(external_id)
+                observed_at = int(incoming.get('observed_at') or attempted_at)
+                unique_count = max(0, int(incoming.get('unique_count') or len(ids)))
+                incoming_truncated = bool(incoming.get('truncated')) or unique_count > len(ids)
+                previous = deepcopy(account_snapshots.get(sort_name)) if isinstance(account_snapshots.get(sort_name), dict) else {}
+                if (
+                    incoming_truncated
+                    and previous.get('activity_ids')
+                    and not bool(previous.get('truncated'))
+                    and len(previous.get('activity_ids') or []) > len(ids)
+                ):
+                    previous.update({
+                        'status': 'stale',
+                        'last_attempt_at': attempted_at,
+                        'error': '本次官方活动列表被调用方截断，已保留上次完整排序快照。',
+                        'last_observed_source_count': unique_count,
+                    })
+                    account_snapshots[sort_name] = previous
+                    continue
+                digest_payload = json.dumps(
+                    {
+                        'account_id': account_id,
+                        'sort': sort_name,
+                        'ids': ids,
+                        'query': incoming.get('query') if isinstance(incoming.get('query'), dict) else {},
+                    },
+                    ensure_ascii=False, separators=(',', ':'), sort_keys=True,
+                )
+                account_snapshots[sort_name] = {
+                    'snapshot_id': hashlib.sha256(digest_payload.encode('utf-8')).hexdigest()[:24],
+                    'status': 'fresh',
+                    'activity_ids': ids,
+                    'source_count': max(len(ids), unique_count),
+                    'raw_count': max(0, int(incoming.get('raw_count') or 0)),
+                    'unique_count': unique_count,
+                    'truncated': incoming_truncated,
+                    'query': deepcopy(incoming.get('query')) if isinstance(incoming.get('query'), dict) else {},
+                    'observed_at': observed_at,
+                    'fetched_at': fetched_at,
+                    'last_attempt_at': attempted_at,
+                    'error': '',
+                }
+            else:
+                previous = deepcopy(account_snapshots.get(sort_name)) if isinstance(account_snapshots.get(sort_name), dict) else {}
+                error = str(incoming.get('error') or f'{sort_name}_sort_not_observed')[:160]
+                if previous.get('activity_ids'):
+                    previous.update({'status': 'stale', 'last_attempt_at': attempted_at, 'error': error})
+                    account_snapshots[sort_name] = previous
+                else:
+                    account_snapshots[sort_name] = {
+                        'snapshot_id': '', 'status': 'missing', 'activity_ids': [],
+                        'source_count': 0, 'raw_count': 0, 'unique_count': 0, 'truncated': False,
+                        'query': deepcopy(incoming.get('query')) if isinstance(incoming.get('query'), dict) else {},
+                        'observed_at': 0, 'fetched_at': '', 'last_attempt_at': attempted_at, 'error': error,
+                    }
+
+        account_snapshots['last_attempt_at'] = attempted_at
+        snapshots[account_id] = account_snapshots
+        # Keep a small bounded set of account snapshots. Account IDs are opaque and
+        # no browser credentials or headers are persisted here.
+        if len(snapshots) > 8:
+            snapshots = dict(sorted(
+                snapshots.items(),
+                key=lambda pair: int((pair[1] or {}).get('last_attempt_at') or 0),
+                reverse=True,
+            )[:8])
+        state['xiaohongshu']['official_snapshots'] = snapshots
+        self._write(state)
+
+    def xiaohongshu_official_snapshot(self, account_id: str = '', sort_name: str = 'default') -> dict[str, Any]:
+        if sort_name not in {'default', 'latest'}:
+            raise WorkflowError("小红书官方排序只支持默认排序或最新排序。", 422)
+        state = self._state()
+        selected = str(account_id or state['xiaohongshu'].get('account_id') or '')[:32]
+        snapshots = state['xiaohongshu'].get('official_snapshots')
+        snapshots = snapshots if isinstance(snapshots, dict) else {}
+        if not selected:
+            account, _ = self._effective_account('xiaohongshu', '')
+            if account:
+                selected = str(account.get('id') or '')[:32]
+            elif len(snapshots) == 1:
+                selected = str(next(iter(snapshots.keys())))[:32]
+        account_snapshots = snapshots.get(selected) if selected and isinstance(snapshots.get(selected), dict) else {}
+        row = deepcopy(account_snapshots.get(sort_name)) if isinstance(account_snapshots.get(sort_name), dict) else {}
+        if not row:
+            return {'account_id': selected, 'sort': sort_name, 'status': 'missing',
+                    'activity_ids': [], 'source_count': 0, 'snapshot_id': '', 'fetched_at': '',
+                    'truncated': False, 'error': '官方排序快照尚未同步。'}
+        row['account_id'] = selected
+        row['sort'] = sort_name
+        return row
 
     def _save_tikhub_key(self, value: str) -> None:
         key = value.strip()
@@ -1131,6 +1249,7 @@ class CampaignSourceService:
         if status != "ready" or not account:
             raise WorkflowError("小红书活动源需要已连接的创作者账号。", 409)
         payload = self.workspace.xhs_ops.events(str(account["id"]), 500, detail_limit=12)
+        self._record_xhs_official_snapshots(str(account["id"]), payload)
         if not payload.get("items") and payload.get("source") == "creator_events_dom" and not payload.get("api_observed"):
             raise WorkflowError("小红书创作者活动列表接口本次未返回数据，请稍后重试。", 502)
         rows = []

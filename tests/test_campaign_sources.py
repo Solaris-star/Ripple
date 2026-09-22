@@ -418,6 +418,15 @@ def test_xiaohongshu_source_uses_connected_creator_account_and_marks_account_evi
         calls.append((account_id, limit, detail_limit))
         return {
             "source": "creator_events_api_v2", "raw_count": 250, "detail_count": 1,
+            "fetched_at": "2026-09-22T09:00:00+00:00",
+            "orders": {
+                "default": {"observed": True, "activity_ids": ["x1", "x2"], "raw_count": 2, "unique_count": 2,
+                            "truncated": False, "observed_at": 1790067600,
+                            "query": {"sort": "1", "type": "1", "source": "3", "topic_activity": "0"}},
+                "latest": {"observed": True, "activity_ids": ["x2", "x1"], "raw_count": 2, "unique_count": 2,
+                           "truncated": False, "observed_at": 1790067600,
+                           "query": {"sort": "2", "type": "1", "source": "3", "topic_activity": "0"}},
+            },
             "items": [{
                 "external_id": "x1", "title": "小红书创作活动",
                 "url": "https://fe.xiaohongshu.com/ditto/vincent/page1?resource_instance_id=1",
@@ -445,6 +454,92 @@ def test_xiaohongshu_source_uses_connected_creator_account_and_marks_account_evi
     assert rows[0]["prizes"] == ["参与投稿瓜分10W现金"]
     assert rows[0]["submission_spec"]["formats"] == ["image_text", "video"]
     assert rows[0]["qualification_state"] == "eligible"
+
+    default = service.xiaohongshu_official_snapshot(account["id"], "default")
+    latest = service.xiaohongshu_official_snapshot(account["id"], "latest")
+    assert default["status"] == "fresh" and default["activity_ids"] == ["xhs:x1", "xhs:x2"]
+    assert latest["status"] == "fresh" and latest["activity_ids"] == ["xhs:x2", "xhs:x1"]
+    assert default["snapshot_id"] and latest["snapshot_id"]
+
+    first_default_snapshot_id = default["snapshot_id"]
+    same_order = {
+        "fetched_at": "2026-09-22T10:00:00+00:00",
+        "orders": {
+            "default": {"observed": True, "activity_ids": ["x1", "x2"], "raw_count": 2, "unique_count": 2,
+                        "truncated": False, "observed_at": 1790071200,
+                        "query": {"sort": "1", "type": "1", "source": "3", "topic_activity": "0"}},
+            "latest": {"observed": True, "activity_ids": ["x2", "x1"], "raw_count": 2, "unique_count": 2,
+                       "truncated": False, "observed_at": 1790071200,
+                       "query": {"sort": "2", "type": "1", "source": "3", "topic_activity": "0"}},
+        },
+    }
+    service._record_xhs_official_snapshots(account["id"], same_order)
+    refreshed_default = service.xiaohongshu_official_snapshot(account["id"], "default")
+    assert refreshed_default["snapshot_id"] == first_default_snapshot_id
+    assert refreshed_default["fetched_at"] == "2026-09-22T10:00:00+00:00"
+
+
+    truncated_refresh = {
+        "fetched_at": "2026-09-22T11:00:00+00:00",
+        "orders": {
+            "default": {"observed": True, "activity_ids": ["x1"], "raw_count": 249, "unique_count": 249,
+                        "truncated": True, "observed_at": 1790074800,
+                        "query": {"sort": "1", "type": "1", "source": "3", "topic_activity": "0"}},
+            "latest": {"observed": True, "activity_ids": ["x2"], "raw_count": 249, "unique_count": 249,
+                       "truncated": True, "observed_at": 1790074800,
+                       "query": {"sort": "2", "type": "1", "source": "3", "topic_activity": "0"}},
+        },
+    }
+    service._record_xhs_official_snapshots(account["id"], truncated_refresh)
+    preserved_default = service.xiaohongshu_official_snapshot(account["id"], "default")
+    preserved_latest = service.xiaohongshu_official_snapshot(account["id"], "latest")
+    assert preserved_default["activity_ids"] == ["xhs:x1", "xhs:x2"]
+    assert preserved_latest["activity_ids"] == ["xhs:x2", "xhs:x1"]
+    assert preserved_default["status"] == preserved_latest["status"] == "stale"
+    assert preserved_default["last_observed_source_count"] == 249
+    assert "截断" in preserved_default["error"]
+
+
+
+def test_xiaohongshu_official_snapshot_keeps_last_good_sort_when_one_sort_fails(source_service, monkeypatch):
+    workspace, service = source_service
+    account = workspace.accounts.create(AccountInput(
+        platform="xiaohongshu", label="排序快照号", idempotency_key="xhs-sort-snapshot",
+    ))
+    with workspace.store.transaction() as state:
+        state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u3"})
+
+    payloads = [
+        {
+            "source": "creator_activity_center_api", "api_observed": True, "raw_count": 2,
+            "fetched_at": "2026-09-22T09:00:00+00:00",
+            "orders": {
+                "default": {"observed": True, "activity_ids": ["1", "2"], "raw_count": 2, "unique_count": 2, "truncated": False, "observed_at": 10},
+                "latest": {"observed": True, "activity_ids": ["2", "1"], "raw_count": 2, "unique_count": 2, "truncated": False, "observed_at": 10},
+            },
+            "items": [{"external_id": "1", "title": "A"}, {"external_id": "2", "title": "B"}],
+        },
+        {
+            "source": "creator_activity_center_api", "api_observed": True, "raw_count": 2,
+            "fetched_at": "2026-09-22T10:00:00+00:00",
+            "orders": {
+                "default": {"observed": True, "activity_ids": ["2", "1"], "raw_count": 2, "unique_count": 2, "truncated": False, "observed_at": 20},
+                "latest": {"observed": False, "activity_ids": [], "raw_count": 0, "unique_count": 0, "truncated": False, "observed_at": 20, "error": "latest_sort_option_missing"},
+            },
+            "items": [{"external_id": "2", "title": "B"}, {"external_id": "1", "title": "A"}],
+        },
+    ]
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda *args, **kwargs: payloads.pop(0))
+    service._xiaohongshu(service._state())
+    old_latest = service.xiaohongshu_official_snapshot(account["id"], "latest")
+    service._xiaohongshu(service._state())
+    new_default = service.xiaohongshu_official_snapshot(account["id"], "default")
+    new_latest = service.xiaohongshu_official_snapshot(account["id"], "latest")
+    assert new_default["activity_ids"] == ["xhs:2", "xhs:1"] and new_default["status"] == "fresh"
+    assert new_latest["activity_ids"] == old_latest["activity_ids"] == ["xhs:2", "xhs:1"]
+    assert new_latest["status"] == "stale"
+    assert new_latest["error"] == "latest_sort_option_missing"
+
 
 
 def test_xiaohongshu_source_treats_missing_api_and_empty_dom_as_transient_failure(source_service, monkeypatch):

@@ -478,38 +478,91 @@ def account_notes(directory: Path, limit: int) -> dict[str, Any]:
         _close(p, context)
 
 
+def _creator_activity_order(value: Any, *, limit: int = CREATOR_ACTIVITY_MAX) -> dict[str, Any]:
+    data = value.get('data') if isinstance(value, dict) and isinstance(value.get('data'), dict) else {}
+    values = data.get('activity_list') if isinstance(data.get('activity_list'), list) else []
+    ids: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not isinstance(raw, dict):
+            continue
+        activity_id = str(raw.get('activity_id') or '').strip()[:160]
+        if activity_id and activity_id not in seen:
+            seen.add(activity_id)
+            ids.append(activity_id)
+    cap = max(1, min(int(limit), CREATOR_ACTIVITY_MAX))
+    return {
+        'activity_ids': ids[:cap],
+        'raw_count': len(values),
+        'unique_count': len(ids),
+        'truncated': len(ids) > cap,
+    }
+
+
 def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_limit: int = 12) -> dict[str, Any]:
     p, context, page = _launch(directory)
-    activity_payload: dict[str, Any] | None = None
+    activity_payloads: dict[str, dict[str, Any]] = {}
+    sort_errors: dict[str, str] = {}
     try:
         def on_response(response):
-            nonlocal activity_payload
-            if '/creator/activity_center/list' not in response.url:
-                return
             try:
+                parsed = urlsplit(response.url)
+                if parsed.hostname != 'creator.xiaohongshu.com' or parsed.path != '/api/galaxy/v2/creator/activity_center/list':
+                    return
+                query = parse_qs(parsed.query)
+                if any(query.get(key) != [value] for key, value in (
+                    ('type', '1'), ('source', '3'), ('topic_activity', '0'),
+                )):
+                    return
+                sort_value = (query.get('sort') or [''])[0]
+                sort_name = 'default' if sort_value == '1' else 'latest' if sort_value == '2' else ''
+                if not sort_name:
+                    return
+                if int(response.status or 0) != 200:
+                    sort_errors[sort_name] = f'http_{int(response.status or 0)}'
+                    return
                 if 'json' not in (response.headers.get('content-type') or '').lower():
+                    sort_errors[sort_name] = 'non_json_response'
                     return
                 value = response.json()
-                if isinstance(value, dict) and isinstance(value.get('data'), dict) and isinstance(value['data'].get('activity_list'), list):
-                    activity_payload = value
+                data = value.get('data') if isinstance(value, dict) else None
+                if not isinstance(data, dict) or not isinstance(data.get('activity_list'), list):
+                    sort_errors[sort_name] = 'invalid_activity_payload'
+                    return
+                if value.get('success') is False:
+                    sort_errors[sort_name] = 'api_unsuccessful'
+                    return
+                activity_payloads[sort_name] = value
+                sort_errors.pop(sort_name, None)
             except Exception:
                 pass
 
-        def wait_activity_payload(wait_ms: int) -> None:
+        def wait_activity_payload(sort_name: str, wait_ms: int) -> None:
             deadline = time.monotonic() + max(0, wait_ms) / 1000
-            while activity_payload is None and time.monotonic() < deadline:
+            while sort_name not in activity_payloads and time.monotonic() < deadline:
                 page.wait_for_timeout(250)
+
+        def click_visible_text(label: str) -> bool:
+            try:
+                matches = page.get_by_text(label, exact=True)
+                for index in range(matches.count()):
+                    candidate = matches.nth(index)
+                    if candidate.is_visible():
+                        candidate.click(timeout=3000)
+                        return True
+            except Exception:
+                return False
+            return False
 
         page.on('response', on_response)
         _goto(page, 'https://creator.xiaohongshu.com/new/events', wait=1600)
-        wait_activity_payload(4500)
-        if activity_payload is None:
+        wait_activity_payload('default', 4500)
+        if 'default' not in activity_payloads:
             page.reload(wait_until='domcontentloaded', timeout=30000)
             page.wait_for_timeout(1600)
             _risk(page)
-            wait_activity_payload(4500)
-        try: page.remove_listener('response', on_response)
-        except Exception: pass
+            wait_activity_payload('default', 4500)
+
         body = ''
         try:
             body = (page.locator('body').inner_text(timeout=1500) or '')[:5000]
@@ -518,13 +571,54 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
         if 'login' in (page.url or '').lower() or ('登录' in body and ('扫码' in body or '手机号' in body)):
             raise XhsBrowserError('login_required')
 
-        api_observed = activity_payload is not None
-        raw_count = 0
+        if 'default' in activity_payloads:
+            try:
+                if click_visible_text('默认排序'):
+                    page.wait_for_timeout(350)
+                    if click_visible_text('最新排序'):
+                        wait_activity_payload('latest', 4500)
+                    else:
+                        sort_errors.setdefault('latest', 'latest_sort_option_missing')
+                else:
+                    sort_errors.setdefault('latest', 'default_sort_control_missing')
+            except Exception:
+                sort_errors.setdefault('latest', 'latest_sort_switch_failed')
+        try: page.remove_listener('response', on_response)
+        except Exception: pass
+
+        cap = max(1, min(limit, CREATOR_ACTIVITY_MAX))
+        default_payload = activity_payloads.get('default')
+        latest_payload = activity_payloads.get('latest')
+        api_observed = bool(activity_payloads)
+        default_order = _creator_activity_order(default_payload, limit=cap) if default_payload else {
+            'activity_ids': [], 'raw_count': 0, 'unique_count': 0, 'truncated': False,
+        }
+        latest_order = _creator_activity_order(latest_payload, limit=cap) if latest_payload else {
+            'activity_ids': [], 'raw_count': 0, 'unique_count': 0, 'truncated': False,
+        }
+        observed_at = int(time.time())
+        orders = {
+            'default': {**default_order, 'observed': bool(default_payload), 'sort': 1,
+                        'query': {'sort': '1', 'type': '1', 'source': '3', 'topic_activity': '0'},
+                        'observed_at': observed_at, 'error': str(sort_errors.get('default') or '')[:120]},
+            'latest': {**latest_order, 'observed': bool(latest_payload), 'sort': 2,
+                       'query': {'sort': '2', 'type': '1', 'source': '3', 'topic_activity': '0'},
+                       'observed_at': observed_at, 'error': str(sort_errors.get('latest') or '')[:120]},
+        }
+
+        raw_count = int(default_order.get('raw_count') or latest_order.get('raw_count') or 0)
         items: list[dict[str, Any]] = []
-        if api_observed:
-            values = ((activity_payload.get('data') or {}).get('activity_list') or [])
-            raw_count = len(values) if isinstance(values, list) else 0
-            items = _creator_activity_rows(activity_payload, limit=max(1, min(limit, CREATOR_ACTIVITY_MAX)))
+        if default_payload:
+            items.extend(_creator_activity_rows(default_payload, limit=cap))
+        if latest_payload:
+            seen_ids = {str(item.get('external_id') or '') for item in items}
+            for row in _creator_activity_rows(latest_payload, limit=cap):
+                external_id = str(row.get('external_id') or '')
+                if external_id and external_id not in seen_ids:
+                    items.append(row)
+                    seen_ids.add(external_id)
+                    if len(items) >= cap:
+                        break
         source = 'creator_activity_center_api' if api_observed else 'creator_events_dom'
         if not items:
             raw = page.evaluate(CREATOR_EVENTS_JS, max(1, min(limit, 50))) or []
@@ -598,7 +692,7 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
         return {'items': listed, 'source': source,
                 'page_url': 'https://creator.xiaohongshu.com/new/events',
                 'api_observed': api_observed, 'raw_count': raw_count, 'listed_count': len(listed),
-                'detail_count': detail_count, 'detail_fetched': detail_fetched}
+                'orders': orders, 'detail_count': detail_count, 'detail_fetched': detail_fetched}
     finally:
         _close(p, context)
 
@@ -793,8 +887,11 @@ def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
     if action=='search': return search(directory,str(params.get('query') or ''),limit)
     if action=='notes': return account_notes(directory,limit)
     if action=='events':
-        event_limit=max(1,min(int(params.get('limit') or CREATOR_ACTIVITY_MAX),CREATOR_ACTIVITY_MAX))
-        return creator_events(directory,event_limit,max(0,min(int(params.get('detail_limit') or 12),20)))
+        raw_event_limit = params.get('limit')
+        raw_detail_limit = params.get('detail_limit')
+        event_limit=max(1,min(int(CREATOR_ACTIVITY_MAX if raw_event_limit is None else raw_event_limit),CREATOR_ACTIVITY_MAX))
+        detail_limit=max(0,min(int(12 if raw_detail_limit is None else raw_detail_limit),20))
+        return creator_events(directory,event_limit,detail_limit)
     if action=='note': return note_detail(directory,str(params.get('url') or ''))
     if action=='comments': return comments(directory,str(params.get('url') or ''),limit)
     if action=='reply': return reply(directory,str(params.get('url') or ''),list(params.get('items') or []))

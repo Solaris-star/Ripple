@@ -11,7 +11,7 @@ from ripple.accounts import AccountInput
 from ripple.api import install
 from ripple.publishing import WorkflowError
 from ripple.workspace import WorkspaceService
-from ripple.xhs_browser import _creator_activity_rows, _creator_task_detail, _metrics, parse_note_url, public_note_url
+from ripple.xhs_browser import _creator_activity_order, _creator_activity_rows, _creator_task_detail, _metrics, parse_note_url, public_note_url
 
 
 def connected_service(tmp_path: Path) -> tuple[WorkspaceService, str]:
@@ -74,6 +74,22 @@ def test_creator_activity_rows_keep_full_activity_center_result_set():
     assert len(rows) == 250
     assert rows[0]["external_id"] == "1"
     assert rows[-1]["external_id"] == "250"
+
+def test_creator_activity_order_preserves_official_sequence_and_reports_truncation():
+    payload = {"data": {"activity_list": [
+        {"activity_id": "b", "activity_name": "B"},
+        {"activity_id": "a", "activity_name": "A"},
+        {"activity_id": "b", "activity_name": "B duplicate"},
+        {"activity_id": "c", "activity_name": "C"},
+    ]}}
+    order = _creator_activity_order(payload, limit=2)
+    assert order == {
+        "activity_ids": ["b", "a"],
+        "raw_count": 4,
+        "unique_count": 3,
+        "truncated": True,
+    }
+
 
 
 def test_creator_task_detail_maps_publish_topic_rewards_and_account_eligibility():
@@ -160,6 +176,17 @@ def test_creator_events_use_same_connected_xhs_profile_boundary(tmp_path, monkey
     assert result["sample_scope"] == "selected_account_creator_events"
     assert result["items"][0]["external_id"] == "event1"
     assert calls == [("xhs_read", "events", {"limit": 250, "detail_limit": 12})]
+
+def test_creator_events_zero_detail_limit_is_forwarded_without_defaulting(tmp_path, monkeypatch):
+    service, account_id = connected_service(tmp_path)
+    calls = []
+    def run(account, operation, operation_id, **extra):
+        calls.append(extra["xhs_params"])
+        return fake_read_result(extra["xhs_action"])
+    monkeypatch.setattr(service.accounts, "run", run)
+    service.xhs_ops.events(account_id, 250, detail_limit=0)
+    assert calls == [{"limit": 250, "detail_limit": 0}]
+
 
 
 def test_interaction_draft_idempotency_guard_and_execute_once(tmp_path, monkeypatch):

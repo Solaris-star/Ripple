@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from datetime import datetime, timezone
 import difflib
 import os
 if os.name == "nt":
@@ -3869,6 +3870,166 @@ def _campaign_effective_status(item: dict) -> str:
     return explicit if explicit in CAMPAIGN_STATUSES and explicit != "unknown" else ("active" if start or end else "unknown")
 
 
+def _campaign_deadline_days(item: dict) -> int | None:
+    raw = str(item.get("submit_deadline") or "")[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        return None
+    try:
+        return (datetime.fromisoformat(raw).date() - datetime.now(timezone.utc).date()).days
+    except ValueError:
+        return None
+
+
+def _campaign_page_filter(item: dict, *, activity_type: str, reward_type: str,
+                          deadline: str, qualification: str, account_id: str) -> bool:
+    if activity_type != "all" and item.get("activity_type") != activity_type:
+        return False
+    if reward_type != "all" and item.get("reward_type") != reward_type:
+        return False
+    if qualification != "all" and item.get("qualification_state") != qualification:
+        return False
+    if account_id:
+        states = item.get("account_states") if isinstance(item.get("account_states"), dict) else {}
+        account_state = states.get(account_id) if isinstance(states.get(account_id), dict) else {}
+        if item.get("account_id") != account_id and account_state.get("visible") is not True:
+            return False
+    if deadline != "all":
+        days = _campaign_deadline_days(item)
+        if deadline == "none":
+            return days is None
+        if deadline == "7" and (days is None or days < 0 or days > 7):
+            return False
+        if deadline == "30" and (days is None or days < 0 or days > 30):
+            return False
+    return True
+
+
+def _campaign_local_priority(item: dict) -> tuple[int, int]:
+    status = str(item.get("status") or "unknown")
+    score = (
+        (40 if status == "active" else 20 if status == "upcoming" else 0)
+        + (20 if item.get("qualification_state") == "eligible" else 8 if item.get("qualification_state") == "unknown" else -30)
+        + (6 if item.get("saved") else 0)
+        + (4 if _campaign_deadline_days(item) is not None and (_campaign_deadline_days(item) or 0) >= 0 else 0)
+    )
+    return score, int(item.get("updated_at") or 0)
+
+
+def _campaign_page_result(*, platform: str = "all", account_id: str = "", sort: str = "recommend",
+                          page: int = 1, activity_type: str = "all", reward_type: str = "all",
+                          deadline: str = "all", qualification: str = "all",
+                          snapshot_id: str = "") -> dict[str, Any]:
+    allowed_platforms = {"all", *CAMPAIGN_PLATFORM_LABELS.keys()}
+    if platform not in allowed_platforms:
+        raise WorkflowError("不支持的活动平台筛选。", 422)
+    if deadline not in {"all", "7", "30", "none"}:
+        raise WorkflowError("不支持的截止时间筛选。", 422)
+    if qualification not in {"all", *CAMPAIGN_QUALIFICATION_STATES}:
+        raise WorkflowError("不支持的资格状态筛选。", 422)
+    if len(account_id) > 80 or len(snapshot_id) > 80:
+        raise WorkflowError("活动分页参数过长。", 422)
+    page = max(1, min(int(page or 1), 100000))
+    page_size = 10
+
+    all_items = [{**row, "status": _campaign_effective_status(row)} for row in _read_campaigns()]
+    stats = {
+        "active": sum(1 for row in all_items if row["status"] == "active"),
+        "soon": sum(1 for row in all_items if (lambda d: d is not None and 0 <= d <= 7)(_campaign_deadline_days(row))),
+        "saved": sum(1 for row in all_items if bool(row.get("saved"))),
+    }
+    filter_options = {
+        "activity_types": sorted({str(row.get("activity_type") or "") for row in all_items if str(row.get("activity_type") or "")}),
+        "reward_types": sorted({str(row.get("reward_type") or "") for row in all_items if str(row.get("reward_type") or "")}),
+    }
+
+    source_status = "local"
+    source_total = 0
+    fetched_at = ""
+    current_snapshot_id = ""
+    truncated = False
+    missing_source_items = 0
+    selected_account_id = account_id
+
+    if platform == "xiaohongshu":
+        if sort not in {"default", "latest"}:
+            raise WorkflowError("小红书官方活动只支持默认排序或最新排序。", 422)
+        snapshot = _CAMPAIGN_SOURCES.xiaohongshu_official_snapshot(account_id, sort)
+        selected_account_id = str(snapshot.get("account_id") or account_id or "")[:80]
+        source_status = str(snapshot.get("status") or "missing")
+        current_snapshot_id = str(snapshot.get("snapshot_id") or "")[:80]
+        fetched_at = str(snapshot.get("fetched_at") or "")[:80]
+        truncated = bool(snapshot.get("truncated"))
+        order_ids = [str(value) for value in snapshot.get("activity_ids", []) if str(value)]
+        source_total = max(len(order_ids), int(snapshot.get("source_count") or 0))
+        if not order_ids or not current_snapshot_id:
+            raise WorkflowError("小红书官方排序快照尚未同步，请先刷新活动。", 409)
+        if snapshot_id and snapshot_id != current_snapshot_id:
+            raise WorkflowError("小红书活动排序已更新，请从第一页重新查看。", 409)
+        by_external: dict[str, dict] = {}
+        for row in all_items:
+            if row.get("platform") != "xiaohongshu":
+                continue
+            ids = row.get("external_ids") if isinstance(row.get("external_ids"), dict) else {}
+            external_id = str(ids.get("xiaohongshu_creator_events") or "")
+            if external_id and external_id not in by_external:
+                by_external[external_id] = row
+        ordered = [by_external[value] for value in order_ids if value in by_external]
+        missing_source_items = max(0, source_total - len(ordered))
+        rows = ordered
+    else:
+        if sort not in {"recommend", "new", "deadline", "saved"}:
+            raise WorkflowError("不支持的活动排序方式。", 422)
+        rows = [row for row in all_items if platform == "all" or row.get("platform") == platform]
+        source_total = len(rows)
+
+    rows = [
+        row for row in rows
+        if _campaign_page_filter(
+            row, activity_type=activity_type, reward_type=reward_type,
+            deadline=deadline, qualification=qualification,
+            account_id=selected_account_id if account_id else "",
+        )
+    ]
+
+    if platform != "xiaohongshu":
+        if sort == "saved":
+            rows = [row for row in rows if bool(row.get("saved"))]
+        if sort == "new":
+            rows.sort(key=lambda row: int(row.get("updated_at") or 0), reverse=True)
+        elif sort == "deadline":
+            rows.sort(key=lambda row: str(row.get("submit_deadline") or "")[:10] or "9999-99-99")
+        else:
+            rows.sort(key=_campaign_local_priority, reverse=True)
+
+    total = len(rows)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    offset = (page - 1) * page_size
+    page_items = rows[offset:offset + page_size]
+    range_start = offset + 1 if total else 0
+    range_end = min(total, offset + len(page_items)) if total else 0
+    return {
+        "items": page_items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "range_start": range_start,
+        "range_end": range_end,
+        "sort": sort,
+        "platform": platform,
+        "account_id": selected_account_id,
+        "snapshot_id": current_snapshot_id,
+        "fetched_at": fetched_at,
+        "source_status": source_status,
+        "source_total": source_total,
+        "truncated": truncated,
+        "missing_source_items": missing_source_items,
+        "stats": stats,
+        "filter_options": filter_options,
+    }
+
+
 class CampaignInput(BaseModel):
     title: str = Field(min_length=1, max_length=240)
     platform: str = Field(pattern=r"^(x|xiaohongshu|douyin|bilibili|wechat|weixin-channels)$")
@@ -4670,6 +4831,22 @@ async def api_campaign_import_preview(req: CampaignImportPreviewInput):
 async def api_campaign_list():
     items = _read_campaigns()
     return [{**item, "status": _campaign_effective_status(item)} for item in items]
+
+
+@app.get("/api/campaigns/page")
+async def api_campaign_page(
+    platform: str = "all", account_id: str = "", sort: str = "recommend", page: int = 1,
+    activity_type: str = "all", reward_type: str = "all", deadline: str = "all",
+    qualification: str = "all", snapshot_id: str = "",
+):
+    try:
+        return _campaign_page_result(
+            platform=platform, account_id=account_id, sort=sort, page=page,
+            activity_type=activity_type, reward_type=reward_type,
+            deadline=deadline, qualification=qualification, snapshot_id=snapshot_id,
+        )
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
 
 
 @app.get("/api/campaigns/{cid}")

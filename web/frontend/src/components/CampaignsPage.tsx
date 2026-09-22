@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   cancelCampaignEnrichment, configureCampaignSource, createCampaign, createIdea, createSchedule, enrichCampaign,
-  fetchCampaignEnrichmentPreview, fetchCampaignEnrichmentStatus, fetchCampaigns, fetchCampaignSources,
+  fetchCampaignEnrichmentPreview, fetchCampaignEnrichmentStatus, fetchCampaignPage, fetchCampaignSources,
   fetchXCampaignEnrichmentStatus,
   fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, runCampaignEnrichment,
   saveCampaign, updateCampaign, verifyCampaign,
 } from '../lib/api';
 import type {
-  Campaign, CampaignEnrichmentPreview, CampaignEnrichmentStatus, CampaignInput, CampaignPlatform,
+  Campaign, CampaignEnrichmentPreview, CampaignEnrichmentStatus, CampaignInput, CampaignListSort, CampaignPageResponse, CampaignPlatform,
   CampaignSourceCapability, CampaignSubmissionSpec, IdeaRecommendation, IdeaRecommendResponse,
   PersonaItem, TopicUseContext, TrendGroup,
 } from '../lib/api';
@@ -217,10 +217,27 @@ function isNetworkError(error: unknown): boolean {
   return /failed to fetch|networkerror|load failed|network request failed/i.test(message);
 }
 
+function paginationItems(page: number, totalPages: number): Array<number | 'ellipsis'> {
+  if (totalPages <= 7) return Array.from({ length: totalPages }, (_, index) => index + 1);
+  const values = new Set<number>([1, totalPages, page - 1, page, page + 1]);
+  if (page <= 4) [2, 3, 4, 5].forEach((value) => values.add(value));
+  if (page >= totalPages - 3) [totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1].forEach((value) => values.add(value));
+  const sorted = Array.from(values).filter((value) => value >= 1 && value <= totalPages).sort((a, b) => a - b);
+  const out: Array<number | 'ellipsis'> = [];
+  sorted.forEach((value, index) => {
+    if (index && value - sorted[index - 1] > 1) out.push('ellipsis');
+    out.push(value);
+  });
+  return out;
+}
+
 export default function CampaignsPage({
   onUseTopic, persona, aiReady, personas, onPersonaChange, onNewPersona, onOpenSettings,
 }: CampaignsPageProps) {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [pageData, setPageData] = useState<CampaignPageResponse | null>(null);
+  const [page, setPage] = useState(1);
+  const [snapshotChanged, setSnapshotChanged] = useState(false);
   const [sources, setSources] = useState<CampaignSourceCapability[]>([]);
   const [automaticCount, setAutomaticCount] = useState(0);
   const [trendGroups, setTrendGroups] = useState<TrendGroup[]>([]);
@@ -252,7 +269,8 @@ export default function CampaignsPage({
   });
   const [sourceSaving, setSourceSaving] = useState(false);
   const loadRef = useRef<(initial?: boolean) => Promise<void>>(async () => undefined);
-  const loadInFlightRef = useRef(false);
+  const loadRequestRef = useRef(0);
+  const snapshotIdRef = useRef('');
   const retryTimerRef = useRef<number | null>(null);
   const retryAttemptRef = useRef(0);
   const campaignsLoadedRef = useRef(false);
@@ -264,7 +282,7 @@ export default function CampaignsPage({
   const [deadlineFilter, setDeadlineFilter] = useState('all');
   const [qualificationFilter, setQualificationFilter] = useState('all');
   const [accountFilter, setAccountFilter] = useState('all');
-  const [sortMode, setSortMode] = useState<'recommend' | 'new' | 'deadline' | 'saved'>('recommend');
+  const [sortMode, setSortMode] = useState<CampaignListSort>('recommend');
 
   const [form, setForm] = useState<CampaignInput | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
@@ -321,38 +339,65 @@ export default function CampaignsPage({
   }, [scheduleRetry]);
 
   const load = useCallback(async (initial = false) => {
-    if (loadInFlightRef.current) return;
-    loadInFlightRef.current = true;
+    const requestId = ++loadRequestRef.current;
     if (initial && !campaignsLoadedRef.current && !sourcesLoadedRef.current) setLoading(true);
+    const listSort: CampaignListSort = platformFilter === 'xiaohongshu'
+      ? (sortMode === 'latest' ? 'latest' : 'default')
+      : (['recommend', 'new', 'deadline', 'saved'].includes(sortMode) ? sortMode as CampaignListSort : 'recommend');
     try {
       let runtime;
       try {
         runtime = await fetchStatus();
       } catch {
-        markConnectionFailure();
+        if (requestId === loadRequestRef.current) markConnectionFailure();
         return;
       }
       if (!runtime.features?.campaigns || !runtime.features?.campaign_sources_v2) {
-        setReconnecting(false);
-        setConnectionIssue('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
-        clearRetry();
+        if (requestId === loadRequestRef.current) {
+          setReconnecting(false);
+          setConnectionIssue('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
+          clearRetry();
+        }
         return;
       }
 
       const [campaignResult, sourceResult, accountResult, agentResult, xRuleResult] = await Promise.allSettled([
-        fetchCampaigns(), fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
+        fetchCampaignPage({
+          platform: platformFilter,
+          account_id: accountFilter === 'all' ? '' : accountFilter,
+          sort: listSort,
+          page,
+          activity_type: typeFilter,
+          reward_type: rewardFilter,
+          deadline: deadlineFilter,
+          qualification: qualificationFilter,
+          snapshot_id: platformFilter === 'xiaohongshu' ? snapshotIdRef.current : '',
+        }),
+        fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
         fetchCampaignEnrichmentStatus(), fetchXCampaignEnrichmentStatus(),
       ]);
+      if (requestId !== loadRequestRef.current) return;
 
       let coreFailed = false;
+      let logicalError = '';
       if (campaignResult.status === 'fulfilled') {
-        const campaignRows = campaignResult.value;
-        setCampaigns(campaignRows);
+        const value = campaignResult.value;
+        setCampaigns(value.items || []);
+        setPageData(value);
+        if (value.page !== page) setPage(value.page);
+        if (platformFilter === 'xiaohongshu' && value.snapshot_id) snapshotIdRef.current = value.snapshot_id;
+        setSnapshotChanged(false);
         setCampaignsLoaded(true);
         campaignsLoadedRef.current = true;
-        setSelected((current) => current ? campaignRows.find((x) => x.id === current.id) || null : null);
+        setSelected((current) => current ? value.items.find((x) => x.id === current.id) || current : null);
       } else {
-        coreFailed = true;
+        const reason = campaignResult.reason;
+        const message = reason instanceof Error ? reason.message : '活动分页读取失败';
+        if (isNetworkError(reason)) coreFailed = true;
+        else {
+          logicalError = message;
+          if (message.includes('排序已更新')) setSnapshotChanged(true);
+        }
       }
 
       if (sourceResult.status === 'fulfilled') {
@@ -362,8 +407,10 @@ export default function CampaignsPage({
         setSourcesLoaded(true);
         sourcesLoadedRef.current = true;
         if (sourceState.server_now) setServerOffset(sourceState.server_now - Math.floor(Date.now() / 1000));
-      } else {
+      } else if (isNetworkError(sourceResult.reason)) {
         coreFailed = true;
+      } else {
+        logicalError ||= sourceResult.reason instanceof Error ? sourceResult.reason.message : '活动源状态读取失败';
       }
 
       if (accountResult.status === 'fulfilled') setAccounts(accountResult.value);
@@ -376,13 +423,15 @@ export default function CampaignsPage({
         clearRetry();
         setReconnecting(false);
         setConnectionIssue('');
-        setError('');
+        setError(logicalError);
       }
     } finally {
-      loadInFlightRef.current = false;
-      if (initial) setLoading(false);
+      if (requestId === loadRequestRef.current && initial) setLoading(false);
     }
-  }, [clearRetry, markConnectionFailure]);
+  }, [
+    accountFilter, clearRetry, deadlineFilter, markConnectionFailure, page, platformFilter,
+    qualificationFilter, rewardFilter, sortMode, typeFilter,
+  ]);
 
   useEffect(() => {
     loadRef.current = load;
@@ -436,9 +485,6 @@ export default function CampaignsPage({
     setRefreshing(true); setError('');
     try {
       const result = await refreshCampaigns(platforms, true);
-      setCampaigns(result.campaigns);
-      setCampaignsLoaded(true);
-      campaignsLoadedRef.current = true;
       setSelected((current) => current ? result.campaigns.find((row) => row.id === current.id) || current : null);
       setSources(result.sources.items || []);
       setAutomaticCount(result.sources.automatic_count || 0);
@@ -450,6 +496,15 @@ export default function CampaignsPage({
       const fresh = result.results.filter((row) => row.status === 'fresh');
       const stale = result.results.filter((row) => row.status !== 'fresh' && row.status !== 'cached');
       showToast(`已刷新 ${fresh.length} 个来源${stale.length ? `，${stale.length} 个来源需要处理` : ''}`);
+
+      if (platformFilter === 'xiaohongshu') {
+        snapshotIdRef.current = '';
+        setSnapshotChanged(false);
+        if (page !== 1) setPage(1);
+        else await load(false);
+      } else {
+        await load(false);
+      }
     } catch (e) {
       if (isNetworkError(e)) markConnectionFailure();
       else setError(e instanceof Error ? e.message : '活动刷新失败');
@@ -526,51 +581,44 @@ export default function CampaignsPage({
     finally { setSourceSaving(false); }
   };
 
-  const activityTypes = useMemo(() => Array.from(new Set(campaigns.map((x) => x.activity_type).filter(Boolean))), [campaigns]);
-  const rewardTypes = useMemo(() => Array.from(new Set(campaigns.map((x) => x.reward_type).filter(Boolean))), [campaigns]);
+  const changePlatformFilter = (value: string) => {
+    snapshotIdRef.current = '';
+    setSnapshotChanged(false);
+    setPage(1);
+    setPlatformFilter(value);
+    setAccountFilter('all');
+    setSortMode(value === 'xiaohongshu' ? 'default' : 'recommend');
+  };
 
-  const visible = useMemo(() => {
-    let rows = campaigns.filter((campaign) => {
-      if (platformFilter !== 'all' && campaign.platform !== platformFilter) return false;
-      if (typeFilter !== 'all' && campaign.activity_type !== typeFilter) return false;
-      if (rewardFilter !== 'all' && campaign.reward_type !== rewardFilter) return false;
-      if (qualificationFilter !== 'all' && campaign.qualification_state !== qualificationFilter) return false;
-      if (accountFilter !== 'all' && campaign.account_id !== accountFilter) return false;
-      if (deadlineFilter !== 'all') {
-        const days = daysUntil(campaign.submit_deadline);
-        if (deadlineFilter === 'none' && days !== null) return false;
-        if (deadlineFilter === '7' && (days === null || days < 0 || days > 7)) return false;
-        if (deadlineFilter === '30' && (days === null || days < 0 || days > 30)) return false;
-      }
-      if (sortMode === 'saved' && !campaign.saved) return false;
-      return true;
-    });
-    rows = [...rows].sort((a, b) => {
-      if (sortMode === 'new') return b.updated_at - a.updated_at;
-      if (sortMode === 'deadline') {
-        const da = dateOnly(a.submit_deadline) || '9999-99-99';
-        const db = dateOnly(b.submit_deadline) || '9999-99-99';
-        return da.localeCompare(db);
-      }
-      const priority = (item: Campaign) => (
-        (item.status === 'active' ? 40 : item.status === 'upcoming' ? 20 : 0)
-        + (item.qualification_state === 'eligible' ? 20 : item.qualification_state === 'unknown' ? 8 : -30)
-        + (item.saved ? 6 : 0)
-        + (item.submit_deadline && (daysUntil(item.submit_deadline) ?? 999) >= 0 ? 4 : 0)
-      );
-      return priority(b) - priority(a) || b.updated_at - a.updated_at;
-    });
-    return rows;
-  }, [campaigns, platformFilter, typeFilter, rewardFilter, deadlineFilter, qualificationFilter, accountFilter, sortMode]);
+  const changeSortMode = (value: CampaignListSort) => {
+    if (platformFilter === 'xiaohongshu') {
+      snapshotIdRef.current = '';
+      setSnapshotChanged(false);
+    }
+    setPage(1);
+    setSortMode(value);
+  };
 
-  const stats = useMemo(() => ({
-    active: campaigns.filter((x) => x.status === 'active').length,
-    soon: campaigns.filter((x) => {
-      const days = daysUntil(x.submit_deadline);
-      return days !== null && days >= 0 && days <= 7;
-    }).length,
-    saved: campaigns.filter((x) => x.saved).length,
-  }), [campaigns]);
+  const acceptLatestSnapshot = () => {
+    snapshotIdRef.current = '';
+    setSnapshotChanged(false);
+    setError('');
+    if (page !== 1) setPage(1);
+    else void load(false);
+  };
+
+  const activityTypes = pageData?.filter_options.activity_types || [];
+  const rewardTypes = pageData?.filter_options.reward_types || [];
+  const visible = campaigns;
+  const stats = pageData?.stats || { active: 0, soon: 0, saved: 0 };
+  const hasSourceRows = (pageData?.source_total || 0) > 0;
+  const sortOptions: ReadonlyArray<readonly [CampaignListSort, string]> = platformFilter === 'xiaohongshu'
+    ? [['default', '默认排序'], ['latest', '最新排序']]
+    : [['recommend', '推荐排序'], ['new', '最近更新'], ['deadline', '即将截止'], ['saved', '已收藏']];
+  const pageButtons = pageData ? paginationItems(pageData.page, pageData.total_pages) : [];
+  const accountOptions = platformFilter === 'all'
+    ? accounts
+    : accounts.filter((account) => account.platform === platformFilter);
 
   const trends = useMemo(() => trendGroups.flatMap((group) =>
     group.items.slice(0, 4).map((item) => ({ ...item, platform: group.label, platformKey: group.platform, status: group.status }))).slice(0, 10), [trendGroups]);
@@ -658,6 +706,7 @@ export default function CampaignsPage({
       const value = await saveCampaign(campaign.id, !campaign.saved);
       setCampaigns((rows) => rows.map((x) => x.id === value.id ? value : x));
       setSelected((current) => current?.id === value.id ? value : current);
+      await load(false);
     } catch (e) {
       showToast(e instanceof Error ? e.message : '收藏失败');
     }
@@ -804,7 +853,7 @@ export default function CampaignsPage({
           const remaining = nextRun ? Math.max(0, nextRun - now) : 0;
           const configurable = ['x', 'xiaohongshu', 'douyin'].includes(source.platform);
           const selectedSource = platformFilter === source.platform;
-          const toggleSource = () => setPlatformFilter(selectedSource ? 'all' : source.platform);
+          const toggleSource = () => changePlatformFilter(selectedSource ? 'all' : source.platform);
           return <article
             key={source.id || source.platform}
             className={`campaign-source-status source-${source.status || 'unknown'} ${selectedSource ? 'selected' : ''}`.trim()}
@@ -834,25 +883,25 @@ export default function CampaignsPage({
       </section>}
 
       <div className="campaign-filters">
-        <select className="field" value={platformFilter} onChange={(e) => setPlatformFilter(e.target.value)}>
+        <select className="field" value={platformFilter} onChange={(e) => changePlatformFilter(e.target.value)}>
           <option value="all">全部平台</option>
           {PLATFORMS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
         </select>
-        <select className="field" value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+        <select className="field" value={typeFilter} onChange={(e) => { setTypeFilter(e.target.value); setPage(1); }}>
           <option value="all">全部活动类型</option>
           {activityTypes.map((x) => <option key={x}>{x}</option>)}
         </select>
-        <select className="field" value={rewardFilter} onChange={(e) => setRewardFilter(e.target.value)}>
+        <select className="field" value={rewardFilter} onChange={(e) => { setRewardFilter(e.target.value); setPage(1); }}>
           <option value="all">全部奖励类型</option>
           {rewardTypes.map((x) => <option key={x}>{x}</option>)}
         </select>
-        <select className="field" value={deadlineFilter} onChange={(e) => setDeadlineFilter(e.target.value)}>
+        <select className="field" value={deadlineFilter} onChange={(e) => { setDeadlineFilter(e.target.value); setPage(1); }}>
           <option value="all">全部截止时间</option>
           <option value="7">7 天内截止</option>
           <option value="30">30 天内截止</option>
           <option value="none">未说明截止时间</option>
         </select>
-        <select className="field" value={qualificationFilter} onChange={(e) => setQualificationFilter(e.target.value)}>
+        <select className="field" value={qualificationFilter} onChange={(e) => { setQualificationFilter(e.target.value); setPage(1); }}>
           <option value="all">全部资格状态</option>
           <option value="eligible">已知符合</option>
           <option value="unknown">资格信息不足</option>
@@ -865,22 +914,29 @@ export default function CampaignsPage({
           {personas.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
           <option value="__new__">+ 新建画像…</option>
         </select>
-        <select className="field" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
+        <select className="field" value={accountFilter} onChange={(e) => {
+          snapshotIdRef.current = '';
+          setSnapshotChanged(false);
+          setAccountFilter(e.target.value);
+          setPage(1);
+        }}>
           <option value="all">全部参与账号</option>
-          {accounts.map((a) => <option key={a.id} value={a.id}>{a.label} · {platformLabel(a.platform)}</option>)}
+          {accountOptions.map((a) => <option key={a.id} value={a.id}>{a.label} · {platformLabel(a.platform)}</option>)}
         </select>
       </div>
 
       <div className="campaign-sort">
-        {([
-          ['recommend', '推荐排序'], ['new', '最近更新'], ['deadline', '即将截止'], ['saved', '已收藏'],
-        ] as const).map(([key, label]) => (
-          <button key={key} className={sortMode === key ? 'active' : ''} onClick={() => setSortMode(key)}>{label}</button>
+        {sortOptions.map(([key, label]) => (
+          <button key={key} className={sortMode === key ? 'active' : ''} onClick={() => changeSortMode(key)}>{label}</button>
         ))}
-        <span>{campaignsLoaded ? `共 ${visible.length} 个活动` : '活动数据未读取'}</span>
+        <span>{campaignsLoaded && pageData
+          ? `共 ${pageData.total} 个活动 · 第 ${pageData.range_start}–${pageData.range_end} 条 · ${pageData.page}/${pageData.total_pages} 页${pageData.truncated ? ' · 来源结果达到同步上限' : ''}`
+          : '活动数据未读取'}</span>
       </div>
 
       {connectionIssue && <div className={`campaign-connection-notice ${reconnecting ? 'reconnecting' : ''}`}>{connectionIssue}{reconnecting && <span>自动重试中…</span>}</div>}
+      {snapshotChanged && <div className="campaign-snapshot-notice"><span>小红书活动排序已有新快照，当前页面没有混入新旧两批顺序。</span><button className="r2-text-button" onClick={acceptLatestSnapshot}>查看最新排序</button></div>}
+      {platformFilter === 'xiaohongshu' && pageData?.source_status === 'stale' && <div className="campaign-snapshot-notice stale"><span>当前展示上次成功同步的小红书官方排序快照。</span></div>}
       {error && <div className="notice-error">{error}</div>}
       <div className="campaign-layout">
         <main className="campaign-list">
@@ -895,9 +951,9 @@ export default function CampaignsPage({
           {campaignsLoaded && visible.length === 0 && (
             <div className="campaign-empty">
               <IconCompass size={28} />
-              <strong>{campaigns.length ? '当前筛选条件没有匹配活动' : '还没有已确认的创作活动'}</strong>
-              <p>{campaigns.length ? '调整筛选条件继续查看。' : '可点击“刷新活动”从已就绪的数据源自动获取；手动导入用于补充遗漏活动。Ripple 不会用虚构活动填充这里。'}</p>
-              {!campaigns.length && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing || !sourcesLoaded} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openImport}>补充导入</button></div>}
+              <strong>{hasSourceRows ? '当前筛选条件没有匹配活动' : '还没有已确认的创作活动'}</strong>
+              <p>{hasSourceRows ? '调整筛选条件继续查看。' : '可点击“刷新活动”从已就绪的数据源自动获取；手动导入用于补充遗漏活动。Ripple 不会用虚构活动填充这里。'}</p>
+              {!hasSourceRows && <div style={{ display: 'flex', gap: 8 }}><button className="btn btn-primary btn-sm" disabled={refreshing || !sourcesLoaded} onClick={() => void refreshNow()}>刷新活动</button><button className="btn btn-sm" onClick={openImport}>补充导入</button></div>}
             </div>
           )}
           <div className="campaign-grid">
@@ -946,6 +1002,19 @@ export default function CampaignsPage({
               );
             })}
           </div>
+
+          {campaignsLoaded && pageData && pageData.total_pages > 1 && (
+            <nav className="campaign-pagination" aria-label="活动分页">
+              <span className="campaign-pagination-info">每页 10 条</span>
+              <div className="campaign-pagination-pages">
+                <button disabled={pageData.page <= 1} onClick={() => setPage(Math.max(1, pageData.page - 1))}>上一页</button>
+                {pageButtons.map((item, index) => item === 'ellipsis'
+                  ? <span className="campaign-pagination-ellipsis" key={`ellipsis-${index}`}>…</span>
+                  : <button key={item} className={pageData.page === item ? 'active' : ''} aria-current={pageData.page === item ? 'page' : undefined} onClick={() => setPage(item)}>{item}</button>)}
+                <button disabled={pageData.page >= pageData.total_pages} onClick={() => setPage(Math.min(pageData.total_pages, pageData.page + 1))}>下一页</button>
+              </div>
+            </nav>
+          )}
 
         </main>
 

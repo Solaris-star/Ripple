@@ -1136,6 +1136,16 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-sort button:hover { color: var(--text); }
 .campaign-sort button.active { color: var(--accent-end); font-weight: 650; border-bottom-color: var(--accent-end); }
 .campaign-sort > span { margin-left: auto; font-size: 13px; color: var(--text-tertiary); padding-right: 4px; }
+.campaign-snapshot-notice { max-width: 1220px; margin: 9px auto 0; padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--accent-end) 28%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--accent-end) 7%, var(--surface)); display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-secondary); font-size: 13px; }
+.campaign-snapshot-notice.stale { border-color: color-mix(in srgb, #d7912c 35%, var(--border)); background: color-mix(in srgb, #d7912c 7%, var(--surface)); }
+.campaign-pagination { margin-top: 16px; min-height: 38px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.campaign-pagination-info { color: var(--text-tertiary); font-size: 12px; }
+.campaign-pagination-pages { display: flex; align-items: center; justify-content: flex-end; gap: 5px; flex-wrap: wrap; }
+.campaign-pagination-pages button { min-width: 34px; height: 34px; padding: 0 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); color: var(--text-secondary); cursor: pointer; font-size: 13px; }
+.campaign-pagination-pages button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent-end) 45%, var(--border)); color: var(--accent-end); }
+.campaign-pagination-pages button.active { border-color: transparent; background: var(--accent-soft); color: var(--accent-end); font-weight: 650; }
+.campaign-pagination-pages button:disabled { opacity: .42; cursor: default; }
+.campaign-pagination-ellipsis { min-width: 20px; text-align: center; color: var(--text-tertiary); }
 .campaign-layout { max-width: 1220px; margin: 14px auto 0; display: grid; grid-template-columns: minmax(0, 1fr) 240px; gap: 14px; align-items: start; }
 .campaign-list { min-width: 0; }
 .campaign-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
@@ -1288,6 +1298,9 @@ textarea.field { resize: vertical; min-height: 90px; }
 }
 @media (max-width: 760px) {
   .campaign-page { padding: 20px 14px 60px; }
+  .campaign-pagination { align-items: flex-start; flex-direction: column; }
+  .campaign-pagination-pages { justify-content: flex-start; }
+  .campaign-snapshot-notice { align-items: flex-start; flex-direction: column; }
   .campaign-stats, .campaign-grid, .campaign-source-grid > div, .campaign-source-status-grid { grid-template-columns: 1fr; }
   .campaign-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .campaign-rec-context { grid-template-columns: repeat(2, 1fr); }

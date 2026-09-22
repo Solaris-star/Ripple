@@ -60,6 +60,131 @@ def test_running_agent_status_is_recovered_after_server_restart(tmp_path, monkey
     assert row["enrichment_status"] == "incomplete"
     assert row["missing_fields"]
 
+def test_campaign_page_boundaries_and_legacy_list_compatibility(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+
+    def rows(count):
+        return [{
+            "id": f"bili-{index}", "title": f"活动 {index}", "platform": "bilibili",
+            "platform_label": "B站", "status": "active", "qualification_state": "unknown",
+            "activity_type": "创作活动", "reward_type": "", "submit_deadline": "",
+            "saved": False, "created_at": index, "updated_at": index,
+            "external_ids": {"bilibili_public": f"bilibili:{index}"},
+        } for index in range(1, count + 1)]
+
+    for count, expected_pages, first_page_count in ((0, 1, 0), (1, 1, 1), (10, 1, 10), (11, 2, 10), (250, 25, 10)):
+        upstream._write_campaigns(rows(count))
+        result = upstream._campaign_page_result(platform="bilibili", sort="new", page=1)
+        assert result["total"] == count
+        assert result["total_pages"] == expected_pages
+        assert len(result["items"]) == first_page_count
+        assert result["page_size"] == 10
+        if count:
+            assert result["range_start"] == 1 and result["range_end"] == min(10, count)
+        else:
+            assert result["range_start"] == 0 and result["range_end"] == 0
+
+    upstream._write_campaigns(rows(11))
+    second = upstream._campaign_page_result(platform="bilibili", sort="new", page=2)
+    assert [row["id"] for row in second["items"]] == ["bili-1"]
+    assert second["range_start"] == 11 and second["range_end"] == 11
+
+    dated = rows(1)
+    dated[0]["submit_deadline"] = "2099-01-01"
+    upstream._write_campaigns(dated)
+    dated_page = upstream._campaign_page_result(platform="bilibili", sort="deadline", page=1)
+    assert dated_page["items"][0]["submit_deadline"] == "2099-01-01"
+
+    upstream._write_campaigns(rows(11))
+    legacy = asyncio.run(upstream.api_campaign_list())
+    assert isinstance(legacy, list) and len(legacy) == 11
+    paths = [getattr(route, "path", "") for route in upstream.app.routes]
+    assert paths.index("/api/campaigns/page") < paths.index("/api/campaigns/{cid}")
+
+
+def test_xhs_campaign_page_uses_exact_official_order_and_filters_before_pagination(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    rows = []
+    for index in range(1, 13):
+        rows.append({
+            "id": f"xhs-{index}",
+            "title": "同名活动" if index in {5, 6} else f"小红书活动 {index}",
+            "platform": "xiaohongshu", "platform_label": "小红书",
+            "status": "active", "qualification_state": "unknown",
+            "activity_type": "精选" if index % 2 == 0 else "普通",
+            "reward_type": "现金" if index % 3 == 0 else "",
+            "submit_deadline": "", "saved": False,
+            "account_id": "account-1",
+            "account_states": {"account-1": {"visible": True}},
+            "created_at": index, "updated_at": 9999 - index,
+            "external_ids": {"xiaohongshu_creator_events": f"xhs:{index}"},
+        })
+    upstream._write_campaigns(rows)
+    default_ids = [f"xhs:{index}" for index in range(12, 0, -1)]
+    latest_ids = [f"xhs:{index}" for index in range(1, 13)]
+
+    def snapshot(account_id="", sort_name="default"):
+        ids = default_ids if sort_name == "default" else latest_ids
+        return {
+            "account_id": account_id or "account-1", "sort": sort_name,
+            "status": "fresh", "snapshot_id": f"snap-{sort_name}",
+            "activity_ids": ids, "source_count": len(ids), "fetched_at": "2026-09-22T09:00:00+00:00",
+            "truncated": False,
+        }
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "xiaohongshu_official_snapshot", snapshot)
+
+    first = upstream._campaign_page_result(
+        platform="xiaohongshu", account_id="account-1", sort="default", page=1,
+    )
+    assert [row["external_ids"]["xiaohongshu_creator_events"] for row in first["items"]] == default_ids[:10]
+    assert first["total"] == 12 and first["total_pages"] == 2
+    assert first["snapshot_id"] == "snap-default"
+    assert first["source_total"] == 12
+    assert first["missing_source_items"] == 0
+
+    latest = upstream._campaign_page_result(
+        platform="xiaohongshu", account_id="account-1", sort="latest", page=1,
+    )
+    assert [row["external_ids"]["xiaohongshu_creator_events"] for row in latest["items"]] == latest_ids[:10]
+
+    filtered = upstream._campaign_page_result(
+        platform="xiaohongshu", account_id="account-1", sort="default", page=1, activity_type="精选",
+    )
+    assert filtered["total"] == 6
+    assert [row["external_ids"]["xiaohongshu_creator_events"] for row in filtered["items"]] == [
+        "xhs:12", "xhs:10", "xhs:8", "xhs:6", "xhs:4", "xhs:2",
+    ]
+    # Same title never collapses official IDs.
+    assert {row["external_ids"]["xiaohongshu_creator_events"] for row in first["items"] if row["title"] == "同名活动"} == {"xhs:6", "xhs:5"}
+
+
+def test_xhs_campaign_page_rejects_missing_or_changed_official_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    upstream._write_campaigns([])
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "xiaohongshu_official_snapshot", lambda *args, **kwargs: {
+        "account_id": "account-1", "status": "missing", "snapshot_id": "", "activity_ids": [],
+        "source_count": 0, "fetched_at": "", "truncated": False,
+    })
+    try:
+        upstream._campaign_page_result(platform="xiaohongshu", account_id="account-1", sort="default")
+        assert False, "expected WorkflowError"
+    except upstream.WorkflowError as exc:
+        assert exc.status == 409
+
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "xiaohongshu_official_snapshot", lambda *args, **kwargs: {
+        "account_id": "account-1", "status": "fresh", "snapshot_id": "new-snapshot",
+        "activity_ids": ["xhs:1"], "source_count": 1, "fetched_at": "2026-09-22T09:00:00+00:00",
+        "truncated": False,
+    })
+    try:
+        upstream._campaign_page_result(
+            platform="xiaohongshu", account_id="account-1", sort="default", snapshot_id="old-snapshot",
+        )
+        assert False, "expected WorkflowError"
+    except upstream.WorkflowError as exc:
+        assert exc.status == 409
+
+
 
 def test_account_specific_campaign_qualification_is_projected_to_card_and_account_state(tmp_path, monkeypatch):
     monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
