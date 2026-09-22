@@ -1,6 +1,6 @@
 # Plan: 通用活动导入与微信官方公开激励规则
 
-状态：EXECUTED / PRE-RESTART VALIDATED。业务基线27f1e81；实现已完成并通过自动化及匿名官方页验证，待本次提交后自动重启本地 Ripple 做运行态验收。
+状态：EXECUTED / RUNTIME VERIFIED。业务基线27f1e81；功能提交 b0b147a，自动重启及实际 API/UI 验收完成。
 
 ## Goal / Non-goals
 
@@ -123,6 +123,18 @@ Will NOT touch：其他平台自动采集、费用时段账本、小红书官方
 - scripts/campaign_import_smoke.py 通过：公众号/视频号频道继承平台、B站固定文案移除、URL/原文双模式、Agent 默认关闭、预览不创建 Campaign、返回草稿保持频道；所有 POST 被拦截。
 - 定向回归最终 67 passed；全量 pytest 488 passed，1 个既有 Starlette TestClient deprecation warning；npm run build 通过，仅有既有 >500kB chunk warning。
 
+## Runtime verification
+
+- 功能提交：b0b147a。通过既有 Windows 计划任务自动重启 Ripple，确认实际监听 7860 的 Python 子进程从 PID 101740 替换为 PID 85632；Vite 5173 保持运行。
+- 重启后 /api/campaigns/sources 实际返回：微信公众号与微信视频号均为 status=ready、automatic=true、mode=official_public_rules、billing=free；automatic_count=5。
+- 真实 POST /api/campaigns/import/preview 读取 https://ad.weixin.qq.com/docs/45：title=微信公众号流量主、platform=wechat、agent_used=false、qualification_state=unknown；请求前后 outputs/_campaigns.json SHA256 不变。
+- 仅刷新 wechat / weixin-channels 两个免费来源，allow_paid=false：两者均 fresh、count=1、provider=wechat_public_rules、rules_allowed=false，没有启动收费工作。
+- 运行态活动页：公众号共1条“微信公众号流量主”，视频号共1条“微信视频号创作分成计划”；两条 source_type=wechat_public_official、qualification=unknown、missing_fields=[]。
+- 真实前端匿名只读验收通过：公众号卡片显示“长期计划 · 未公布截止日期”“收益方式/收益规则”“资格待核验”“微信官方公开规则”；视频号卡片显示视频作品规格和同样的长期计划语义。
+- 公众号/视频号来源卡均显示自动同步、免费来源、每6小时以及实际下一次采集时间；这表示已接入首批公开官方规则，不表示已覆盖微信全部实时/账号专属激励。
+- 真实前端“补充导入”在公众号频道默认 target=wechat，固定“B站活动 URL”不存在，Agent 默认未勾选；运行态验证仅执行 GET/HEAD，没有产生意外外部或写请求。
+- 工作区在业务提交及重启前后保持可追溯；运行态刷新只更新忽略的本地状态/活动数据，没有产生代码改动。
+
 ## Open questions
 
-等待用户确认实施。已经证实存在公开官方长期变现/创作分成规则；尚未核实所有实时、限时或账号专属激励清单，本轮不作全量覆盖承诺。
+本轮已执行完成。已经接入首批微信公开官方长期变现/创作分成规则；尚未核实所有实时、限时或账号专属激励清单，因此不作“微信全部活动已同步”的覆盖承诺。
