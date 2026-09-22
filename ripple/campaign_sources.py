@@ -921,6 +921,7 @@ class CampaignSourceService:
             f"你是 Ripple 的 X 创作活动发现与规则整理器。当前日期 {end.isoformat()}。"
             f"请使用这个模型或网关自身具备的 X/实时搜索能力，查找 {start.isoformat()} 至 {end.isoformat()} 最近发布、"
             "且现在仍可能值得创作者参与的真实创作活动、征集、挑战、创作者激励。"
+            "最多返回 8 条，优先规则信息相对完整、来源明确、对创作者最有参与价值的活动。"
             "优先 X 官方、品牌官方、创作者项目官方账号。每条必须给出真实的 x.com 或 twitter.com /status/ 帖子 URL。"
             "发现候选后，继续阅读该公告及可访问的同线程/引用规则信息，尽量提取参赛作品、参与条件、内容要求、奖励和获奖条件。"
             "所有面向用户展示的文字必须使用简体中文；品牌名、产品名、官方活动名、@账号、#标签和 URL 可保留原文。"
@@ -939,13 +940,13 @@ class CampaignSourceService:
             '"exclusive_required":null,"min_entries":null,"max_entries":null,"submission_method":"","required_mentions":[],"required_music":[]},'
             '"ai_policy":"unknown"}]}'
         )
-        result = self.ai.prompt_route("x_campaign_discovery", prompt, timeout=90, max_tokens=2800)
+        result = self.ai.prompt_route("x_campaign_discovery", prompt, timeout=150, max_tokens=2800)
         parsed = _json_fragment(result.get("text", ""))
         if isinstance(parsed, dict) and parsed.get("search_available") is False:
             return []
         values = parsed.get("campaigns", []) if isinstance(parsed, dict) else parsed if isinstance(parsed, list) else []
         rows = []
-        for item in values[:50] if isinstance(values, list) else []:
+        for item in values[:8] if isinstance(values, list) else []:
             if not isinstance(item, dict):
                 continue
             url = _safe_url(str(item.get("source_url") or item.get("url") or ""),
