@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   cancelCampaignEnrichment, configureCampaignSource, createCampaign, createIdea, createSchedule, enrichCampaign,
   fetchCampaignEnrichmentPreview, fetchCampaignEnrichmentStatus, fetchCampaigns, fetchCampaignSources,
+  fetchXCampaignEnrichmentStatus,
   fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, runCampaignEnrichment,
   saveCampaign, updateCampaign, verifyCampaign,
 } from '../lib/api';
@@ -226,8 +227,11 @@ export default function CampaignsPage({
   const [enrichingId, setEnrichingId] = useState('');
   const [enrichmentPreview, setEnrichmentPreview] = useState<CampaignEnrichmentPreview | null>(null);
   const [enrichmentStatus, setEnrichmentStatus] = useState<CampaignEnrichmentStatus | null>(null);
+  const [xEnrichmentStatus, setXEnrichmentStatus] = useState<CampaignEnrichmentStatus | null>(null);
   const enrichmentPhase = enrichmentStatus?.status || '';
   const agentBatchActive = ['running', 'queued', 'cancelling'].includes(enrichmentPhase);
+  const xEnrichmentPhase = xEnrichmentStatus?.status || '';
+  const xBatchActive = ['running', 'queued'].includes(xEnrichmentPhase);
   const [serverOffset, setServerOffset] = useState(0);
   const [clock, setClock] = useState(() => Math.floor(Date.now() / 1000));
   const [sourceEditor, setSourceEditor] = useState<CampaignSourceCapability | null>(null);
@@ -280,15 +284,16 @@ export default function CampaignsPage({
         setError('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
         return;
       }
-      const [campaignRows, sourceState, accountRows, agentState] = await Promise.all([
+      const [campaignRows, sourceState, accountRows, agentState, xRuleState] = await Promise.all([
         fetchCampaigns(), fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
-        fetchCampaignEnrichmentStatus().catch(() => null),
+        fetchCampaignEnrichmentStatus().catch(() => null), fetchXCampaignEnrichmentStatus().catch(() => null),
       ]);
       setAccounts(accountRows);
       setCampaigns(campaignRows);
       setSources(sourceState.items || []);
       setAutomaticCount(sourceState.automatic_count || 0);
       if (agentState) setEnrichmentStatus(agentState);
+      if (xRuleState) setXEnrichmentStatus(xRuleState);
       if (sourceState.server_now) setServerOffset(sourceState.server_now - Math.floor(Date.now() / 1000));
       setSelected((current) => current ? campaignRows.find((x) => x.id === current.id) || null : null);
       setError('');
@@ -319,6 +324,17 @@ export default function CampaignsPage({
     }, 1800);
     return () => window.clearInterval(timer);
   }, [enrichmentPhase, load]);
+
+  useEffect(() => {
+    if (!xBatchActive) return;
+    const timer = window.setInterval(() => {
+      fetchXCampaignEnrichmentStatus().then((status) => {
+        setXEnrichmentStatus(status);
+        if (!['running', 'queued'].includes(status.status)) void load(false);
+      }).catch(() => undefined);
+    }, 1800);
+    return () => window.clearInterval(timer);
+  }, [xBatchActive, load]);
 
   useEffect(() => {
     const selectedTrends = loadTrendSelection();
@@ -681,6 +697,7 @@ export default function CampaignsPage({
           <span>活动源由 Ripple 后端定时同步，页面无需保持打开；右上角“刷新活动”可随时手动重新检查。收费备用源未经显式启用不会调用。</span>
         </div>
         {enrichmentStatus && ['running', 'queued', 'cancelling'].includes(enrichmentStatus.status) && <div className="campaign-agent-progress"><strong>Agent 补全 {enrichmentStatus.done}/{enrichmentStatus.total}</strong><span>{enrichmentStatus.failed ? `失败 ${enrichmentStatus.failed} · ` : ''}按活动串行处理，避免重复 Token 消耗</span><button className="r2-text-button" onClick={() => void cancelGlobalEnrichment()}>取消</button></div>}
+        {xEnrichmentStatus && ['running', 'queued'].includes(xEnrichmentStatus.status) && <div className="campaign-agent-progress"><strong>X 规则整理 {xEnrichmentStatus.done}/{xEnrichmentStatus.total}</strong><span>{xEnrichmentStatus.failed ? `失败 ${xEnrichmentStatus.failed} · ` : ''}逐条中文整理，已处理活动不会自动重复消耗 Token</span></div>}
       </div>
       <section className="campaign-source-status-grid">
         {sources.map((source) => {
@@ -812,7 +829,7 @@ export default function CampaignsPage({
                     <div><small>参与条件</small><span className={!campaign.eligibility?.length ? 'campaign-fact-empty' : ''}>{campaign.eligibility?.length ? concise(campaign.eligibility, '') : '—'}</span></div>
                     <div><small>奖品 / 奖励</small><span className={!(campaign.prizes?.length || campaign.reward_summary) ? 'campaign-fact-empty' : ''}>{campaign.prizes?.length || campaign.reward_summary ? concise(campaign.prizes, campaign.reward_summary || '') : '—'}</span></div>
                     <div><small>获奖条件</small><span className={!campaign.winning_conditions?.length ? 'campaign-fact-empty' : ''}>{campaign.winning_conditions?.length ? concise(campaign.winning_conditions, '') : '—'}</span></div>
-                    <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
+                    <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{campaign.platform === 'x' && xEnrichmentStatus?.current === campaign.id ? '整理中…' : campaign.platform === 'x' && campaign.x_enrichment_status === 'failed' ? '整理失败，等待重试' : incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
                   </div>
                   <div className="campaign-actions">
                     <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看详情</button>

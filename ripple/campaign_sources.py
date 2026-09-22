@@ -121,6 +121,44 @@ def _json_fragment(text: str) -> Any:
         return None
 
 
+def _x_zh_text(value: Any, width: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return ""
+    return text[:width] if re.search(r"[\u4e00-\u9fff]", text) else ""
+
+
+def _x_zh_list(values: Any, *, limit: int = 30, width: int = 240) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    rows: list[str] = []
+    for value in values:
+        text = _x_zh_text(value, width)
+        if text and text not in rows:
+            rows.append(text)
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _x_iso_date(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text) else ""
+
+
+def _x_submission_spec(value: Any) -> dict[str, Any]:
+    spec = normalize_submission_spec(value)
+    spec["content_directions"] = _x_zh_list(spec.get("content_directions"), limit=16, width=180)
+    spec["style_requirements"] = _x_zh_list(spec.get("style_requirements"), limit=16, width=180)
+    method = _x_zh_text(spec.get("submission_method"), 300)
+    spec["submission_method"] = method
+    live = spec.get("live") if isinstance(spec.get("live"), dict) else {}
+    if live.get("required_category") and not re.search(r"[\u4e00-\u9fff]", str(live.get("required_category"))):
+        live["required_category"] = ""
+    spec["live"] = live
+    return spec
+
+
 def _generic_activity_rows(value: Any, limit: int = 60) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -918,29 +956,17 @@ class CampaignSourceService:
         end = datetime.now(timezone.utc).date()
         start = end - timedelta(days=7)
         prompt = (
-            f"你是 Ripple 的 X 创作活动发现与规则整理器。当前日期 {end.isoformat()}。"
-            f"请使用这个模型或网关自身具备的 X/实时搜索能力，查找 {start.isoformat()} 至 {end.isoformat()} 最近发布、"
-            "且现在仍可能值得创作者参与的真实创作活动、征集、挑战、创作者激励。"
-            "最多返回 8 条，优先规则信息相对完整、来源明确、对创作者最有参与价值的活动。"
-            "优先 X 官方、品牌官方、创作者项目官方账号。每条必须给出真实的 x.com 或 twitter.com /status/ 帖子 URL。"
-            "发现候选后，继续阅读该公告及可访问的同线程/引用规则信息，尽量提取参赛作品、参与条件、内容要求、奖励和获奖条件。"
-            "所有面向用户展示的文字必须使用简体中文；品牌名、产品名、官方活动名、@账号、#标签和 URL 可保留原文。"
-            "英文规则要准确翻译成中文，不要扩写。原文没有明确说明的信息必须留空、空数组或 null，绝对不能猜。"
-            "如果当前模型实际上无法访问 X 或无法确认真实帖子，返回 search_available=false 和空 campaigns。"
-            "日期只有原文明确时才填写 YYYY-MM-DD；不要把帖子发布时间冒充活动开始时间。"
-            "submission_spec.formats 只允许 video、short_video、long_video、image_text、text、image、live、audio、any。"
-            "ai_policy 未明确时写 unknown。只输出 JSON，不要 Markdown："
-            '{"search_available":true,"reason":"","campaigns":[{'
-            '"title":"","organizer":"","source_url":"https://x.com/.../status/...","external_id":"",'
-            '"summary":"","published_at":"","starts_at":"","signup_deadline":"","submit_deadline":"","stats_deadline":"",'
-            '"eligibility":[],"content_requirements":[],"prizes":[],"reward_summary":"","winning_conditions":[],"reward_rules":[],"required_topics":[],'
-            '"submission_spec":{"formats":[],"content_directions":[],"style_requirements":[],"duration_seconds":{"min":null,"max":null},'
-            '"aspect_ratios":[],"resolutions":[],"orientation":null,"image_count":{"min":null,"max":null},"text_length":{"min":null,"max":null},'
-            '"live":{"min_duration_seconds":null,"required_category":"","title_keywords":[]},"original_required":null,"first_publish_required":null,'
-            '"exclusive_required":null,"min_entries":null,"max_entries":null,"submission_method":"","required_mentions":[],"required_music":[]},'
-            '"ai_policy":"unknown"}]}'
+            f"你是 Ripple 的 X 创作活动发现器。当前日期 {end.isoformat()}。"
+            f"请使用这个模型或网关自身具备的 X/实时搜索能力，只做活动发现：查找 {start.isoformat()} 至 {end.isoformat()} "
+            "最近发布、且现在仍可能值得创作者参与的真实创作活动、征集、挑战、创作者激励。"
+            "最多返回 8 条，优先 X 官方、品牌官方、创作者项目官方账号。"
+            "这一阶段不要分析完整规则、不要翻译长文，只确认活动存在并返回帖子身份。"
+            "每条必须给出真实的 x.com 或 twitter.com /status/<数字> 帖子 URL；无法确认就不要返回。"
+            "如果当前模型实际上无法访问 X，返回 search_available=false 和空 campaigns。"
+            "只输出 JSON，不要 Markdown："
+            '{"search_available":true,"reason":"","campaigns":[{"title":"","organizer":"","source_url":"https://x.com/.../status/...","external_id":""}]}'
         )
-        result = self.ai.prompt_route("x_campaign_discovery", prompt, timeout=150, max_tokens=2800)
+        result = self.ai.prompt_route("x_campaign_discovery", prompt, timeout=75, max_tokens=1200)
         parsed = _json_fragment(result.get("text", ""))
         if isinstance(parsed, dict) and parsed.get("search_available") is False:
             return []
@@ -956,32 +982,75 @@ class CampaignSourceService:
                 continue
             match = re.search(r"/status/(\d+)", url)
             external = str(item.get("external_id") or (match.group(1) if match else ""))[:160]
-            summary = str(item.get("summary") or item.get("description") or "").strip()
             rows.append({
                 "provider_id": "x_model_prompt", "platform": "x", "external_id": f"x:{external}" if external else "",
                 "title": title[:240], "organizer": str(item.get("organizer") or "")[:160],
                 "organizer_type": "unknown", "activity_type": "创作活动",
-                "reward_type": "", "reward_summary": str(item.get("reward_summary") or "")[:600],
-                "summary": summary[:1200],
-                "starts_at": str(item.get("starts_at") or "")[:40],
-                "signup_deadline": str(item.get("signup_deadline") or "")[:40],
-                "submit_deadline": str(item.get("submit_deadline") or "")[:40],
-                "stats_deadline": str(item.get("stats_deadline") or "")[:40],
-                "eligibility": [str(x)[:240] for x in item.get("eligibility", []) if str(x).strip()][:20],
-                "content_requirements": [str(x)[:240] for x in item.get("content_requirements", []) if str(x).strip()][:30],
-                "prizes": [str(x)[:240] for x in item.get("prizes", []) if str(x).strip()][:30],
-                "winning_conditions": [str(x)[:240] for x in item.get("winning_conditions", []) if str(x).strip()][:30],
-                "reward_rules": [str(x)[:240] for x in item.get("reward_rules", []) if str(x).strip()][:30],
-                "required_topics": [str(x)[:120] for x in item.get("required_topics", []) if str(x).strip()][:20],
-                "submission_spec": normalize_submission_spec(item.get("submission_spec")),
-                "ai_policy": str(item.get("ai_policy") or "unknown")[:600],
+                "reward_type": "", "reward_summary": "", "summary": "",
+                "starts_at": "", "signup_deadline": "", "submit_deadline": "", "stats_deadline": "",
+                "eligibility": [], "content_requirements": [], "prizes": [], "winning_conditions": [],
+                "reward_rules": [], "required_topics": [], "submission_spec": normalize_submission_spec({}),
+                "ai_policy": "unknown",
                 "source_url": url, "source_type": "x_model_prompt", "source_status": "model_reported",
-                "note": summary[:3000],
-                "evidence": {"kind": "model_prompt_x_post", "url": url,
-                             "provider": result.get("provider_id", ""), "model": result.get("model", ""),
-                             "published_at": str(item.get("published_at") or "")[:40]},
+                "note": "",
+                "evidence": {"kind": "model_prompt_x_discovery", "url": url,
+                             "provider": result.get("provider_id", ""), "model": result.get("model", "")},
             })
         return rows
+
+    def enrich_x_prompt_campaign(self, campaign: dict[str, Any]) -> dict[str, Any]:
+        url = _safe_url(str(campaign.get("source_url") or ""), ("x.com", "twitter.com"))
+        match = re.search(r"/status/(\d+)", url or "")
+        if not url or not match:
+            raise WorkflowError("X 规则整理需要有效的 /status/<id> 帖子 URL。", 422)
+        title = str(campaign.get("title") or "").strip()[:240]
+        organizer = str(campaign.get("organizer") or "").strip()[:160]
+        prompt = (
+            "你是 Ripple 的 X 创作活动规则整理器。只处理下面这一条已发现的 X 活动。"
+            f"帖子 URL：{url}。已知活动名：{title or '未说明'}。已知主办方：{organizer or '未说明'}。"
+            "请使用这个模型或网关自身具备的 X/实时搜索能力，阅读该帖子，以及能明确关联到该活动的同线程、引用帖或官方规则说明。"
+            "所有面向用户展示的文字必须使用简体中文；品牌名、产品名、官方活动名、@账号、#标签和 URL 可保留原文。"
+            "英文规则准确翻译，不扩写。只提取有明确依据的信息；原帖/官方规则没有说明的字段必须留空、空数组或 null，绝对不能猜。"
+            "总奖池不能表述成单人奖金；达到门槛不等于必然获奖。日期只有明确年份时才填写 YYYY-MM-DD。"
+            "submission_spec.formats 只允许 video、short_video、long_video、image_text、text、image、live、audio、any。"
+            "ai_policy 未明确时写 unknown。只输出 JSON，不要 Markdown："
+            '{"title":"","organizer":"","summary":"","starts_at":"","signup_deadline":"","submit_deadline":"","stats_deadline":"",'
+            '"eligibility":[],"content_requirements":[],"prizes":[],"reward_summary":"","winning_conditions":[],"reward_rules":[],"required_topics":[],'
+            '"submission_spec":{"formats":[],"content_directions":[],"style_requirements":[],"duration_seconds":{"min":null,"max":null},'
+            '"aspect_ratios":[],"resolutions":[],"orientation":null,"image_count":{"min":null,"max":null},"text_length":{"min":null,"max":null},'
+            '"live":{"min_duration_seconds":null,"required_category":"","title_keywords":[]},"original_required":null,"first_publish_required":null,'
+            '"exclusive_required":null,"min_entries":null,"max_entries":null,"submission_method":"","required_mentions":[],"required_music":[]},'
+            '"ai_policy":"unknown"}'
+        )
+        result = self.ai.prompt_route("x_campaign_discovery", prompt, timeout=90, max_tokens=2200)
+        item = _json_fragment(result.get("text", ""))
+        if not isinstance(item, dict):
+            raise WorkflowError("X 规则整理模型没有返回有效 JSON。", 502)
+        return {
+            "provider_id": "x_model_prompt", "platform": "x",
+            "external_id": f"x:{match.group(1)}",
+            "title": str(item.get("title") or title)[:240],
+            "organizer": str(item.get("organizer") or organizer)[:160],
+            "organizer_type": "unknown", "activity_type": "创作活动",
+            "reward_type": "", "reward_summary": _x_zh_text(item.get("reward_summary"), 600),
+            "summary": _x_zh_text(item.get("summary"), 1200),
+            "starts_at": _x_iso_date(item.get("starts_at")),
+            "signup_deadline": _x_iso_date(item.get("signup_deadline")),
+            "submit_deadline": _x_iso_date(item.get("submit_deadline")),
+            "stats_deadline": _x_iso_date(item.get("stats_deadline")),
+            "eligibility": _x_zh_list(item.get("eligibility"), limit=20),
+            "content_requirements": _x_zh_list(item.get("content_requirements"), limit=30),
+            "prizes": _x_zh_list(item.get("prizes"), limit=30),
+            "winning_conditions": _x_zh_list(item.get("winning_conditions"), limit=30),
+            "reward_rules": _x_zh_list(item.get("reward_rules"), limit=30),
+            "required_topics": [str(x)[:120] for x in item.get("required_topics", []) if str(x).strip()][:20],
+            "submission_spec": _x_submission_spec(item.get("submission_spec")),
+            "ai_policy": ("unknown" if str(item.get("ai_policy") or "").strip().lower() in {"", "unknown"} else _x_zh_text(item.get("ai_policy"), 600) or "unknown"),
+            "source_url": url, "source_type": "x_model_prompt", "source_status": "model_reported",
+            "note": str(item.get("summary") or "")[:3000],
+            "evidence": {"kind": "model_prompt_x_rules", "url": url,
+                         "provider": result.get("provider_id", ""), "model": result.get("model", "")},
+        }
 
     def _x_search_tool(self) -> list[dict[str, Any]]:
         end = datetime.now(timezone.utc).date()

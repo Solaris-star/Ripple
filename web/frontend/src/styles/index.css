@@ -1106,7 +1106,7 @@ textarea.field { resize: vertical; min-height: 90px; }
 .campaign-source-status > :not(.campaign-source-hit) { position: relative; z-index: 2; pointer-events: none; }
 .campaign-source-status-actions { pointer-events: auto !important; z-index: 3 !important; }
 .campaign-source-status.source-ready,.campaign-source-status.source-ready_fallback { border-color: color-mix(in srgb, var(--green) 34%, var(--border)); }
-.campaign-source-status.source-needs_config,.campaign-source-status.source-needs_login { border-color: #eadfca; }
+.campaign-source-status.source-needs_config,.campaign-source-status.source-needs_login,.campaign-source-status.source-manual { border-color: var(--border); }
 .campaign-source-status.source-stale,.campaign-source-status.source-error { border-color: color-mix(in srgb, var(--red) 25%, var(--border)); }
 .campaign-source-status-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .campaign-source-brand { min-width: 0; display: inline-flex; align-items: center; gap: 7px; }

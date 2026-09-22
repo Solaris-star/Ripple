@@ -3756,6 +3756,9 @@ CAMPAIGN_STATUSES = {"upcoming", "active", "ended", "cancelled", "unknown"}
 CAMPAIGN_QUALIFICATION_STATES = {"eligible", "ineligible", "unknown"}
 
 
+X_RULE_ENRICHMENT_VERSION = 1
+
+
 def _normalize_campaign(item: dict) -> dict:
     for field in ("eligibility", "content_requirements", "prizes", "winning_conditions",
                   "reward_rules", "required_topics", "rule_history", "source_evidence"):
@@ -3790,6 +3793,23 @@ def _normalize_campaign(item: dict) -> dict:
     item["last_agent_enriched_at"] = int(item.get("last_agent_enriched_at") or 0)
     item["agent_attempt_count"] = max(0, int(item.get("agent_attempt_count") or 0))
     item["agent_next_retry_at"] = int(item.get("agent_next_retry_at") or 0)
+    item["x_enrichment_version"] = max(0, int(item.get("x_enrichment_version") or 0))
+    item["x_enriched_at"] = int(item.get("x_enriched_at") or 0)
+    item["x_enrichment_model"] = str(item.get("x_enrichment_model") or "")[:200]
+    item["x_enrichment_run_id"] = str(item.get("x_enrichment_run_id") or "")[:120]
+    item["x_enrichment_error"] = str(item.get("x_enrichment_error") or "")[:600]
+    item["x_enrichment_attempt_count"] = max(0, int(item.get("x_enrichment_attempt_count") or 0))
+    item["x_enrichment_next_retry_at"] = int(item.get("x_enrichment_next_retry_at") or 0)
+    x_status = str(item.get("x_enrichment_status") or "")
+    if x_status in {"running", "queued"}:
+        x_status = "incomplete"
+    if item.get("platform") == "x" and item.get("source_type") == "x_model_prompt":
+        if item["x_enrichment_version"] >= X_RULE_ENRICHMENT_VERSION:
+            item["x_enrichment_status"] = "complete" if not campaign_missing_fields(item) else "partial"
+        else:
+            item["x_enrichment_status"] = x_status or "incomplete"
+    else:
+        item["x_enrichment_status"] = x_status
     item["missing_fields"] = campaign_missing_fields(item)
     status = str(item.get("enrichment_status") or "")
     if status in {"running", "queued"}:
@@ -3949,6 +3969,10 @@ def _campaign_from_request(req: CampaignInput, previous: dict | None = None) -> 
         history = history[-20:]
     confirmed_fields: list[str] = []
     if req.summary.strip(): confirmed_fields.append("summary")
+    if req.reward_summary.strip(): confirmed_fields.append("reward_summary")
+    for _field, _value in (("starts_at", req.starts_at), ("signup_deadline", req.signup_deadline), ("submit_deadline", req.submit_deadline), ("stats_deadline", req.stats_deadline)):
+        if str(_value or "").strip(): confirmed_fields.append(_field)
+    if req.ai_policy.strip() and req.ai_policy.strip() != "unknown": confirmed_fields.append("ai_policy")
     if req.eligibility: confirmed_fields.append("eligibility")
     if req.content_requirements: confirmed_fields.append("content_requirements")
     if req.prizes: confirmed_fields.append("prizes")
@@ -4225,6 +4249,9 @@ _CAMPAIGN_AGENT_LOCK = threading.Lock()
 _CAMPAIGN_AGENT_BATCH_LOCK = threading.Lock()
 _CAMPAIGN_AGENT_CANCEL = threading.Event()
 _CAMPAIGN_AGENT_BATCH: dict[str, Any] = {"status": "idle", "id": "", "total": 0, "done": 0, "failed": 0, "current": "", "items": []}
+_CAMPAIGN_X_LOCK = threading.Lock()
+_CAMPAIGN_X_BATCH_LOCK = threading.Lock()
+_CAMPAIGN_X_BATCH: dict[str, Any] = {"status": "idle", "id": "", "total": 0, "done": 0, "failed": 0, "current": "", "items": []}
 
 
 def _campaign_agent_model() -> str:
@@ -4351,14 +4378,151 @@ def _start_campaign_agent_batch(ids: list[str], *, automatic: bool = False) -> b
     threading.Thread(target=_campaign_agent_worker, args=(ids, batch_id, automatic), daemon=True, name="ripple-campaign-agent").start()
     return True
 
+def _x_enrichment_candidates(*, limit: int = 100) -> list[dict]:
+    rows = []
+    now = int(time.time())
+    for item in _read_campaigns():
+        if item.get("platform") != "x" or item.get("source_type") != "x_model_prompt":
+            continue
+        if int(item.get("x_enrichment_version") or 0) >= X_RULE_ENRICHMENT_VERSION:
+            continue
+        url = str(item.get("source_url") or "")
+        if not re.search(r"/status/\d+", url):
+            continue
+        attempts = int(item.get("x_enrichment_attempt_count") or 0)
+        if attempts >= 2:
+            continue
+        if now < int(item.get("x_enrichment_next_retry_at") or 0):
+            continue
+        rows.append({"id": item["id"], "title": item.get("title", ""), "missing_fields": campaign_missing_fields(item)})
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _x_enrich_one(cid: str) -> dict:
+    run_id = uuid.uuid4().hex
+    now = int(time.time())
+    with _CAMPAIGN_X_LOCK:
+        items = _read_campaigns()
+        item = next((row for row in items if row.get("id") == cid), None)
+        if not item:
+            raise WorkflowError("活动不存在。", 404)
+        if item.get("platform") != "x" or item.get("source_type") != "x_model_prompt":
+            raise WorkflowError("当前 X 规则整理只处理 Grok / 搜索模型发现的活动。", 409)
+        if int(item.get("x_enrichment_version") or 0) >= X_RULE_ENRICHMENT_VERSION:
+            return {"item": item, "called": False, "reason": "already_enriched"}
+        cfg = _AI_PROVIDERS.resolved("x_campaign_discovery", fallback_to_default=False)
+        if not cfg:
+            raise WorkflowError("请先配置“X 活动发现”模型路由。", 409)
+        attempts = int(item.get("x_enrichment_attempt_count") or 0) + 1
+        item["x_enrichment_attempt_count"] = attempts
+        item["x_enrichment_next_retry_at"] = now + 6 * 60 * 60
+        item["x_enrichment_status"] = "running"
+        item["x_enrichment_error"] = ""
+        item["x_enrichment_model"] = str(cfg.get("model") or "")[:200]
+        item["x_enrichment_run_id"] = run_id
+        item["updated_at"] = now
+        _write_campaigns(items)
+        snapshot = deepcopy(item)
+    try:
+        candidate = _CAMPAIGN_SOURCES.enrich_x_prompt_campaign(snapshot)
+    except WorkflowError as exc:
+        with _CAMPAIGN_X_LOCK:
+            latest = _read_campaigns()
+            current = next((row for row in latest if row.get("id") == cid), None)
+            if current:
+                current["x_enrichment_status"] = "failed"
+                current["x_enrichment_error"] = str(exc)[:600]
+                current["x_enrichment_run_id"] = run_id
+                current["updated_at"] = int(time.time())
+                _write_campaigns(latest)
+        raise
+    with _CAMPAIGN_X_LOCK:
+        latest = _read_campaigns()
+        before = deepcopy(next((row for row in latest if row.get("id") == cid), snapshot))
+        updated = _merge_campaign_candidate(latest, candidate)
+        locked = {str(x) for x in updated.get("user_confirmed_fields", []) if str(x)}
+        scalar_snapshot_fields = ("summary", "reward_summary", "starts_at", "signup_deadline", "submit_deadline", "stats_deadline", "ai_policy", "note")
+        list_snapshot_fields = ("eligibility", "content_requirements", "prizes", "winning_conditions", "reward_rules", "required_topics")
+        for field in scalar_snapshot_fields:
+            if field not in locked:
+                updated[field] = str(candidate.get(field) or "")[:3000 if field in {"summary", "note"} else 600]
+        for field in list_snapshot_fields:
+            if field not in locked:
+                updated[field] = deepcopy(candidate.get(field) or [])
+        if "submission_spec" not in locked:
+            updated["submission_spec"] = normalize_submission_spec(candidate.get("submission_spec"))
+        before_version = int(before.get("rule_version") or 0)
+        after_changed = any(before.get(field) != updated.get(field) for field in CAMPAIGN_RULE_SNAPSHOT_FIELDS)
+        if after_changed and int(updated.get("rule_version") or 0) == before_version and before_version > 0:
+            history = [x for x in (updated.get("rule_history") or []) if isinstance(x, dict)]
+            history.append(_campaign_rule_snapshot(before, archived_at=int(time.time())))
+            updated["rule_history"] = history[-20:]
+            updated["rule_version"] = before_version + 1
+        updated["x_enrichment_version"] = X_RULE_ENRICHMENT_VERSION
+        updated["x_enriched_at"] = int(time.time())
+        updated["x_enrichment_model"] = str((candidate.get("evidence") or {}).get("model") or "")[:200]
+        updated["x_enrichment_run_id"] = run_id
+        updated["x_enrichment_error"] = ""
+        updated["x_enrichment_next_retry_at"] = 0
+        updated["missing_fields"] = campaign_missing_fields(updated)
+        updated["x_enrichment_status"] = "complete" if not updated["missing_fields"] else "partial"
+        updated["updated_at"] = int(time.time())
+        _write_campaigns(latest)
+        return {"item": updated, "called": True, "reason": "completed"}
+
+
+def _x_enrichment_worker(ids: list[str], batch_id: str) -> None:
+    global _CAMPAIGN_X_BATCH
+    done = failed = 0
+    for cid in ids[:3]:
+        with _CAMPAIGN_X_BATCH_LOCK:
+            _CAMPAIGN_X_BATCH["current"] = cid
+        try:
+            _x_enrich_one(cid); done += 1
+        except WorkflowError:
+            failed += 1
+        except Exception as exc:
+            failed += 1
+            with _CAMPAIGN_X_LOCK:
+                latest = _read_campaigns()
+                current = next((row for row in latest if row.get("id") == cid), None)
+                if current:
+                    current["x_enrichment_status"] = "failed"
+                    current["x_enrichment_error"] = f"内部错误：{type(exc).__name__}"[:600]
+                    current["updated_at"] = int(time.time())
+                    _write_campaigns(latest)
+        with _CAMPAIGN_X_BATCH_LOCK:
+            _CAMPAIGN_X_BATCH.update({"done": done, "failed": failed})
+    with _CAMPAIGN_X_BATCH_LOCK:
+        _CAMPAIGN_X_BATCH.update({"status": "done", "current": "", "done": done, "failed": failed})
+
+
+def _start_x_enrichment_batch(ids: list[str]) -> bool:
+    global _CAMPAIGN_X_BATCH
+    if not ids or not _AI_PROVIDERS.resolved("x_campaign_discovery", fallback_to_default=False):
+        return False
+    with _CAMPAIGN_X_BATCH_LOCK:
+        if _CAMPAIGN_X_BATCH.get("status") in {"running", "queued"}:
+            return False
+        batch_id = uuid.uuid4().hex
+        selected = ids[:3]
+        _CAMPAIGN_X_BATCH = {"status": "running", "id": batch_id, "total": len(selected), "done": 0, "failed": 0, "current": "", "items": selected}
+    threading.Thread(target=_x_enrichment_worker, args=(selected, batch_id), daemon=True, name="ripple-x-campaign-rules").start()
+    return True
+
+
 def _campaign_scheduler_tick() -> dict:
     due = _CAMPAIGN_SOURCES.due_platforms()
-    if not due:
-        return {"due": [], "merged": 0}
-    payload = _CAMPAIGN_SOURCES.refresh(due, force=False)
-    merged = _merge_campaign_refresh(payload)
-    if any(row.get("platform") == "bilibili" and row.get("status") == "fresh" for row in payload.get("results", [])):
-        _start_campaign_agent_batch([row["id"] for row in _campaign_enrichment_candidates(limit=3)], automatic=True)
+    if due:
+        payload = _CAMPAIGN_SOURCES.refresh(due, force=False)
+        merged = _merge_campaign_refresh(payload)
+        if any(row.get("platform") == "bilibili" and row.get("status") == "fresh" for row in payload.get("results", [])):
+            _start_campaign_agent_batch([row["id"] for row in _campaign_enrichment_candidates(limit=3)], automatic=True)
+    else:
+        merged = {"merged": 0, "total": len(_read_campaigns()), "stale_platforms": []}
+    _start_x_enrichment_batch([row["id"] for row in _x_enrichment_candidates(limit=3)])
     return {"due": due, **merged}
 
 
@@ -4387,6 +4551,7 @@ async def api_campaign_refresh(req: CampaignRefreshInput):
     merged = _merge_campaign_refresh(payload)
     if any(row.get("platform") == "bilibili" and row.get("status") == "fresh" for row in payload.get("results", [])):
         _start_campaign_agent_batch([row["id"] for row in _campaign_enrichment_candidates(limit=3)], automatic=True)
+    _start_x_enrichment_batch([row["id"] for row in _x_enrichment_candidates(limit=3)])
     return {**payload, **merged, "campaigns": [{**item, "status": _campaign_effective_status(item)} for item in _read_campaigns()]}
 
 
@@ -4413,6 +4578,12 @@ async def api_campaign_enrichment_run():
 async def api_campaign_enrichment_status():
     with _CAMPAIGN_AGENT_BATCH_LOCK:
         return deepcopy(_CAMPAIGN_AGENT_BATCH)
+
+
+@app.get("/api/campaigns/x-enrichment/status")
+async def api_x_campaign_enrichment_status():
+    with _CAMPAIGN_X_BATCH_LOCK:
+        return deepcopy(_CAMPAIGN_X_BATCH)
 
 
 @app.post("/api/campaigns/enrichment/cancel")

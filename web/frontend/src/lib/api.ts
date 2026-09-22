@@ -351,6 +351,14 @@ export interface Campaign {
   enrichment_status?: 'incomplete' | 'running' | 'partial' | 'complete' | 'failed' | string;
   missing_fields?: string[];
   agent_error?: string;
+  x_enrichment_version?: number;
+  x_enriched_at?: number;
+  x_enrichment_model?: string;
+  x_enrichment_run_id?: string;
+  x_enrichment_status?: 'incomplete' | 'running' | 'partial' | 'complete' | 'failed' | string;
+  x_enrichment_error?: string;
+  x_enrichment_attempt_count?: number;
+  x_enrichment_next_retry_at?: number;
 }
 export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<Campaign,
   'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' | 'summary' |
@@ -429,6 +437,7 @@ export interface CampaignEnrichmentStatus { status: string; id?: string; total: 
 export function fetchCampaignEnrichmentPreview(): Promise<CampaignEnrichmentPreview> { return request('/api/campaigns/enrichment/preview'); }
 export function runCampaignEnrichment(): Promise<{ started: boolean; reason?: string; status: CampaignEnrichmentStatus }> { return request('/api/campaigns/enrichment/run', { method: 'POST' }); }
 export function fetchCampaignEnrichmentStatus(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/enrichment/status'); }
+export function fetchXCampaignEnrichmentStatus(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/x-enrichment/status'); }
 export function cancelCampaignEnrichment(): Promise<CampaignEnrichmentStatus> { return request('/api/campaigns/enrichment/cancel', { method: 'POST' }); }
 export function previewCampaignImport(url: string): Promise<{ draft: CampaignInput & Partial<Campaign>; agent_used: boolean; model: string; warning: string; evidence_fingerprint: string }> {
   return request('/api/campaigns/import/preview', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });

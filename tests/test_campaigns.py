@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from web import app as upstream
 
@@ -136,6 +137,104 @@ def test_x_model_prompt_completeness_uses_real_rule_fields(tmp_path, monkeypatch
     assert set(incomplete["missing_fields"]) == {"eligibility", "submission_spec", "winning_conditions"}
     assert incomplete["enrichment_status"] == "incomplete"
     assert incomplete["last_verified_at"] == 0
+
+
+def test_existing_x_campaign_is_enriched_once_and_then_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    row = upstream._merge_campaign_candidate(items, {
+        "provider_id": "x_model_prompt", "platform": "x", "external_id": "x:321",
+        "title": "Vizard Agent Challenge", "organizer": "@vizard_ai",
+        "source_url": "https://x.com/vizard_ai/status/321", "source_type": "x_model_prompt",
+        "source_status": "model_reported", "summary": "Old English summary",
+        "reward_summary": "$3,000 Cash", "submit_deadline": "Oct 6",
+        "eligibility": ["Open to everyone"], "prizes": ["$3,000 Cash"],
+        "winning_conditions": ["Top creators win"],
+        "evidence": {"kind": "model_prompt_x_discovery", "url": "https://x.com/vizard_ai/status/321"},
+    })
+    upstream._write_campaigns(items)
+    monkeypatch.setattr(upstream._AI_PROVIDERS, "resolved", lambda *args, **kwargs: {
+        "provider_id": "gateway", "provider_name": "Gateway", "model": "grok-search",
+    })
+    calls = []
+    def fake_enrich(current):
+        calls.append(current["id"])
+        return {
+            "provider_id": "x_model_prompt", "platform": "x", "external_id": "x:321",
+            "title": "Vizard Agent Challenge", "organizer": "@vizard_ai",
+            "source_url": "https://x.com/vizard_ai/status/321", "source_type": "x_model_prompt",
+            "source_status": "model_reported", "summary": "中文活动摘要",
+            "reward_summary": "3,000 美元现金", "submit_deadline": "2026-10-06",
+            "eligibility": ["免费参与"], "content_requirements": ["按赛道要求提交作品"],
+            "prizes": ["3,000 美元现金"], "winning_conditions": ["按活动规则评选赛道冠军"],
+            "reward_rules": [], "required_topics": [],
+            "submission_spec": {"formats": ["video"]}, "ai_policy": "unknown",
+            "evidence": {"kind": "model_prompt_x_rules", "url": "https://x.com/vizard_ai/status/321", "model": "grok-search"},
+        }
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "enrich_x_prompt_campaign", fake_enrich)
+
+    assert upstream._x_enrichment_candidates(limit=10)[0]["id"] == row["id"]
+    first = upstream._x_enrich_one(row["id"])
+    assert first["called"] is True
+    assert first["item"]["x_enrichment_version"] == upstream.X_RULE_ENRICHMENT_VERSION
+    assert first["item"]["x_enrichment_status"] == "complete"
+    assert first["item"]["summary"] == "中文活动摘要"
+    assert first["item"]["reward_summary"] == "3,000 美元现金"
+    assert first["item"]["submit_deadline"] == "2026-10-06"
+    assert first["item"]["eligibility"] == ["免费参与"]
+    assert first["item"]["prizes"] == ["3,000 美元现金"]
+    assert first["item"]["winning_conditions"] == ["按活动规则评选赛道冠军"]
+    assert "Old English" not in first["item"]["summary"]
+    assert "$3,000 Cash" not in first["item"]["reward_summary"]
+    assert first["item"]["submission_spec"]["formats"] == ["video"]
+    assert calls == [row["id"]]
+    assert upstream._x_enrichment_candidates(limit=10) == []
+
+    second = upstream._x_enrich_one(row["id"])
+    assert second["called"] is False
+    assert second["reason"] == "already_enriched"
+    assert calls == [row["id"]]
+
+
+def test_x_enrichment_failure_is_backed_off_and_does_not_loop(tmp_path, monkeypatch):
+    monkeypatch.setattr(upstream, "CAMPAIGNS_FILE", tmp_path / "campaigns.json")
+    items = []
+    row = upstream._merge_campaign_candidate(items, {
+        "provider_id": "x_model_prompt", "platform": "x", "external_id": "x:654",
+        "title": "失败活动", "source_url": "https://x.com/brand/status/654",
+        "source_type": "x_model_prompt", "source_status": "model_reported",
+        "evidence": {"kind": "model_prompt_x_discovery", "url": "https://x.com/brand/status/654"},
+    })
+    upstream._write_campaigns(items)
+    monkeypatch.setattr(upstream._AI_PROVIDERS, "resolved", lambda *args, **kwargs: {
+        "provider_id": "gateway", "provider_name": "Gateway", "model": "grok-search",
+    })
+    monkeypatch.setattr(
+        upstream._CAMPAIGN_SOURCES, "enrich_x_prompt_campaign",
+        lambda current: (_ for _ in ()).throw(upstream.WorkflowError("timeout", 504)),
+    )
+    try:
+        upstream._x_enrich_one(row["id"])
+        assert False, "expected WorkflowError"
+    except upstream.WorkflowError:
+        pass
+    stored = upstream._read_campaigns()[0]
+    assert stored["x_enrichment_status"] == "failed"
+    assert stored["x_enrichment_attempt_count"] == 1
+    assert stored["x_enrichment_next_retry_at"] > int(time.time())
+    assert upstream._x_enrichment_candidates(limit=10) == []
+
+
+
+def test_scheduler_processes_existing_x_rule_queue_even_when_no_source_is_due(monkeypatch):
+    monkeypatch.setattr(upstream._CAMPAIGN_SOURCES, "due_platforms", lambda: [])
+    monkeypatch.setattr(upstream, "_x_enrichment_candidates", lambda limit=3: [{"id": "x1"}, {"id": "x2"}])
+    started = []
+    monkeypatch.setattr(upstream, "_start_x_enrichment_batch", lambda ids: started.append(ids) or True)
+    monkeypatch.setattr(upstream, "_read_campaigns", lambda: [{"id": "x1"}, {"id": "x2"}])
+    result = upstream._campaign_scheduler_tick()
+    assert result["due"] == []
+    assert started == [["x1", "x2"]]
 
 
 def test_campaign_edit_bumps_rule_version_and_keeps_import_provenance(tmp_path, monkeypatch):

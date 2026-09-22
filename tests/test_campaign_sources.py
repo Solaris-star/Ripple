@@ -178,62 +178,118 @@ def test_legacy_xai_source_alias_migrates_to_prompt(source_service):
     assert state["x"]["method"] == "prompt"
 
 
-def test_x_prompt_results_are_chinese_structured_model_reports(source_service, monkeypatch):
+def test_x_prompt_discovery_only_returns_verified_status_identity(source_service, monkeypatch):
     _, service = source_service
     seen = []
+
     def fake_prompt_route(purpose, prompt, **kwargs):
         seen.append((purpose, prompt, kwargs))
         return {
             "provider_id": "gateway", "model": "grok-search",
             "text": json.dumps({"search_available": True, "campaigns": [
-                {
-                    "title": "Vizard Agent Challenge", "organizer": "@vizard_ai",
-                    "source_url": "https://x.com/vizard_ai/status/123", "external_id": "123",
-                    "summary": "Vizard Agent Challenge 已开启，共设 6 个赛道。",
-                    "published_at": "2026-09-18", "starts_at": "2026-09-18",
-                    "signup_deadline": "", "submit_deadline": "2026-10-06", "stats_deadline": "",
-                    "eligibility": ["免费参与，按活动要求选择赛道并提交作品"],
-                    "content_requirements": ["围绕所选赛道提交符合要求的创作项目"],
-                    "prizes": ["3,000 美元现金", "100,000 积分"],
-                    "reward_summary": "3,000 美元现金 + 100,000 积分",
-                    "winning_conditions": ["各赛道冠军及其他获奖作品按活动规则评选"],
-                    "reward_rules": ["6 名赛道冠军各获得 500 美元现金"],
-                    "required_topics": ["#VizardAgentChallenge"],
-                    "submission_spec": {
-                        "formats": ["video"], "content_directions": ["按赛道要求完成创作"],
-                        "style_requirements": [], "duration_seconds": {"min": None, "max": None},
-                        "aspect_ratios": [], "resolutions": [], "orientation": None,
-                        "image_count": {"min": None, "max": None}, "text_length": {"min": None, "max": None},
-                        "live": {"min_duration_seconds": None, "required_category": "", "title_keywords": []},
-                        "original_required": None, "first_publish_required": None, "exclusive_required": None,
-                        "min_entries": 1, "max_entries": None, "submission_method": "通过活动要求提交作品",
-                        "required_mentions": [], "required_music": [],
-                    },
-                    "ai_policy": "原帖未说明 AI 使用要求",
-                },
+                {"title": "Vizard Agent Challenge", "organizer": "@vizard_ai",
+                 "source_url": "https://x.com/vizard_ai/status/123", "external_id": "123"},
                 {"title": "Bad Link", "source_url": "https://x.com/brand"},
             ]}, ensure_ascii=False),
         }
+
     monkeypatch.setattr(service.ai, "prompt_route", fake_prompt_route)
     rows = service._x_prompt()
     assert len(rows) == 1
     assert seen[0][0] == "x_campaign_discovery"
-    assert "所有面向用户展示的文字必须使用简体中文" in seen[0][1]
-    assert "参赛作品、参与条件、内容要求、奖励和获奖条件" in seen[0][1]
+    assert "只做活动发现" in seen[0][1]
+    assert "不要分析完整规则" in seen[0][1]
+    assert seen[0][2]["max_tokens"] == 1200
     row = rows[0]
     assert row["external_id"] == "x:123"
     assert row["source_type"] == "x_model_prompt"
     assert row["source_status"] == "model_reported"
+    assert row["summary"] == ""
+    assert row["eligibility"] == []
+    assert row["winning_conditions"] == []
+    assert row["evidence"]["kind"] == "model_prompt_x_discovery"
+
+
+def test_x_prompt_single_campaign_enrichment_returns_chinese_rules(source_service, monkeypatch):
+    _, service = source_service
+    seen = []
+
+    def fake_prompt_route(purpose, prompt, **kwargs):
+        seen.append((purpose, prompt, kwargs))
+        return {
+            "provider_id": "gateway", "model": "grok-search",
+            "text": json.dumps({
+                "title": "Vizard Agent Challenge", "organizer": "@vizard_ai",
+                "summary": "Vizard Agent Challenge 已开启，共设 6 个赛道。",
+                "starts_at": "2026-09-18", "signup_deadline": "", "submit_deadline": "2026-10-06", "stats_deadline": "",
+                "eligibility": ["免费参与，按活动要求选择赛道并提交作品"],
+                "content_requirements": ["围绕所选赛道提交符合要求的创作项目"],
+                "prizes": ["3,000 美元现金", "100,000 积分"],
+                "reward_summary": "3,000 美元现金 + 100,000 积分",
+                "winning_conditions": ["各赛道冠军及其他获奖作品按活动规则评选"],
+                "reward_rules": ["6 名赛道冠军各获得 500 美元现金"],
+                "required_topics": ["#VizardAgentChallenge"],
+                "submission_spec": {
+                    "formats": ["video"], "content_directions": ["按赛道要求完成创作"], "style_requirements": [],
+                    "duration_seconds": {"min": None, "max": None}, "aspect_ratios": [], "resolutions": [],
+                    "orientation": None, "image_count": {"min": None, "max": None},
+                    "text_length": {"min": None, "max": None},
+                    "live": {"min_duration_seconds": None, "required_category": "", "title_keywords": []},
+                    "original_required": None, "first_publish_required": None, "exclusive_required": None,
+                    "min_entries": 1, "max_entries": None, "submission_method": "通过活动要求提交作品",
+                    "required_mentions": [], "required_music": [],
+                },
+                "ai_policy": "原帖未说明 AI 使用要求",
+            }, ensure_ascii=False),
+        }
+
+    monkeypatch.setattr(service.ai, "prompt_route", fake_prompt_route)
+    row = service.enrich_x_prompt_campaign({
+        "platform": "x", "title": "Vizard Agent Challenge", "organizer": "@vizard_ai",
+        "source_url": "https://x.com/vizard_ai/status/123",
+    })
+    assert "所有面向用户展示的文字必须使用简体中文" in seen[0][1]
+    assert "只处理下面这一条已发现的 X 活动" in seen[0][1]
     assert row["summary"] == "Vizard Agent Challenge 已开启，共设 6 个赛道。"
     assert row["eligibility"] == ["免费参与，按活动要求选择赛道并提交作品"]
     assert row["prizes"] == ["3,000 美元现金", "100,000 积分"]
     assert row["winning_conditions"] == ["各赛道冠军及其他获奖作品按活动规则评选"]
     assert row["submission_spec"]["formats"] == ["video"]
     assert row["submission_spec"]["min_entries"] == 1
-    assert row["ai_policy"] == "原帖未说明 AI 使用要求"
-    assert row["signup_deadline"] == ""
-    assert row["submit_deadline"] == "2026-10-06"
-    assert row["evidence"]["kind"] == "model_prompt_x_post"
+    assert row["source_status"] == "model_reported"
+    assert row["evidence"]["kind"] == "model_prompt_x_rules"
+
+
+def test_x_prompt_enrichment_drops_english_user_copy_and_invalid_dates(source_service, monkeypatch):
+    _, service = source_service
+    monkeypatch.setattr(service.ai, "prompt_route", lambda *args, **kwargs: {
+        "provider_id": "gateway", "model": "grok-search",
+        "text": json.dumps({
+            "title": "English Title", "organizer": "@brand",
+            "summary": "Join our creator challenge now",
+            "starts_at": "September 18", "submit_deadline": "Oct 6",
+            "eligibility": ["Open to everyone"], "content_requirements": ["Make a video"],
+            "prizes": ["$3,000 cash"], "reward_summary": "$3,000 cash",
+            "winning_conditions": ["Six champions win"], "reward_rules": ["$500 each"],
+            "required_topics": ["#CreatorChallenge"],
+            "submission_spec": {"formats": ["video"], "content_directions": ["Create anything"], "submission_method": "Post on X"},
+            "ai_policy": "No AI restrictions stated",
+        }),
+    })
+    row = service.enrich_x_prompt_campaign({
+        "platform": "x", "title": "Original Activity", "organizer": "@brand",
+        "source_url": "https://x.com/brand/status/999",
+    })
+    assert row["summary"] == ""
+    assert row["starts_at"] == "" and row["submit_deadline"] == ""
+    assert row["eligibility"] == [] and row["content_requirements"] == []
+    assert row["prizes"] == [] and row["reward_summary"] == ""
+    assert row["winning_conditions"] == [] and row["reward_rules"] == []
+    assert row["submission_spec"]["formats"] == ["video"]
+    assert row["submission_spec"]["content_directions"] == []
+    assert row["submission_spec"]["submission_method"] == ""
+    assert row["required_topics"] == ["#CreatorChallenge"]
+    assert row["ai_policy"] == "unknown"
 
 
 def test_x_source_accepts_verified_x_search_capability_from_compatible_gateway(source_service, monkeypatch):
