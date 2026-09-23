@@ -1,0 +1,28 @@
+.campaign-page .campaign-search {
+  max-width: 1220px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px auto 8px;
+}
+.campaign-page .campaign-search .field {
+  flex: 1;
+  min-width: 0;
+}
+.campaign-page .campaign-search .btn {
+  flex-shrink: 0;
+}
+.campaign-page .campaign-search-help {
+  max-width: 1220px;
+  margin: 0 auto 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: .72;
+}
+.campaign-page .campaign-list[aria-busy='true'] {
+  min-height: 180px;
+}
+@media (max-width: 560px) {
+  .campaign-page .campaign-search { flex-wrap: wrap; }
+  .campaign-page .campaign-search .field { flex-basis: 100%; }
+}
