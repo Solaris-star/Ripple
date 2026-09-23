@@ -28,6 +28,7 @@ from .campaign_schedule import CampaignPaidSchedule, DAILY_TIMES, TIMEZONE
 from .ai_providers import AIProviderService
 from .campaign_enrichment import evidence_fingerprint, infer_submission_spec, normalize_submission_spec
 from .publishing import WorkflowError
+from .douyin_campaigns import detail_url as douyin_detail_url, display_date as douyin_display_date
 from .secrets import protect
 from .wechat_public_rules import can_parse_public_wechat_url, official_program_urls, preview_public_wechat_rule
 
@@ -793,6 +794,7 @@ class CampaignSourceService:
                 "account_id": douyin_account.get("id") if douyin_account else "",
                 "tikhub_enabled": tikhub_enabled, "tikhub_api_key_set": tikhub_set,
                 "last_sync": state["last_sync"].get("douyin", {}),
+                "scope_note": str(state["douyin"].get("scope_note") or "仅同步当前账号创作者中心活动日历；登录就绪不代表已完成活动采集。"),
             },
             {
                 "id": "wechat_campaigns", "platform": "wechat", "label": "微信公众号",
@@ -1629,7 +1631,7 @@ class CampaignSourceService:
             raise WorkflowError("该抖音账号正在执行其他浏览器任务，请稍后刷新活动。", 429)
         result = self.workspace.accounts.run(
             account, "campaign_read", uuid.uuid4().hex, headed=False,
-            campaign_action="events", campaign_params={"limit": 40},
+            campaign_action="events", campaign_params={"limit": 200},
         )
         state_name = str(result.get("state") or "")
         if state_name == "verification_required":
@@ -1637,27 +1639,57 @@ class CampaignSourceService:
         if state_name != "success":
             raise WorkflowError(str(result.get("message") or "抖音创作者活动源读取失败。"), 502)
         payload = result.get("data") if isinstance(result.get("data"), dict) else {}
-        rows = []
-        for item in payload.get("items", []) if isinstance(payload.get("items"), list) else []:
-            title = str(item.get("title") or "").strip()
-            if not title:
+        if payload.get("source") != "creator_activity_api_v2" or not isinstance(payload.get("items"), list):
+            raise WorkflowError("抖音采集返回的活动结构无效，已保留上次数据。", 502)
+        window = payload.get("window") if isinstance(payload.get("window"), dict) else {}
+        start, end = (douyin_display_date(window.get(key))[:10] for key in ("start_time", "end_time"))
+        scope_note = "创作者中心活动日历" + (f" · {start}～{end}（北京时间）" if start and end else " · 当前页面时间范围")
+        scope_note += "；仅代表当前账号该窗口的列表结果。"
+        if payload.get("truncated"):
+            scope_note += "部分条目未读取或未通过校验。"
+        rows, seen = [], set()
+        for order, item in enumerate(payload["items"]):
+            if not isinstance(item, dict):
+                raise WorkflowError("抖音活动条目格式错误。", 502)
+            title, external_id = str(item.get("title") or "").strip(), str(item.get("external_id") or "")
+            if not title or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", external_id):
+                raise WorkflowError("抖音活动缺少可靠名称或 ID。", 502)
+            if external_id in seen:
                 continue
-            url = _safe_url(str(item.get("url") or ""), ("douyin.com", "creator.douyin.com"))
+            seen.add(external_id)
+            url = douyin_detail_url(item.get("url"))
+            fields = ("eligibility", "content_requirements", "prizes", "winning_conditions", "reward_rules")
+            detail_fields = {key: [str(v)[:240] for v in item.get(key, []) if isinstance(v, str)][:20]
+                             for key in fields}
+            detail_status = str(item.get("detail_status") or "not_fetched")
+            if detail_status not in {"parsed", "no_structured_rules", "needs_visual_review", "failed", "app_only", "not_fetched"}:
+                detail_status = "not_fetched"
+            spec = infer_submission_spec("\n".join(detail_fields["content_requirements"]))
+            listing = {"display_starts_at": str(item.get("display_starts_at") or "")[:40],
+                       "display_ends_at": str(item.get("display_ends_at") or "")[:40],
+                       "detail_status": detail_status, "scope_note": scope_note,
+                       "challenge_ids": [str(v) for v in item.get("challenge_ids", []) if re.fullmatch(r"[1-9][0-9]{0,24}", str(v))][:20],
+                       "source_order": order, "fetched_at": int(payload.get("fetched_at") or time.time())}
             rows.append({
                 "provider_id": "douyin_creator_portal", "platform": "douyin",
-                "external_id": ("douyin:" + str(item.get("external_id"))) if item.get("external_id") else "",
+                "external_id": "douyin:" + external_id,
                 "title": title[:240], "organizer": "抖音创作者中心", "organizer_type": "platform",
                 "activity_type": "创作活动", "reward_type": "", "reward_summary": "",
                 "summary": str(item.get("description") or "")[:1200],
-                "starts_at": _date_from_unix(item.get("starts_at")),
-                "submit_deadline": _date_from_unix(item.get("ends_at")),
-                "source_url": url or "https://creator.douyin.com/",
-                "source_type": str(payload.get("source") or "creator_activity"),
-                "source_status": "verified", "note": str(item.get("description") or "")[:3000],
-                "account_id": str(account["id"]),
-                "evidence": {"kind": "creator_account", "account_id": str(account["id"]),
-                             "url": url or "https://creator.douyin.com/"},
+                "starts_at": "", "signup_deadline": str(item.get("signup_deadline") or "")[:40],
+                "submit_deadline": str(item.get("submit_deadline") or "")[:40],
+                "source_url": url, "source_type": "creator_activity_api_v2", "source_status": "verified",
+                "note": str(item.get("description") or "")[:3000], "account_id": str(account["id"]),
+                "qualification_state": "unknown", "qualification_basis": "列表对该账号可见；参与资格仍需核对具体活动规则。",
+                "submission_spec": spec, **detail_fields, "douyin_listing": listing,
+                "field_evidence": {key: {"source": "official_detail", "originals": values} for key, values in detail_fields.items() if values},
+                "evidence": {"kind": "platform_public_detail" if detail_status == "parsed" else "platform_public_list",
+                             "account_id": str(account["id"]), "url": url, "endpoint": "/web/api/v2/creator/activity/pc/list",
+                             "activity_id": external_id, "scope_note": scope_note},
             })
+        latest = self._state()
+        latest["douyin"]["scope_note"] = scope_note
+        self._write(latest)
         return rows
 
     def _tikhub(self) -> list[dict[str, Any]]:

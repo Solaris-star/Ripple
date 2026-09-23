@@ -136,7 +136,7 @@ function sourceLabel(campaign: Campaign): string {
 
 function sourceVerificationLabel(campaign: Campaign): string {
   const label = sourceLabel(campaign);
-  return campaign.platform === 'xiaohongshu' && campaign.source_status === 'verified' ? '列表已同步' : label;
+  return (campaign.platform === 'xiaohongshu' || campaign.douyin_listing) && campaign.source_status === 'verified' ? '列表已同步' : label;
 }
 
 function sourceName(campaign: Campaign): string {
@@ -168,6 +168,15 @@ function xhsDetailStatusText(campaign: Campaign): string {
   return '详情待读取';
 }
 
+function douyinDetailStatusText(campaign: Campaign): string {
+  const labels: Record<string, string> = {
+    parsed: '官方详情已读取', no_structured_rules: '详情未提供可提取的规则',
+    needs_visual_review: '详情含图片，规则待核实', failed: '官方详情暂时无法读取',
+    app_only: '未提供网页详情，请在抖音 App 内查看', not_fetched: '详情待读取',
+  };
+  return labels[campaign.douyin_listing?.detail_status || ''] || '详情待读取';
+}
+
 function concise(values: string[] | undefined, fallback: string, limit = 2): string {
   const rows = (values || []).map((x) => x.trim()).filter(Boolean);
   return rows.length ? rows.slice(0, limit).join('；') + (rows.length > limit ? ' 等 ' + rows.length + ' 条' : '') : fallback;
@@ -178,6 +187,11 @@ function isLongTermProgram(campaign: Campaign): boolean {
 }
 
 function campaignTime(campaign: Campaign): string {
+  if (campaign.douyin_listing && !campaign.starts_at && !campaign.submit_deadline) {
+    const data = campaign.douyin_listing;
+    const start = dateOnly(data.display_starts_at); const end = dateOnly(data.display_ends_at);
+    return `${start || '未说明'} → ${end || '未说明'} · 展示期，投稿截止未核实`;
+  }
   if (isLongTermProgram(campaign) && !dateOnly(campaign.starts_at) && !dateOnly(campaign.submit_deadline)) return '长期计划 · 未公布截止日期';
   const start = dateOnly(campaign.starts_at) || '开始时间未说明';
   const end = dateOnly(campaign.submit_deadline) || '截止时间未说明';
@@ -932,6 +946,7 @@ export default function CampaignsPage({
               <span>{SOURCE_HEALTH[source.status || ''] || source.status || (source.automatic ? '自动同步' : '支持导入')}</span>
             </div>
             <p>{source.detail}</p>
+            {source.scope_note && <small>{source.scope_note}</small>}
             {source.automatic && <small>自动频率：{!source.schedule ? '等待后端加载采集计划' : source.schedule.mode === 'daily_slots' ? `每日 ${(source.schedule.times || []).join(' / ')}（北京时间）` : `每 ${syncIntervalLabel(source.sync_interval_seconds)}（免费来源）`}</small>}
             {source.schedule?.paid_note && <small>{source.schedule.paid_note}</small>}
             {source.cost_note && <small>{source.cost_note}</small>}
@@ -1061,7 +1076,7 @@ export default function CampaignsPage({
                     <div><small>参与条件</small><span className={!campaign.eligibility?.length ? 'campaign-fact-empty' : ''}>{campaign.eligibility?.length ? concise(campaign.eligibility, '') : '—'}</span></div>
                     <div><small>{longTerm ? '收益方式' : '奖品 / 奖励'}</small><span className={!rewardText ? 'campaign-fact-empty' : ''}>{rewardText || '—'}</span></div>
                     <div><small>{longTerm ? '收益规则' : '获奖条件'}</small><span className={!conditionText ? 'campaign-fact-empty' : ''}>{conditionText || '—'}</span></div>
-                    <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{campaign.platform === 'xiaohongshu' ? (xhsRuleStatus + (campaign.xhs_detail_status === 'parsed' && incomplete ? ' · 仍缺：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '')) : campaign.platform === 'x' && xEnrichmentStatus?.current === campaign.id ? '整理中…' : campaign.platform === 'x' && campaign.x_enrichment_status === 'failed' ? '整理失败，等待重试' : incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
+                    <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{campaign.platform === 'xiaohongshu' ? (xhsRuleStatus + (campaign.xhs_detail_status === 'parsed' && incomplete ? ' · 仍缺：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '')) : campaign.douyin_listing ? douyinDetailStatusText(campaign) : campaign.platform === 'x' && xEnrichmentStatus?.current === campaign.id ? '整理中…' : campaign.platform === 'x' && campaign.x_enrichment_status === 'failed' ? '整理失败，等待重试' : incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
                   </div>
                   <div className="campaign-actions">
                     <button className="btn btn-sm" onClick={() => setSelected(campaign)}>查看详情</button>
@@ -1116,6 +1131,8 @@ export default function CampaignsPage({
               </div>
             </div>
 
+            {selected.douyin_listing && <section><h4>抖音来源范围</h4><p className="campaign-copy">{selected.douyin_listing.scope_note}</p><p className="campaign-unknown">官方列表展示期：{dateOnly(selected.douyin_listing.display_starts_at) || '未说明'} → {dateOnly(selected.douyin_listing.display_ends_at) || '未说明'}。展示日期不等同报名或投稿截止日期。</p><p>{douyinDetailStatusText(selected)}</p>{selected.douyin_listing.challenge_ids.length > 0 && <p className="campaign-unknown">官方关联话题 ID：{selected.douyin_listing.challenge_ids.join('、')}（话题名称尚未核实）</p>}</section>}
+
             <section className="campaign-summary-section"><h4>活动摘要</h4><p className={selected.summary || selected.note ? 'campaign-copy' : 'campaign-unknown'}>{selected.summary || selected.note || '当前来源没有提供可结构化的活动摘要，建议打开原活动页查看。'}</p></section>
             <section>
               <h4>时间节点</h4>
@@ -1155,7 +1172,7 @@ export default function CampaignsPage({
             <section><h4>AI 使用要求</h4><p className="campaign-copy">{selected.ai_policy === 'unknown' || !selected.ai_policy ? '原活动规则未说明 AI 使用要求。' : selected.ai_policy}</p></section>
             <section><h4>来源与核验</h4>
               <p className="campaign-source-name"><strong>{sourceName(selected)}</strong> · {sourceVerificationLabel(selected)}</p>
-              {selected.source_url ? <a className="campaign-source-link" href={selected.source_url} target="_blank" rel="noreferrer">{selected.source_url}</a> : <p className="campaign-unknown">没有保存来源链接。</p>}
+              {selected.source_url ? <a className="campaign-source-link" href={selected.source_url} target="_blank" rel="noreferrer">{selected.source_url}</a> : <p className="campaign-unknown">{selected.douyin_listing ? '官方列表未提供可打开的网页详情。请在抖音 App 按活动名称查看；不会使用创作者首页冒充详情。' : '没有保存来源链接。'}</p>}
               <p className="campaign-verify">首次发现：{selected.discovered_at ? new Date(selected.discovered_at * 1000).toLocaleString('zh-CN') : '未知'} · 最后看到：{selected.last_seen_at ? new Date(selected.last_seen_at * 1000).toLocaleString('zh-CN') : '未知'}</p>
               <p className="campaign-verify">规则最近核验：{selected.last_verified_at ? new Date(selected.last_verified_at * 1000).toLocaleString('zh-CN') : '尚未完整核验'} · 规则版本 v{selected.rule_version}</p>
               {selected.platform === 'xiaohongshu' && <p className="campaign-verify">详情解析：{xhsDetailStatusText(selected)}{selected.xhs_detail_fetched_at ? ' · ' + new Date(selected.xhs_detail_fetched_at * 1000).toLocaleString('zh-CN') : ''}{selected.xhs_detail_error ? ' · ' + selected.xhs_detail_error : ''}</p>}

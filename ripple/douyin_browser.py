@@ -1,29 +1,22 @@
-"""Read-only Douyin Creator Center activity discovery using an isolated Ripple profile."""
+"""Douyin login and read-only creator activity discovery in a Ripple profile."""
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from pathlib import Path
+import re
+import time
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
+import uuid
+
+from .douyin_campaigns import (HOME, MAX_RESPONSE, DouyinCampaignError, fetch_public_detail,
+                               official_list_url, parse_activity_list)
 
 
 class DouyinBrowserError(RuntimeError):
     pass
-
-
-EVENTS_JS = r"""(limit) => {
-  const out=[]; const seen=new Set();
-  const nodes=Array.from(document.querySelectorAll("a[href], [class*=activity], [class*=task], [class*=mission], [class*=card]"));
-  for(const node of nodes) {
-    if(out.length>=limit) break;
-    const text=(node.innerText||node.textContent||'').replace(/\s+/g,' ').trim();
-    if(!text || text.length<4 || !/(活动|征稿|激励|创作|任务|招募|挑战|话题)/.test(text)) continue;
-    const a=node.matches?.('a[href]') ? node : node.querySelector?.('a[href]');
-    const href=a?.href||'';
-    const title=(node.querySelector?.("[class*=title],[class*=name],h1,h2,h3,h4")?.textContent||text.split('  ')[0]||text).trim().slice(0,200);
-    const key=(href||title).toLowerCase(); if(!key||seen.has(key)) continue; seen.add(key);
-    out.push({title, url:href, text:text.slice(0,1600)});
-  }
-  return out;
-}"""
 
 
 def _launch(directory: Path, *, headed: bool = False, browser_channel: str | None = None):
@@ -61,180 +54,231 @@ def _close(p, context) -> None:
         p.stop()
 
 
-def _login_required(page) -> bool:
-    url = (page.url or "").lower()
-    body = ""
+def _body(page) -> str:
     try:
-        body = (page.locator("body").inner_text(timeout=1200) or "")[:5000]
+        return (page.locator("body").inner_text(timeout=800) or "")[:5000]
     except Exception:
-        pass
-    return "login" in url or ("登录" in body and ("扫码" in body or "手机号" in body))
+        return ""
 
 
-def _candidates(value: Any, *, limit: int = 60) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    title_keys = ("activity_name", "activityName", "task_name", "taskName", "mission_name",
-                  "missionName", "event_name", "eventName", "title", "name")
-    id_keys = ("activity_id", "activityId", "task_id", "taskId", "mission_id", "missionId", "id")
-    start_keys = ("start_time", "startTime", "begin_time", "beginTime", "start_at", "startAt")
-    end_keys = ("end_time", "endTime", "deadline", "expire_time", "expireTime", "submit_deadline")
-    url_keys = ("jump_url", "jumpUrl", "url", "link", "h5_url", "h5Url")
-    desc_keys = ("description", "desc", "summary", "sub_title", "subTitle")
+def _login_required(page) -> bool:
+    return "login" in urlsplit(page.url or "").path.lower() or bool(re.search(r"扫码登录|验证码登录|密码登录", _body(page)))
 
-    def walk(node: Any, depth: int = 0) -> None:
-        if len(rows) >= limit or depth > 7:
+
+class _IdentityObserver:
+    """Positive authenticated API evidence; an unloaded page is never logged in."""
+    def __init__(self):
+        self.value: dict[str, Any] = {"logged_in": False, "name": "", "remote_id": ""}
+
+    def observe(self, response) -> None:
+        parsed = urlsplit(response.url)
+        paths = {"/aweme/v1/creator/pc/user/info/", "/web/api/media/user/info/"}
+        if parsed.hostname != "creator.douyin.com" or parsed.path not in paths or response.status != 200:
             return
-        if isinstance(node, list):
-            for child in node[:250]:
-                walk(child, depth + 1)
-            return
-        if not isinstance(node, dict):
-            return
-        title = next((str(node.get(k) or "").strip() for k in title_keys if str(node.get(k) or "").strip()), "")
-        activityish = any(k in node for k in id_keys + start_keys + end_keys) or any(
-            word in title for word in ("活动", "征稿", "激励", "创作", "任务", "招募", "挑战")
-        )
-        if title and activityish and len(title) <= 300:
-            external_id = next((str(node.get(k) or "").strip() for k in id_keys if str(node.get(k) or "").strip()), "")
-            key = (external_id or title).casefold()
-            if key not in seen:
-                seen.add(key)
-                rows.append({
-                    "external_id": external_id[:160],
-                    "title": title[:240],
-                    "url": next((str(node.get(k) or "").strip() for k in url_keys if str(node.get(k) or "").strip()), "")[:2048],
-                    "starts_at": next((str(node.get(k) or "").strip() for k in start_keys if str(node.get(k) or "").strip()), "")[:80],
-                    "ends_at": next((str(node.get(k) or "").strip() for k in end_keys if str(node.get(k) or "").strip()), "")[:80],
-                    "description": next((str(node.get(k) or "").strip() for k in desc_keys if str(node.get(k) or "").strip()), "")[:3000],
-                })
-        for child in node.values():
-            if isinstance(child, (dict, list)):
-                walk(child, depth + 1)
-
-    walk(value)
-    return rows[:limit]
-
-
-def _identity(page, fallback: str = "") -> dict[str, Any]:
-    if "creator.douyin.com" not in (page.url or "").lower() or _login_required(page):
-        return {"logged_in": False, "name": "", "remote_id": ""}
-    name = ""
-    for selector in ("[class*=user-name]", "[class*=nickname]", "[class*=account-name]", "[class*=creator-name]"):
         try:
-            value = (page.locator(selector).first.inner_text(timeout=500) or "").strip()
-            if value:
-                name = value[:80]
-                break
+            data = response.json()
+            if not isinstance(data, dict) or type(data.get("status_code")) is not int or data["status_code"] != 0:
+                return
+            user = data.get("user") if isinstance(data.get("user"), dict) else data
+            uid = user.get("uid")
+            if isinstance(uid, bool) or not isinstance(uid, (str, int)) or not re.fullmatch(r"[1-9][0-9]{0,24}", str(uid)):
+                return
+            self.value = {"logged_in": True, "remote_id": str(uid),
+                          "name": str(user.get("nickname") or self.value.get("name") or "")[:80]}
         except Exception:
-            pass
-    return {"logged_in": True, "name": name or str(fallback or "抖音创作者")[:80], "remote_id": ""}
+            return
+
+
+def _identity(page, fallback: str = "", observer: _IdentityObserver | None = None) -> dict[str, Any]:
+    if (urlsplit(page.url or "").hostname != "creator.douyin.com" or _login_required(page)
+            or observer is None or not observer.value.get("logged_in")):
+        return {"logged_in": False, "name": "", "remote_id": ""}
+    return {**observer.value, "name": observer.value.get("name") or str(fallback or "抖音创作者")[:80]}
+
+
+LOGIN_MESSAGES = {
+    "starting": "正在打开抖音登录窗口并读取二维码…",
+    "qr_ready": "请使用抖音 App 扫码，并在手机上确认登录。",
+    "scanned": "已扫码，请在手机上完成登录确认。",
+    "verifying": "抖音要求额外验证，请到独立浏览器窗口完成。",
+    "waiting_user": "平台暂未显示可读取的二维码，请在已打开的独立窗口选择扫码登录或完成验证。",
+    "success": "抖音登录成功，账号身份已核验。",
+    "expired": "二维码或登录等待已超时，请在平台窗口刷新二维码，或重新打开登录。",
+    "error": "抖音登录未完成，请检查独立浏览器窗口或网络。",
+}
+
+
+class _LoginProgress:
+    def __init__(self, directory: Path | None):
+        self.directory = directory
+        self.last: tuple[str, str] | None = None
+
+    def update(self, state: str, image: bytes | None = None) -> None:
+        if self.directory is None:
+            return
+        if state not in LOGIN_MESSAGES:
+            state = "error"
+        if state == "qr_ready" and not image:
+            state = "waiting_user"
+        revision = hashlib.sha256(image).hexdigest()[:16] if image and state == "qr_ready" else ""
+        if self.last == (state, revision):
+            return
+        self.directory.mkdir(parents=True, exist_ok=True)
+        qr = self.directory / "qr.png"
+        if revision:
+            temp = qr.with_name(uuid.uuid4().hex + ".png.tmp")
+            temp.write_bytes(image)
+            os.replace(temp, qr)
+        else:
+            qr.unlink(missing_ok=True)
+        value = {"state": state, "message": LOGIN_MESSAGES[state], "qr_revision": revision}
+        temp = self.directory / (uuid.uuid4().hex + ".json.tmp")
+        temp.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp, self.directory / "status.json")
+        self.last = state, revision
+
+
+def _qr_image(page) -> bytes | None:
+    """Capture only a QR element, validated geometrically; never a full login page."""
+    import cv2
+    import numpy as np
+    nodes = page.locator('[class*="login-card"] img, [class*="login-card"] canvas, '
+                         '[class*="qrcode"] img, [class*="qrcode"] canvas, [class*="qr-code"] img')
+    for i in range(min(nodes.count(), 12)):
+        node = nodes.nth(i)
+        try:
+            box = node.bounding_box(timeout=500)
+            if not box or not 100 <= box["width"] <= 400 or not 100 <= box["height"] <= 400:
+                continue
+            if abs(box["width"] - box["height"]) > 12 or not node.is_visible():
+                continue
+            raw = node.screenshot(type="png", timeout=1200)
+            if len(raw) > 512 * 1024:
+                continue
+            pixels = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+            valid, points = cv2.QRCodeDetector().detect(pixels)
+            if valid and points is not None:
+                return raw
+        except Exception:
+            continue
+    return None
 
 
 def login(directory: Path, *, headed: bool = True, browser_channel: str | None = None,
-          timeout: int = 240, fallback_name: str = "") -> dict[str, Any]:
-    import time
-    p, context, page = _launch(directory, headed=headed, browser_channel=browser_channel)
+          timeout: int = 240, fallback_name: str = "", run_dir: Path | None = None) -> dict[str, Any]:
+    progress = _LoginProgress(run_dir)
+    progress.update("starting")
+    p = context = None
     try:
-        page.goto("https://creator.douyin.com/creator-micro/home", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1800)
-        if _login_required(page):
-            if not headed:
-                raise DouyinBrowserError("login_required")
-            deadline = time.monotonic() + max(10, min(timeout, 300))
-            while time.monotonic() < deadline:
-                page.wait_for_timeout(1000)
-                if not _login_required(page):
-                    break
-        identity = _identity(page, fallback_name)
-        if not identity["logged_in"]:
-            raise DouyinBrowserError("login_required")
-        return identity
+        p, context, page = _launch(directory, headed=headed, browser_channel=browser_channel)
+        observer = _IdentityObserver()
+        page.on("response", observer.observe)
+        page.goto(HOME, wait_until="domcontentloaded", timeout=30000)
+        deadline = time.monotonic() + max(5, min(timeout, 240))
+        while time.monotonic() < deadline:
+            page.wait_for_timeout(1000)
+            identity = _identity(page, fallback_name, observer)
+            if identity["logged_in"]:
+                progress.update("success")
+                return identity
+            text = _body(page)
+            if re.search(r"扫码成功|扫描成功|已扫码|请在手机.{0,15}确认", text):
+                progress.update("scanned")
+            elif re.search(r"二维码.{0,8}(?:过期|失效)|登录已超时", text):
+                progress.update("expired")
+            elif re.search(r"安全验证|拖动滑块|请完成验证|请输入短信验证码", text):
+                progress.update("verifying")
+            else:
+                image = _qr_image(page)
+                progress.update("qr_ready" if image else "waiting_user", image)
+        progress.update("expired")
+        raise DouyinBrowserError("login_required")
+    except Exception:
+        if progress.last is None or progress.last[0] != "expired":
+            progress.update("error")
+        raise
     finally:
-        _close(p, context)
+        if p is not None and context is not None:
+            _close(p, context)
 
 
 def probe(directory: Path, *, browser_channel: str | None = None, fallback_name: str = "") -> dict[str, Any]:
     p, context, page = _launch(directory, headed=False, browser_channel=browser_channel)
     try:
-        page.goto("https://creator.douyin.com/creator-micro/home", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(1600)
-        return _identity(page, fallback_name)
+        observer = _IdentityObserver()
+        page.on("response", observer.observe)
+        page.goto(HOME, wait_until="domcontentloaded", timeout=30000)
+        for _ in range(20):
+            page.wait_for_timeout(500)
+            identity = _identity(page, fallback_name, observer)
+            if identity["logged_in"] or _login_required(page):
+                return identity
+        raise DouyinBrowserError("identity_unconfirmed")
     finally:
         _close(p, context)
 
 
-def events(directory: Path, limit: int = 30, *, browser_channel: str | None = None) -> dict[str, Any]:
+def _candidates(value: Any, *, limit: int = 200) -> list[dict[str, Any]]:
+    return parse_activity_list(value, limit=limit)["items"]
+
+
+def events(directory: Path, limit: int = 200, *, browser_channel: str | None = None) -> dict[str, Any]:
     p, context, page = _launch(directory, browser_channel=browser_channel)
-    payloads: list[Any] = []
+    payloads: list[dict[str, Any]] = []
+    failures: list[str] = []
+    observer = _IdentityObserver()
     try:
         def on_response(response):
-            lower = response.url.lower()
-            if not any(token in lower for token in ("activity", "mission", "task", "inspire", "campaign")):
+            if not official_list_url(response.url):
                 return
             try:
-                if "json" in (response.headers.get("content-type") or "").lower():
-                    value = response.json()
-                    if isinstance(value, (dict, list)) and len(payloads) < 50:
-                        payloads.append(value)
+                if response.status != 200 or "json" not in response.headers.get("content-type", "").lower():
+                    raise DouyinCampaignError("抖音活动接口未返回可用的 JSON 响应。")
+                raw = response.body()
+                if len(raw) > MAX_RESPONSE:
+                    raise DouyinCampaignError("抖音活动响应超过安全上限。")
+                # Python parses raw JSON so long numeric IDs are not rounded by JavaScript.
+                result = parse_activity_list(json.loads(raw), limit=limit)
+                query = parse_qs(urlsplit(response.url).query)
+                result["window"] = {k: int(query[k][0]) for k in ("start_time", "end_time")
+                                    if len(query.get(k, [])) == 1 and query[k][0].isdigit()}
+                if len(payloads) < 4:
+                    payloads.append(result)
+            except (ValueError, TypeError, KeyError):
+                failures.append("抖音官方活动列表响应无效，未回退到分类或首页文本。")
             except Exception:
-                pass
+                failures.append("抖音官方活动列表读取失败。")
 
+        page.on("response", observer.observe)
         page.on("response", on_response)
-        page.goto("https://creator.douyin.com/creator-micro/home", wait_until="domcontentloaded", timeout=30000)
-        page.wait_for_timeout(2600)
-        if _login_required(page):
-            raise DouyinBrowserError("login_required")
-
-        # A read-only navigation to a visible activity/task entry can trigger the
-        # Creator Center's activity API without depending on a hard-coded endpoint.
-        for label in ("活动", "热门活动", "任务中心", "创作任务", "激励"):
-            try:
-                link = page.get_by_text(label, exact=False).first
-                if link.count() and link.is_visible():
-                    link.click()
-                    page.wait_for_timeout(1800)
-                    break
-            except Exception:
-                pass
-
-        if _login_required(page):
-            raise DouyinBrowserError("login_required")
-
-        items: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for payload in payloads:
-            for row in _candidates(payload, limit=max(30, limit * 2)):
-                key = (row.get("external_id") or row.get("url") or row.get("title") or "").casefold()
-                if key and key not in seen:
-                    seen.add(key); items.append(row)
-                    if len(items) >= limit: break
-            if len(items) >= limit: break
-        source = "creator_activity_api"
-        if not items:
-            source = "creator_activity_dom"
-            raw = page.evaluate(EVENTS_JS, max(1, min(limit, 50))) or []
-            for row in raw:
-                if not isinstance(row, dict):
-                    continue
-                title = str(row.get("title") or "").strip()[:240]
-                if not title:
-                    continue
-                items.append({
-                    "external_id": "",
-                    "title": title,
-                    "url": str(row.get("url") or "")[:2048],
-                    "starts_at": "",
-                    "ends_at": "",
-                    "description": str(row.get("text") or "")[:3000],
-                })
-        return {"items": items[:limit], "source": source, "page_url": (page.url or "")[:2048]}
+        page.goto(HOME, wait_until="domcontentloaded", timeout=30000)
+        for _ in range(40):
+            page.wait_for_timeout(500)
+            if _login_required(page):
+                raise DouyinBrowserError("login_required")
+            if observer.value["logged_in"] and (payloads or failures):
+                break
+        if not _identity(page, observer=observer)["logged_in"]:
+            raise DouyinBrowserError("identity_unconfirmed")
+        if not payloads:
+            raise DouyinBrowserError(failures[-1] if failures else "未观察到抖音官方活动列表响应，请稍后重试。")
+        result = payloads[-1]
+        result["page_url"] = HOME
+        result["fetched_at"] = int(time.time())
     finally:
         _close(p, context)
+    # Public details use no account credentials. Bound work and keep list rows on failure.
+    deadline, attempted = time.monotonic() + 45, 0
+    for row in result["items"]:
+        if row["url"] and attempted < 8 and time.monotonic() < deadline:
+            row.update(fetch_public_detail(row["url"]))
+            attempted += 1
+    result["detail_attempted"] = attempted
+    return result
 
 
 def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
     if action != "events":
         raise DouyinBrowserError("unsupported_action")
-    limit = max(1, min(int(params.get("limit") or 30), 50))
+    limit = max(1, min(int(params.get("limit") or 200), 500))
     return events(directory, limit, browser_channel=str(params.get("browser_channel") or "") or None)

@@ -7,22 +7,17 @@ from ripple.douyin_browser import _candidates
 
 
 def test_douyin_creator_json_parser_extracts_activity_fields():
-    rows = _candidates({"data": {"tasks": [{
-        "taskId": "t1",
-        "taskName": "九月创作激励",
-        "startTime": 1789000000,
-        "endTime": 1791000000,
-        "jumpUrl": "https://creator.douyin.com/activity/t1",
-        "description": "发布原创视频参与",
-    }]}})
-    assert rows == [{
-        "external_id": "t1",
-        "title": "九月创作激励",
-        "url": "https://creator.douyin.com/activity/t1",
-        "starts_at": "1789000000",
-        "ends_at": "1791000000",
-        "description": "发布原创视频参与",
-    }]
+    rows = _candidates({"status_code": 0, "list": [{
+        "activity_id": "7681577746870326281", "show_name": "九月创作激励",
+        "show_start_time": 1789000000, "show_end_time": 1791000000,
+        "jump_link": "https://creator.douyin.com/activity/t1", "challenge_ids": [0, 12345],
+    }]})
+    assert rows[0]["external_id"] == "7681577746870326281"
+    assert rows[0]["title"] == "九月创作激励"
+    assert rows[0]["url"] == "https://creator.douyin.com/activity/t1"
+    assert rows[0]["display_starts_at"].endswith("+08:00")
+    assert rows[0]["challenge_ids"] == ["12345"]
+    assert "submit_deadline" not in rows[0]
 
 
 def test_native_worker_douyin_campaign_read_does_not_require_removed_legacy_publisher(tmp_path, monkeypatch):

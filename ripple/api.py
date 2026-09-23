@@ -385,6 +385,8 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
         op = a.get("operation") or {}
         if not re.fullmatch(r"[a-f0-9]{32}", operation_id) or op.get("id") != operation_id or op.get("kind") != "login" or op.get("state") != "running":
             raise HTTPException(404, "二维码已过期，请重新登录。")
+        if a.get("platform") == "douyin" and a.get("login_state") != "qr_ready":
+            raise HTTPException(404, "当前抖音二维码已失效或等待手机确认。")
         path = service.accounts.directory(account_id) / "operations" / operation_id / "qr.png"
         if not path.is_file() or path.stat().st_size > 2 * 1024 * 1024:
             raise HTTPException(404, "二维码尚未就绪。")

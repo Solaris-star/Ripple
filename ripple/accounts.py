@@ -120,8 +120,15 @@ class AccountService:
                     st = json.loads((run / "status.json").read_text(encoding="utf-8"))
                     value["login_state"] = st.get("state", "starting")
                     value["qr_available"] = op.get("kind") == "login" and (run / "qr.png").is_file() and st.get("state") == "qr_ready"
+                    if value.get("platform") == "douyin" and op.get("kind") == "login":
+                        from .douyin_browser import LOGIN_MESSAGES
+                        value["message"] = LOGIN_MESSAGES.get(st.get("state"), LOGIN_MESSAGES["starting"])
+                        revision = str(st.get("qr_revision") or "")
+                        value["qr_revision"] = revision if re.fullmatch(r"[a-f0-9]{16}", revision) else ""
             except (OSError, ValueError):
                 value["login_state"] = "starting"
+                if value.get("platform") == "douyin" and op.get("kind") == "login":
+                    value["message"] = "正在打开抖音登录窗口并读取二维码…"
         if value.get("adapter") != "x-api":
             home = NATIVE.get(value.get("platform"), {}).get("home")
             if home:

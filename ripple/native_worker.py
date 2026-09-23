@@ -82,7 +82,7 @@ def execute(payload: dict) -> dict:
                 identity = douyin_browser.login(
                     directory, headed=bool(payload.get("headed", True)),
                     browser_channel=str(payload.get("browser_channel") or "") or None,
-                    timeout=240, fallback_name=str(payload.get("profile_label") or ""),
+                    timeout=240, fallback_name=str(payload.get("profile_label") or ""), run_dir=run_dir,
                 )
                 return {"state": "connected", "identity": identity, "message": "抖音创作者账号登录状态已核验。"}
             if operation == "probe":
@@ -103,8 +103,11 @@ def execute(payload: dict) -> dict:
                 return {"state": "verification_required" if operation == "campaign_read" else "expired",
                         "not_submitted": True, "identity": {"logged_in": False, "name": "", "remote_id": ""},
                         "message": "抖音创作者中心登录态已失效，请先重新连接账号。", "data": {}}
+            message = {"identity_unconfirmed": "尚未取得抖音账号身份的有效响应，请检查网络或平台验证后重试。",
+                       "browser_launch_failed": "无法启动抖音独立浏览器，请检查浏览器环境。",
+                       "unsupported_action": "不支持的抖音只读操作。"}.get(code, code[:300])
             return {"state": "failed_terminal", "not_submitted": True,
-                    "message": "抖音创作者中心只读操作未完成。", "data": {}}
+                    "message": message or "抖音创作者中心只读操作未完成。", "data": {}}
 
     module = importlib.import_module(NATIVE[platform]["module"])
     import login_state

@@ -4191,6 +4191,7 @@ def _campaign_from_request(req: CampaignInput, previous: dict | None = None) -> 
         "external_ids": deepcopy(previous.get("external_ids") or {}),
         "source_evidence": deepcopy(previous.get("source_evidence") or []),
         "account_states": deepcopy(previous.get("account_states") or {}),
+        "douyin_listing": deepcopy(previous.get("douyin_listing")),
         "field_evidence": deepcopy(previous.get("field_evidence") or {}),
         "rule_evidence_fingerprint": str(previous.get("rule_evidence_fingerprint") or "")[:80],
         "last_agent_fingerprint": str(previous.get("last_agent_fingerprint") or "")[:80],
@@ -4226,6 +4227,7 @@ def _campaign_find_candidate(items: list[dict], candidate: dict) -> dict | None:
     title_key = _campaign_match_key(candidate.get("title", ""))
     platform = str(candidate.get("platform") or "")
     provider_id = str(candidate.get("provider_id") or "")
+    strict_douyin_activity = platform == "douyin" and provider_id == "douyin_creator_portal" and bool(external)
     strict_xhs_activity = bool(
         platform == "xiaohongshu"
         and provider_id == "xiaohongshu_creator_events"
@@ -4235,6 +4237,11 @@ def _campaign_find_candidate(items: list[dict], candidate: dict) -> dict | None:
         if item.get("platform") != platform:
             continue
         ids = item.get("external_ids") if isinstance(item.get("external_ids"), dict) else {}
+        if strict_douyin_activity:
+            # Official IDs survive shared landing URLs and duplicate titles.
+            if str(ids.get(provider_id) or "") == external:
+                return item
+            continue
         if external and external in {str(v) for v in ids.values() if v}:
             return item
         if strict_xhs_activity:
@@ -4441,6 +4448,8 @@ def _merge_campaign_candidate(items: list[dict], candidate: dict) -> dict:
             item["enrichment_status"] = "partial"
         elif item.get("enrichment_status") not in {"queued", "running", "failed"}:
             item["enrichment_status"] = "incomplete"
+    if candidate.get("platform") == "douyin" and isinstance(candidate.get("douyin_listing"), dict):
+        item["douyin_listing"] = deepcopy(candidate["douyin_listing"])
     ids = item.setdefault("external_ids", {})
     if provider_id and external_id:
         ids[provider_id] = external_id

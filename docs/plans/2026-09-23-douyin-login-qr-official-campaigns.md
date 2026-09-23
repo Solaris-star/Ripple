@@ -1,6 +1,6 @@
 # Plan: 抖音登录二维码与官方创作活动采集
 
-状态：PLAN，等待用户确认；本轮仅只读排查及编写本计划，未修改业务代码或活动数据。
+状态：EXECUTE 已完成（2026-09-23）。用户确认后完成实现、定向修复、真实同步和验证；原计划与执行结果一并保留。
 
 ## Goal / Non-goals
 
@@ -111,4 +111,23 @@ Will NOT touch：当前账号凭据/个人浏览器 Profile、其他平台采集
 
 ## Open questions
 
-用户确认上述范围后进入 EXECUTE。实现阶段继续核实列表时间窗口、展示日期含义和真实跳转类型；不会默默启用收费接口、扩大登录授权或清空历史数据。
+用户已确认执行。列表窗口已核实为当前账号创作者中心活动日历的当月范围；展示日期保留为展示日期。App 内详情及图片里的规则仍需核实，不填写未经确认的奖励、条件或截止时间。
+
+## Execution results（2026-09-23）
+
+- 官方只读接口 `/web/api/v2/creator/activity/pc/list` 在北京时间 2026-09-01～2026-09-30 的窗口返回 13 条；通过一次 `platforms=[douyin], force=true, allow_paid=false` 的真实同步，13 个官方 ID 全部独立入库，分页 10 + 3。两条同名“2026抖音创作者大会”保留不同 ID。同步过程约 12 秒。
+- 本次 11 条活动没有可打开的网页详情，2 条官方详情包含图片且未找到可直接提取的规则，均明确标注；没有把 show_* 展示日期当投稿截止日期，也没有用平台首页冒充详情。
+- 登录使用已有独立 Profile，增加真实二维码元素识别/截图、状态原子写入、二维码版本更新和结束清理。匿名临时浏览器实测可取得真实二维码，超时后图片清除；前端使用模拟账号及合成二维码验证启动、二维码轮换、扫码等待、超时及成功，未要求已绑定账号重新扫码。
+- 修复前检查“摄影摄像”记录无收藏、人工规则或业务引用；服务暂停期间仅隔离该 ID。完整原始文件保存在 `.ripple-private/outputs/recovery/campaigns-before-taxonomy-0dfad7646640532d8ecc3a5c08cb34c2bab9a0464c90a7d541124a6c198008e7.json`。其他 313 条记录在修复时保持不变，随后抖音同步也未改动其他平台条目。
+- 后端相关回归 225 项通过、无失败或跳过；前端单测 12 项通过，定向 lint 无警告/错误，生产构建成功。浏览器 5 组场景通过，无页面异常、无真实登录/刷新等写请求。保留两项现有测试依赖弃用警告。
+- RippleLocalService 已重启，运行 PID 从 49124 变为 123704；后续确认新接口及最终前端 `index-ZkB_4Ih1.js` 已实际提供，用户抖音账号仍 connected。
+- 保留免费抖音来源每小时同步、TikHub 关闭和其他平台采集计划。没有启动收费模型，没有报名、发布或领奖。
+- 本轮前置 checkpoint 工具返回错误，改用 `artifacts/douyin-official-20260923/baseline/` 保存精确原始文件、SHA 和工作区状态；提交按该基线生成本任务 hunks，既有未提交内容不混入。
+
+### Evidence / repeatable checks
+
+结果记录：`artifacts/douyin-official-20260923/live-sync-report.json`、`browser-report.json`、`validation-summary.json`、`tests.xml`。
+
+离线回归：`tests/test_douyin_official_adapter.py`（严格列表结构/ID/时间、域名及跳转安全、规则来源、二维码轮换及访问边界、账号范围和误采隔离），并回归现有活动、账号/服务认证及执行节点测试。
+
+浏览器验证：`python scripts/douyin_adapter_smoke.py`，基于本次已同步的 2026-09 日历样本，不启动真实登录或采集。定向数据修复脚本 `scripts/douyin_taxonomy_repair.py` 默认只预览，应用需要停止服务、明确记录 ID、匹配原文件 SHA、无人工改动/引用，并先保留完整备份。

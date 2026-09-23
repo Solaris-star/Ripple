@@ -422,7 +422,10 @@ def test_xhs_and_douyin_candidate_parsers_accept_creator_api_shapes_without_dom(
         }
     }
     xhs = xhs_candidates(fixture)
-    douyin = douyin_candidates(fixture)
+    douyin = douyin_candidates({"status_code": 0, "list": [{
+        "activity_id": "a1", "show_name": "创作激励计划", "jump_link": "",
+        "show_start_time": 1789000000, "show_end_time": 1791000000,
+    }]})
     assert xhs[0]["external_id"] == "a1" and xhs[0]["title"] == "创作激励计划"
     assert douyin[0]["external_id"] == "a1" and douyin[0]["title"] == "创作激励计划"
 

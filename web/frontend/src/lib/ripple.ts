@@ -20,7 +20,7 @@ export interface Account {
   identity: { logged_in: boolean; name: string; remote_id: string } | null;
   checked_at: string | null; message: string; live_verified: boolean;
   operation: { id: string; kind: string; state: string; started_at: string; task_id?: string; browser_channel?: string; execution_node_id?: string; command_id?: string } | null;
-  login_state?: string; qr_available?: boolean; login_url?: string;
+  login_state?: string; qr_available?: boolean; qr_revision?: string; login_url?: string;
   execution_node_id?: string; profile_id?: string; browser_channel?: string | null;
   adapter?: string; external_id?: string; bridge_revision?: string; capabilities?: string[];
 }

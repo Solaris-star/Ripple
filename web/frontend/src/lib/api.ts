@@ -364,6 +364,10 @@ export interface Campaign {
   xhs_detail_version?: number;
   xhs_detail_fetched_at?: number;
   xhs_detail_error?: string;
+  douyin_listing?: {
+    display_starts_at: string; display_ends_at: string; detail_status: string;
+    scope_note: string; challenge_ids: string[]; source_order: number; fetched_at: number;
+  } | null;
 }
 export type CampaignInput = Pick<Campaign, 'title' | 'platform'> & Partial<Pick<Campaign,
   'organizer' | 'organizer_type' | 'activity_type' | 'reward_type' | 'reward_summary' | 'summary' |
@@ -422,6 +426,7 @@ export interface CampaignSourceCapability {
   mode: string;
   automatic: boolean;
   detail: string;
+  scope_note?: string;
   status?: 'ready' | 'ready_fallback' | 'needs_config' | 'needs_login' | 'stale' | 'error' | 'manual' | string;
   billing?: 'free' | 'paid_or_plan_dependent' | 'free_primary_paid_fallback' | 'unknown' | string;
   cost_note?: string;
