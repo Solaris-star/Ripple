@@ -643,7 +643,8 @@ def test_campaign_source_capabilities_only_claim_bilibili_without_configuration(
 
 
 def test_structured_idea_keeps_campaign_and_trend_context(tmp_path, monkeypatch):
-    monkeypatch.setattr(upstream, "IDEAS_FILE", tmp_path / "ideas.json")
+    monkeypatch.setattr(upstream, "_IDEATION", upstream.IdeationService(
+        tmp_path / "ideas.sqlite3", legacy_path=tmp_path / "ideas.json"))
     idea = upstream.IdeaItem(
         title="活动选题",
         note="说明",

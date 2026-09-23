@@ -8,7 +8,7 @@ import { TREND_PLATFORMS, ALL_TREND_KEYS, loadTrendSelection, saveTrendSelection
 import { PlatformIcon } from './PlatformBrand';
 
 interface TrendsPageProps {
-  onUseTopic: (title: string) => void;
+  onOpenIdeas: (seed: { trend_title: string; trend_platform: string }) => void;
   onBreakdown: (seed: string) => void;
 }
 
@@ -19,7 +19,7 @@ function metricText(metrics: XhsMetrics): string {
   return rows.map(([label, value]) => `${label} ${value.toLocaleString()}`).join(' · ');
 }
 
-export default function TrendsPage({ onUseTopic, onBreakdown }: TrendsPageProps) {
+export default function TrendsPage({ onOpenIdeas, onBreakdown }: TrendsPageProps) {
   const [selected, setSelected] = useState<string[]>(() => loadTrendSelection());
   const [groups, setGroups] = useState<TrendGroup[]>([]);
   const [loading, setLoading] = useState(false);
@@ -152,7 +152,7 @@ export default function TrendsPage({ onUseTopic, onBreakdown }: TrendsPageProps)
             <div className="xhs-sample-main"><a href={item.url || undefined} target="_blank" rel="noreferrer">{item.title}</a><small>{item.author ? `@${item.author}` : '作者信息未读取'}{metricText(item.metrics) ? ` · ${metricText(item.metrics)}` : ' · 互动指标未读取'}</small></div>
             <button className="trend-save" title="存入选题库" onClick={() => void save(item.title, xhsOpsScope)}>{saved.has(item.title) ? <IconCheck size={14} /> : <IconBookmark size={14} />}</button>
             <button className="trend-use" onClick={() => breakdown(item)}><IconSkills size={12} /> 拆解</button>
-            <button className="trend-use" onClick={() => onUseTopic(item.title)}>做内容</button>
+            <button className="trend-use" title="围绕此热点找选题" onClick={() => onOpenIdeas({ trend_title: item.title, trend_platform: 'xiaohongshu' })}>找选题</button>
           </div>)}
         </div>}
         {!xhsCandidate && <div className="trend-empty-hint">连接小红书账号后可读取推荐流、关键词搜索、自己的近期作品和评论。Ripple 不复用日常浏览器登录态。</div>}
@@ -165,7 +165,7 @@ export default function TrendsPage({ onUseTopic, onBreakdown }: TrendsPageProps)
             {g.status === 'stale' && <div className="trend-state-note">当前源刷新失败，显示 {new Date(g.fetched_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} 的缓存。</div>}
             <div className="trend-list">
               {g.items.length === 0 && !loading && <div className="trend-empty"><div>{g.error || '当前没有可用数据。'}</div>{g.platform === 'xiaohongshu' && <div className="trend-xhs-auth"><button className="btn btn-sm" disabled={xhsLoading} onClick={() => void readXiaohongshu()}>{xhsLoading ? '读取中…' : '重新获取公开热点'}</button>{xhsAccounts.length > 0 && <button className="btn btn-sm" disabled={xhsLoading || !xhsCandidate} onClick={() => void readXiaohongshu(xhsCandidate)}>使用所选账号只读获取</button>}</div>}{g.platform === 'xiaohongshu' && <div className="trend-empty-hint">公开聚合源失败时会保留最近成功缓存；已连接账号只用于你明确发起的只读读取。</div>}</div>}
-              {g.items.map((it, i) => <div key={i} className="trend-item"><span className={`trend-rank ${i < 3 ? 'top' : ''}`}>{i + 1}</span><div className="trend-main"><a className="trend-title" href={it.url || undefined} target="_blank" rel="noreferrer" title={it.title}>{it.title}</a>{it.hot && <span className="trend-hot">{it.hot}</span>}</div><button className="trend-save" title={saved.has(it.title) ? '已收藏到选题库' : '收藏到选题库'} onClick={() => void save(it.title, `${g.label}热搜`)}>{saved.has(it.title) ? <IconCheck size={14} /> : <IconBookmark size={14} />}</button><button className="trend-use" title="做成内容" onClick={() => onUseTopic(it.title)}>做内容</button></div>)}
+              {g.items.map((it, i) => <div key={i} className="trend-item"><span className={`trend-rank ${i < 3 ? 'top' : ''}`}>{i + 1}</span><div className="trend-main"><a className="trend-title" href={it.url || undefined} target="_blank" rel="noreferrer" title={it.title}>{it.title}</a>{it.hot && <span className="trend-hot">{it.hot}</span>}</div><button className="trend-save" title={saved.has(it.title) ? '已收藏到选题库' : '收藏到选题库'} onClick={() => void save(it.title, `${g.label}热搜`)}>{saved.has(it.title) ? <IconCheck size={14} /> : <IconBookmark size={14} />}</button><button className="trend-use" title="围绕此热点找选题" onClick={() => onOpenIdeas({ trend_title: it.title, trend_platform: g.platform })}>找选题</button></div>)}
             </div>
           </div>
         ))}

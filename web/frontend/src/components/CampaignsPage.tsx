@@ -9,7 +9,7 @@ import {
 import type {
   Campaign, CampaignEnrichmentStatus, CampaignInput, CampaignListSort, CampaignPageResponse, CampaignPlatform,
   CampaignSourceCapability, CampaignSubmissionSpec, IdeaRecommendation, IdeaRecommendResponse,
-  PersonaItem, TopicUseContext, TrendGroup,
+  PersonaItem, TrendGroup,
 } from '../lib/api';
 import { loadTrendSelection } from '../lib/trendPrefs';
 import { api as rippleApi } from '../lib/ripple';
@@ -21,13 +21,13 @@ import { PlatformBadge, PlatformIcon } from './PlatformBrand';
 import { platformDisplayName } from '../lib/platforms';
 
 interface CampaignsPageProps {
-  onUseTopic: (input: string | TopicUseContext) => void;
   persona: string;
   aiReady: boolean;
   personas: PersonaItem[];
   onPersonaChange: (name: string) => void;
   onNewPersona: () => void;
   onOpenSettings: () => void;
+  onOpenIdeas: (ideaId: string) => void;
 }
 
 const PLATFORMS: { key: CampaignPlatform; label: string }[] = [
@@ -269,7 +269,7 @@ function paginationItems(page: number, totalPages: number): Array<number | 'elli
 }
 
 export default function CampaignsPage({
-  onUseTopic, persona, aiReady, personas, onPersonaChange, onNewPersona, onOpenSettings,
+  persona, aiReady, personas, onPersonaChange, onNewPersona, onOpenSettings, onOpenIdeas,
 }: CampaignsPageProps) {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [pageData, setPageData] = useState<CampaignPageResponse | null>(null);
@@ -852,6 +852,8 @@ export default function CampaignsPage({
       ].filter(Boolean).join('\n\n'),
       source: `AI推荐 · ${persona} · ${campaign.title}`,
       status: 'pending',
+      stage: 'saved',
+      persona,
       angle: rec.angle,
       reason: rec.reason,
       campaign_id: campaign.id,
@@ -860,34 +862,22 @@ export default function CampaignsPage({
       target_platforms: rec.platforms?.length ? rec.platforms : [campaign.platform],
       requirements: rec.requirements?.length ? rec.requirements : campaign.content_requirements,
       pending_checks: rec.pending_checks || [],
+      platform_plans: rec.platform_plans || [],
+      source_refs: rec.source_refs || [],
+      score: rec.score || 0,
     });
     setAdded((current) => new Set(current).add(rec.title));
     showToast('已加入选题库');
     return idea;
   };
 
-  const startRecommendationContent = (rec: IdeaRecommendation) => {
-    const campaign = recommendCampaign;
-    onUseTopic({
-      title: rec.title,
-      angle: rec.angle,
-      reason: rec.reason,
-      campaignId: campaign?.id,
-      campaignTitle: campaign?.title,
-      campaignRuleVersion: campaign?.rule_version,
-      trendRefs: rec.trend_refs,
-      targetPlatforms: rec.platforms?.length ? rec.platforms : campaign ? [campaign.platform] : [],
-      requirements: rec.requirements?.length ? rec.requirements : campaign?.content_requirements || [],
-      pendingChecks: rec.pending_checks || [],
-      campaignRequirements: campaign?.content_requirements || [],
-      campaignRequiredTopics: campaign?.required_topics || [],
-      campaignAiPolicy: campaign?.ai_policy,
-      campaignSubmitDeadline: campaign?.submit_deadline,
-      campaignSourceUrl: campaign?.source_url,
-      campaignQualification: campaign?.qualification_state,
-      campaignCurrentRuleVersion: campaign?.rule_version,
-      source: campaign ? `活动广场 · ${campaign.title}` : '活动广场',
-    });
+  const selectRecommendation = async (rec: IdeaRecommendation) => {
+    try {
+      const idea = await addRecommendation(rec);
+      if (idea) onOpenIdeas(idea.id);
+    } catch (cause) {
+      setRecommendError(cause instanceof Error ? cause.message : '加入选题库失败');
+    }
   };
 
   const formSpec = form?.submission_spec || emptySubmissionSpec();
@@ -1363,8 +1353,8 @@ export default function CampaignsPage({
                     {!!rec.pending_checks?.length && <div className="campaign-rec-detail pending"><b>待确认事项</b>{rec.pending_checks.map((x) => <span key={x}>! {x}</span>)}</div>}
                   </div>
                   <div className="idea-rec-actions">
-                    <button className="btn btn-sm" disabled={added.has(rec.title)} onClick={() => void addRecommendation(rec)}>{added.has(rec.title) ? '已加入' : '加入选题库'}</button>
-                    <button className="btn btn-sm btn-primary" onClick={() => startRecommendationContent(rec)}>做内容</button>
+                    <button className="btn btn-sm" disabled={added.has(rec.title)} onClick={() => void addRecommendation(rec)}>{added.has(rec.title) ? '已加入' : '暂存选题'}</button>
+                    <button className="btn btn-sm btn-primary" disabled={added.has(rec.title)} onClick={() => void selectRecommendation(rec)}>选定并深化</button>
                   </div>
                 </article>
               ))}

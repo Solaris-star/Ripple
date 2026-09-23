@@ -568,19 +568,41 @@ export function deleteCampaign(id: string): Promise<{ ok: boolean }> {
 }
 
 // ---- 选题库 ----
+export type IdeaStage = 'candidate' | 'saved' | 'developing' | 'review' | 'ready' | 'production' | 'done' | 'rejected' | 'archived';
+export interface IdeaPlatformPlan {
+  platform: string; angle: string; format: string; hook: string; adaptation: string;
+}
+export interface IdeaBriefData {
+  audience: string; objective: string; core_thesis: string; differentiation: string;
+  title_directions: string[]; hook: string;
+  outline: { title: string; purpose: string; evidence_needed: string[] }[];
+  platform_plans: { platform: string; title: string; hook: string; format: string; adaptation: string }[];
+  evidence_checks: string[]; production_tasks: string[]; open_questions: string[]; source_refs: string[];
+}
+export interface IdeaBrief {
+  idea_id: string; revision: number; data: IdeaBriefData; locked_fields: string[];
+  source: string; status: string; created_at: string;
+}
 export interface Idea {
-  id: string; title: string; note: string; source: string; status: string; created: number;
+  id: string; run_id?: string; title: string; note: string; source: string; status: string; stage?: IdeaStage;
+  persona?: string; created: number; updated?: number;
   angle?: string; reason?: string; campaign_id?: string; campaign_rule_version?: number;
   trend_refs?: string[]; target_platforms?: string[]; requirements?: string[]; pending_checks?: string[];
+  platform_plans?: IdeaPlatformPlan[]; source_refs?: string[]; score?: number;
+  brief_revision?: number; brief_status?: string; content_id?: string; plan_id?: string; brief?: IdeaBrief | null;
 }
 export type IdeaInput = {
-  title: string; note?: string; source?: string; status?: string;
+  title: string; note?: string; source?: string; status?: string; stage?: IdeaStage; persona?: string;
   angle?: string; reason?: string; campaign_id?: string; campaign_rule_version?: number;
   trend_refs?: string[]; target_platforms?: string[]; requirements?: string[]; pending_checks?: string[];
+  platform_plans?: IdeaPlatformPlan[]; source_refs?: string[]; score?: number;
 };
 export interface TopicUseContext {
   title: string;
   ideaId?: string;
+  contentId?: string;
+  brief?: IdeaBriefData;
+  autoStart?: boolean;
   angle?: string;
   reason?: string;
   campaignId?: string;
@@ -599,16 +621,21 @@ export interface TopicUseContext {
   campaignCurrentRuleVersion?: number;
   source?: string;
 }
-export function fetchIdeas(): Promise<Idea[]> { return request('/api/ideas'); }
-export function fetchIdea(id: string): Promise<{ idea: Idea; campaign: Campaign | null; campaign_rule_snapshot?: CampaignRuleSnapshot | null }> { return request(`/api/ideas/${encodeURIComponent(id)}`); }
+export function fetchIdeas(persona = '', includeRejected = false): Promise<Idea[]> {
+  const params = new URLSearchParams();
+  if (persona) params.set('persona', persona);
+  if (includeRejected) params.set('include_rejected', 'true');
+  return request('/api/ideas' + (params.size ? '?' + params.toString() : ''));
+}
+export function fetchIdea(id: string): Promise<{ idea: Idea; campaign: Campaign | null; campaign_rule_snapshot?: CampaignRuleSnapshot | null; brief?: IdeaBrief | null }> { return request('/api/ideas/' + encodeURIComponent(id)); }
 export function createIdea(item: IdeaInput): Promise<Idea> {
   return request('/api/ideas', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
 }
 export function updateIdea(id: string, item: IdeaInput): Promise<Idea> {
-  return request(`/api/ideas/${encodeURIComponent(id)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
+  return request('/api/ideas/' + encodeURIComponent(id), { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(item) });
 }
 export function deleteIdea(id: string): Promise<{ ok: boolean }> {
-  return request(`/api/ideas/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  return request('/api/ideas/' + encodeURIComponent(id), { method: 'DELETE' });
 }
 
 export interface IdeaRecommendation {
@@ -616,6 +643,7 @@ export interface IdeaRecommendation {
   platforms: string[]; trend_refs: string[];
   requirements?: string[]; pending_checks?: string[];
   campaign_id?: string; campaign_rule_version?: number;
+  platform_plans?: IdeaPlatformPlan[]; source_refs?: string[];
 }
 export interface IdeaRecommendResponse {
   persona: string; platforms: string[]; generated_at: number; existing_count: number;
@@ -629,6 +657,60 @@ export function recommendIdeas(input: {
   campaign_id?: string; limit?: number;
 }): Promise<IdeaRecommendResponse> {
   return request('/api/ideas/recommend', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+}
+
+export interface IdeaSourceSnapshot {
+  id: string; kind: 'trend' | 'campaign' | string; source_id: string; title: string; platform: string;
+  url: string; fetched_at: number; version: string; access_scope: string; data: Record<string, unknown>;
+}
+export interface IdeaRun {
+  id: string; kind: 'recommend' | 'develop'; persona: string; target_platforms: string[]; trend_sources: string[];
+  status: 'queued' | 'running' | 'waiting_user' | 'partial' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
+  stage: string; error: string; result: Record<string, unknown>; event_seq: number; cancelled: boolean;
+  request: Record<string, unknown>; created_at: string; updated_at: string;
+  sources?: IdeaSourceSnapshot[]; ideas?: Idea[];
+}
+export function createIdeaRun(input: {
+  persona: string; target_platforms: string[]; trend_sources: string[]; trend_titles?: string[];
+  include_trends: boolean; include_campaigns: boolean; campaign_ids?: string[];
+  instruction?: string; goal?: string; effort_minutes?: number; limit?: number; idempotency_key: string;
+}): Promise<IdeaRun> {
+  return request('/api/idea-runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+}
+export function fetchIdeaRuns(limit = 20): Promise<{ items: IdeaRun[] }> { return request('/api/idea-runs?limit=' + limit); }
+export function fetchIdeaRun(id: string): Promise<IdeaRun> { return request('/api/idea-runs/' + encodeURIComponent(id)); }
+export function cancelIdeaRun(id: string): Promise<IdeaRun> { return request('/api/idea-runs/' + encodeURIComponent(id) + '/cancel', { method: 'POST' }); }
+export function feedbackIdea(id: string, action: 'stash' | 'select' | 'reject' | 'reopen', reason = ''): Promise<Idea> {
+  return request('/api/ideas/' + encodeURIComponent(id) + '/feedback', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, reason }),
+  });
+}
+export function developIdea(id: string, input: { scope?: string; instruction?: string; idempotency_key: string }): Promise<IdeaRun> {
+  return request('/api/ideas/' + encodeURIComponent(id) + '/develop', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+}
+export function fetchIdeaBrief(id: string): Promise<{ idea: Idea; brief: IdeaBrief | null }> { return request('/api/ideas/' + encodeURIComponent(id) + '/brief'); }
+export function updateIdeaBrief(id: string, input: { expected_revision: number; data: IdeaBriefData; locked_fields: string[] }): Promise<IdeaBrief> {
+  return request('/api/ideas/' + encodeURIComponent(id) + '/brief', {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+}
+export function confirmIdeaBrief(id: string, expectedRevision: number): Promise<IdeaBrief> {
+  return request('/api/ideas/' + encodeURIComponent(id) + '/brief/confirm', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_revision: expectedRevision }),
+  });
+}
+export function startIdeaContent(id: string, expectedRevision: number, idempotencyKey: string): Promise<{ idea: Idea; content: { id: string; version_id: string; content: { title: string } }; created: boolean }> {
+  return request('/api/ideas/' + encodeURIComponent(id) + '/start-content', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expected_revision: expectedRevision, idempotency_key: idempotencyKey }),
+  });
+}
+export function planIdea(id: string, input: { scheduled_local: string; timezone: string; fold?: 0 | 1 | null; idempotency_key: string }): Promise<{ idea: Idea; plan: { id: string; version: number; scheduled_local: string; timezone: string } }> {
+  return request('/api/ideas/' + encodeURIComponent(id) + '/plan', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
   });
 }

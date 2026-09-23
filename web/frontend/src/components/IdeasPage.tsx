@@ -1,15 +1,24 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { fetchIdeas, createIdea, updateIdea, deleteIdea, createSchedule, recommendIdeas } from '../lib/api';
-import type { Idea, IdeaInput, IdeaRecommendation, IdeaRecommendResponse, PersonaItem, TopicUseContext } from '../lib/api';
-import { IconIdea, IconEdit, IconTrash, IconChat, IconCalendar, IconChevron, IconSkills } from './icons';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  cancelIdeaRun, confirmIdeaBrief, createIdea, createIdeaRun, deleteIdea, developIdea, feedbackIdea,
+  fetchIdeaBrief, fetchIdeaRun, fetchIdeaRuns, fetchIdeas, planIdea, startIdeaContent, updateIdea,
+  updateIdeaBrief,
+} from '../lib/api';
+import type {
+  Idea, IdeaBrief, IdeaBriefData, IdeaInput, IdeaRun, IdeaSourceSnapshot, PersonaItem, TopicUseContext,
+} from '../lib/api';
+import { IconCalendar, IconCheck, IconEdit, IconIdea, IconSkills, IconTrash } from './icons';
 import { loadTrendSelection, TREND_PLATFORMS } from '../lib/trendPrefs';
-import { executeStructuredOperation, fetchStructuredOperations } from '../lib/ripple';
-import type { OperationResult, TopicEvaluationOutput } from '../lib/ripple';
 import { PlatformIcon } from './PlatformBrand';
 import { platformDisplayName } from '../lib/platforms';
+import { executeStructuredOperation, fetchStructuredOperations } from '../lib/ripple';
+import type { OperationResult, TopicEvaluationOutput } from '../lib/ripple';
+import IdeaBriefEditor from './IdeaBriefEditor';
+import '../styles/ideas-workbench.css';
 
 interface IdeasPageProps {
   onUseTopic: (input: string | TopicUseContext) => void;
+  onOpenContent?: (id: string) => void;
   persona: string;
   aiReady: boolean;
   personas: PersonaItem[];
@@ -17,301 +26,535 @@ interface IdeasPageProps {
   onNewPersona: () => void;
 }
 
-const COLUMNS: { key: string; label: string; color: string }[] = [
-  { key: 'pending', label: '待做', color: 'var(--text-tertiary)' },
-  { key: 'doing', label: '进行中', color: 'var(--layer-attribute)' },
-  { key: 'done', label: '已完成', color: 'var(--layer-publish)' },
+const TARGET_PLATFORMS = ['xiaohongshu', 'douyin', 'bilibili', 'wechat', 'weixin-channels', 'zhihu', 'x'] as const;
+const ACTIVE_RUNS = new Set(['queued', 'running', 'partial', 'waiting_user']);
+const STAGE_LABELS: Record<string, string> = {
+  candidate: '候选', saved: '待深化', developing: '策划中', review: '待确认',
+  ready: '可制作', production: '制作中', done: '已完成', rejected: '不感兴趣', archived: '已归档',
+};
+const BOARD_COLUMNS = [
+  { key: 'saved', label: '待深化', stages: ['saved'] },
+  { key: 'review', label: '策划中', stages: ['developing', 'review'] },
+  { key: 'ready', label: '可制作', stages: ['ready'] },
+  { key: 'production', label: '制作中', stages: ['production'] },
+  { key: 'done', label: '已完成', stages: ['done'] },
 ];
-const NEXT: Record<string, string> = { pending: 'doing', doing: 'done', done: 'pending' };
-const EMPTY: IdeaInput = { title: '', note: '', source: '', status: 'pending' };
 
-export default function IdeasPage({ onUseTopic, persona, aiReady, personas, onPersonaChange, onNewPersona }: IdeasPageProps) {
+const blankIdea = (persona = ''): IdeaInput => ({ title: '', note: '', source: '手动灵感', status: 'pending', stage: 'saved', persona });
+const keyFor = (prefix: string) => {
+  const token = typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID().replaceAll('-', '') : String(Date.now()) + Math.random().toString(16).slice(2);
+  return (prefix + '-' + token).slice(0, 120);
+};
+
+function recommendationLevel(score = 0): string {
+  if (score >= 82) return '高匹配';
+  if (score >= 68) return '较匹配';
+  return '可探索';
+}
+
+function stageOf(idea: Idea): string {
+  return idea.stage || (idea.status === 'doing' ? 'production' : idea.status === 'done' ? 'done' : 'saved');
+}
+
+function sourceLabel(source: IdeaSourceSnapshot): string {
+  if (source.kind === 'campaign') return '活动';
+  if (source.kind === 'trend') return '热点';
+  return '来源';
+}
+
+export default function IdeasPage({
+  onUseTopic, onOpenContent, persona, aiReady, personas, onPersonaChange, onNewPersona,
+}: IdeasPageProps) {
   const [ideas, setIdeas] = useState<Idea[]>([]);
-  const [form, setForm] = useState<IdeaInput | null>(null);
-  const [editId, setEditId] = useState<string | null>(null);
+  const [runs, setRuns] = useState<IdeaRun[]>([]);
+  const [tab, setTab] = useState<'candidates' | 'mine'>('candidates');
+  const [mineView, setMineView] = useState<'list' | 'board'>('list');
+  const [mineFilter, setMineFilter] = useState('all');
+  const [query, setQuery] = useState('');
+  const [targetPlatforms, setTargetPlatforms] = useState<string[]>([]);
+  const [includeTrends, setIncludeTrends] = useState(true);
+  const [includeCampaigns, setIncludeCampaigns] = useState(true);
+  const [goal, setGoal] = useState('');
+  const [effort, setEffort] = useState(120);
+  const [instruction, setInstruction] = useState('');
+  const [fixedTrendTitles, setFixedTrendTitles] = useState<string[]>([]);
+  const [fixedTrendPlatform, setFixedTrendPlatform] = useState('');
+  const [activeRun, setActiveRun] = useState<IdeaRun | null>(null);
+  const [error, setError] = useState('');
   const [toast, setToast] = useState('');
-  const [recommendOpen, setRecommendOpen] = useState(false);
-  const [recommending, setRecommending] = useState(false);
-  const [recommendError, setRecommendError] = useState('');
-  const [recommendResult, setRecommendResult] = useState<IdeaRecommendResponse | null>(null);
-  const [addedRecommendations, setAddedRecommendations] = useState<Set<string>>(new Set());
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [evidenceIdea, setEvidenceIdea] = useState<Idea | null>(null);
+  const [evidenceSources, setEvidenceSources] = useState<IdeaSourceSnapshot[]>([]);
+  const [evidenceLoading, setEvidenceLoading] = useState(false);
+  const [form, setForm] = useState<IdeaInput | null>(null);
+  const [editId, setEditId] = useState('');
+  const [briefIdea, setBriefIdea] = useState<Idea | null>(null);
+  const [brief, setBrief] = useState<IdeaBrief | null>(null);
+  const [briefBusy, setBriefBusy] = useState(false);
+  const [pendingBriefIdeaId, setPendingBriefIdeaId] = useState('');
+  const [scheduleIdea, setScheduleIdea] = useState<Idea | null>(null);
+  const [scheduleDate, setScheduleDate] = useState('');
+  const [scheduleTime, setScheduleTime] = useState('');
   const [evaluation, setEvaluation] = useState<OperationResult<TopicEvaluationOutput> | null>(null);
   const [evaluationIdea, setEvaluationIdea] = useState<Idea | null>(null);
   const [evaluating, setEvaluating] = useState(false);
-  const [evaluationError, setEvaluationError] = useState('');
   const [evaluationReady, setEvaluationReady] = useState(false);
+  const focusHandled = useRef(false);
+  const openBriefRef = useRef<(id: string) => Promise<void>>(async () => {});
 
-  const load = useCallback(() => { fetchIdeas().then(setIdeas).catch(() => {}); }, []);
-  useEffect(() => { load(); }, [load]);
-  useEffect(() => { void fetchStructuredOperations().then(({ items }) => setEvaluationReady(!!items.find((x) => x.id === 'topic_evaluate')?.ready)).catch(() => setEvaluationReady(false)); }, []);
+  const trendSelection = loadTrendSelection();
+  const trendLabels = TREND_PLATFORMS.filter((value) => trendSelection.includes(value.key)).map((value) => value.label);
 
-  const showToast = (m: string) => { setToast(m); setTimeout(() => setToast(''), 2200); };
-  const byStatus = useMemo(() => {
-    const g: Record<string, Idea[]> = { pending: [], doing: [], done: [] };
-    for (const it of ideas) (g[it.status] || g.pending).push(it);
-    return g;
+  const showToast = (message: string) => {
+    setToast(message);
+    window.setTimeout(() => setToast(''), 2400);
+  };
+
+  const load = useCallback(async () => {
+    const [ideaResult, runResult] = await Promise.allSettled([fetchIdeas(persona, true), fetchIdeaRuns(20)]);
+    if (ideaResult.status === 'fulfilled') setIdeas(ideaResult.value);
+    if (runResult.status === 'fulfilled') {
+      setRuns(runResult.value.items);
+      setActiveRun((current) => {
+        if (current && ACTIVE_RUNS.has(current.status)) return current;
+        return runResult.value.items.find((value) => ACTIVE_RUNS.has(value.status)) || null;
+      });
+    }
+    const failed = [ideaResult, runResult].find((value) => value.status === 'rejected');
+    if (failed?.status === 'rejected') setError(failed.reason instanceof Error ? failed.reason.message : '选题数据读取失败');
+  }, [persona]);
+
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    try {
+      const rawSeed = sessionStorage.getItem('ripple_idea_seed') || '';
+      if (!rawSeed) return;
+      sessionStorage.removeItem('ripple_idea_seed');
+      const seed = JSON.parse(rawSeed) as { trend_title?: unknown; trend_platform?: unknown };
+      const title = typeof seed.trend_title === 'string' ? seed.trend_title.trim() : '';
+      const platform = typeof seed.trend_platform === 'string' ? seed.trend_platform.trim() : '';
+      if (!title) return;
+      setFixedTrendTitles([title.slice(0, 500)]);
+      setFixedTrendPlatform(platform.slice(0, 40));
+      setIncludeTrends(true);
+      setInstruction((current) => current || `优先围绕指定热点「${title.slice(0, 200)}」寻找与账号赛道自然相关的选题；不相关时说明，不强行蹭热点。`);
+    } catch { /* invalid cross-page seed is ignored */ }
+  }, []);
+  useEffect(() => {
+    void fetchStructuredOperations()
+      .then(({ items }) => setEvaluationReady(!!items.find((value) => value.id === 'topic_evaluate')?.ready))
+      .catch(() => setEvaluationReady(false));
+  }, []);
+
+  useEffect(() => {
+    if (!activeRun || !ACTIVE_RUNS.has(activeRun.status)) return;
+    let stopped = false;
+    const read = async () => {
+      try {
+        const next = await fetchIdeaRun(activeRun.id);
+        if (stopped) return;
+        setActiveRun(next);
+        setRuns((current) => [next, ...current.filter((value) => value.id !== next.id)].slice(0, 20));
+        if (!ACTIVE_RUNS.has(next.status)) {
+          await load();
+          if (next.status === 'succeeded') {
+            if (next.kind === 'recommend') {
+              setTab('candidates');
+              showToast('候选选题已完成来源与约束校验');
+            } else {
+              const ideaId = String(next.result?.idea_id || pendingBriefIdeaId || '');
+              if (ideaId) await openBrief(ideaId);
+            }
+          } else if (next.error) {
+            setError(next.error);
+          }
+        }
+      } catch (cause) {
+        if (!stopped) setError(cause instanceof Error ? cause.message : '选题任务状态读取失败');
+      }
+    };
+    void read();
+    const timer = window.setInterval(() => void read(), 1400);
+    return () => { stopped = true; window.clearInterval(timer); };
+    // openBrief is intentionally resolved from the latest component closure through state refresh.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRun?.id, activeRun?.status, load, pendingBriefIdeaId]);
+
+  const candidates = useMemo(() => ideas.filter((idea) => stageOf(idea) === 'candidate' && (!persona || !idea.persona || idea.persona === persona)), [ideas, persona]);
+  const mine = useMemo(() => ideas.filter((idea) => {
+    const stage = stageOf(idea);
+    return stage !== 'candidate' && stage !== 'rejected' && stage !== 'archived' && (!persona || !idea.persona || idea.persona === persona);
+  }), [ideas, persona]);
+  const rejected = useMemo(() => ideas.filter((idea) => stageOf(idea) === 'rejected'), [ideas]);
+
+  const filteredMine = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return mine.filter((idea) => {
+      const stage = stageOf(idea);
+      const stageMatch = mineFilter === 'all' || (
+        mineFilter === 'planning' ? ['saved', 'developing', 'review'].includes(stage)
+          : mineFilter === 'ready' ? stage === 'ready'
+            : mineFilter === 'production' ? stage === 'production'
+              : mineFilter === 'done' ? stage === 'done' : true
+      );
+      const textMatch = !needle || [idea.title, idea.note, idea.angle, idea.reason].some((value) => String(value || '').toLowerCase().includes(needle));
+      return stageMatch && textMatch;
+    });
+  }, [mine, mineFilter, query]);
+
+  const startRun = async () => {
+    if (!persona) { setError('先选择一个账号画像，再开始推荐。'); return; }
+    if (!aiReady) { setError('Agent 推荐服务未配置或不可用。'); return; }
+    setError('');
+    try {
+      const run = await createIdeaRun({
+        persona,
+        target_platforms: targetPlatforms,
+        trend_sources: includeTrends ? Array.from(new Set([...trendSelection, fixedTrendPlatform].filter(Boolean))) : [],
+        trend_titles: includeTrends ? fixedTrendTitles : [],
+        include_trends: includeTrends,
+        include_campaigns: includeCampaigns,
+        instruction: instruction.trim(),
+        goal: goal.trim(),
+        effort_minutes: effort,
+        limit: 6,
+        idempotency_key: keyFor('ideas'),
+      });
+      setActiveRun(run);
+      setRuns((current) => [run, ...current.filter((value) => value.id !== run.id)].slice(0, 20));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'Agent 选题任务创建失败');
+    }
+  };
+
+  const cancelRun = async () => {
+    if (!activeRun) return;
+    try { setActiveRun(await cancelIdeaRun(activeRun.id)); } catch (cause) { setError(cause instanceof Error ? cause.message : '取消失败'); }
+  };
+
+  const feedback = async (idea: Idea, action: 'stash' | 'reject' | 'reopen') => {
+    try {
+      await feedbackIdea(idea.id, action);
+      await load();
+      showToast(action === 'stash' ? '已暂存到我的选题' : action === 'reject' ? '已移出当前候选' : '已恢复候选');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '操作失败'); }
+  };
+
+  const develop = async (idea: Idea, developInstruction = '') => {
+    if (!aiReady) { setError('Agent 模型尚未配置。'); return; }
+    setError('');
+    setPendingBriefIdeaId(idea.id);
+    setBriefBusy(true);
+    try {
+      const run = await developIdea(idea.id, {
+        scope: developInstruction ? 'partial' : 'full',
+        instruction: developInstruction,
+        idempotency_key: keyFor('develop-' + idea.id),
+      });
+      setActiveRun(run);
+      setRuns((current) => [run, ...current.filter((value) => value.id !== run.id)].slice(0, 20));
+      if (!brief) setBriefIdea(idea);
+    } catch (cause) {
+      setBriefBusy(false);
+      setError(cause instanceof Error ? cause.message : '策划深化失败');
+    }
+  };
+
+  async function openBrief(id: string) {
+    setBriefBusy(true);
+    try {
+      const result = await fetchIdeaBrief(id);
+      setBriefIdea(result.idea);
+      setBrief(result.brief);
+      if (!result.brief) {
+        setBriefBusy(false);
+        await develop(result.idea);
+        return;
+      }
+      setBriefBusy(false);
+    } catch (cause) {
+      setBriefBusy(false);
+      setError(cause instanceof Error ? cause.message : '策划单读取失败');
+    }
+  }
+  openBriefRef.current = openBrief;
+
+  useEffect(() => {
+    if (focusHandled.current || ideas.length === 0) return;
+    let focus = '';
+    try {
+      focus = sessionStorage.getItem('ripple_idea_focus') || '';
+      if (focus) sessionStorage.removeItem('ripple_idea_focus');
+    } catch { /* ignore */ }
+    if (!focus) { focusHandled.current = true; return; }
+    const idea = ideas.find((value) => value.id === focus);
+    focusHandled.current = true;
+    if (!idea) return;
+    setTab('mine');
+    void openBriefRef.current(idea.id);
   }, [ideas]);
 
-  const openNew = () => { setEditId(null); setForm({ ...EMPTY }); };
-  const openEdit = (it: Idea) => { setEditId(it.id); setForm({
-    title: it.title, note: it.note, source: it.source, status: it.status,
-    angle: it.angle, reason: it.reason, campaign_id: it.campaign_id,
-    campaign_rule_version: it.campaign_rule_version, trend_refs: it.trend_refs,
-    target_platforms: it.target_platforms, requirements: it.requirements, pending_checks: it.pending_checks,
-  }); };
-  const save = async () => {
-    if (!form || !form.title.trim()) return;
-    if (editId) await updateIdea(editId, form); else await createIdea(form);
-    setForm(null); setEditId(null); load();
+
+  const saveBrief = async (data: IdeaBriefData, locked: string[]) => {
+    if (!briefIdea || !brief) return;
+    setBriefBusy(true);
+    try {
+      const saved = await updateIdeaBrief(briefIdea.id, { expected_revision: brief.revision, data, locked_fields: locked });
+      setBrief(saved);
+      await load();
+      showToast('策划单已保存为新版本');
+    } finally { setBriefBusy(false); }
   };
-  const advance = async (it: Idea) => { await updateIdea(it.id, { ...it, status: NEXT[it.status] }); load(); };
-  const remove = async (it: Idea) => { await deleteIdea(it.id); load(); };
-  const schedule = async (it: Idea) => {
-    const d = new Date();
-    await createSchedule({
-      title: it.title, date: d.toISOString().slice(0, 10), platform: it.target_platforms?.[0] || '',
-      time: '', status: 'idea', note: it.note, kind: 'content', source: it.campaign_id ? 'campaign' : 'manual',
-      campaign_id: it.campaign_id || '', campaign_rule_version: it.campaign_rule_version || 0,
+
+  const confirmBrief = async () => {
+    if (!briefIdea || !brief) return;
+    setBriefBusy(true);
+    try {
+      const confirmed = await confirmIdeaBrief(briefIdea.id, brief.revision);
+      setBrief(confirmed);
+      await load();
+      showToast('策划已确认，可以进入内容制作');
+    } finally { setBriefBusy(false); }
+  };
+
+  const startContent = async () => {
+    if (!briefIdea || !brief || brief.status !== 'confirmed') return;
+    setBriefBusy(true);
+    try {
+      const result = await startIdeaContent(briefIdea.id, brief.revision, 'idea-' + briefIdea.id + '-brief-' + brief.revision + '-content');
+      const context: TopicUseContext = {
+        title: result.idea.title,
+        ideaId: result.idea.id,
+        contentId: result.content.id,
+        brief: brief.data,
+        autoStart: false,
+        angle: result.idea.angle,
+        reason: result.idea.reason,
+        campaignId: result.idea.campaign_id,
+        campaignRuleVersion: result.idea.campaign_rule_version,
+        trendRefs: result.idea.trend_refs,
+        targetPlatforms: result.idea.target_platforms,
+        requirements: result.idea.requirements,
+        pendingChecks: result.idea.pending_checks,
+        source: result.idea.source,
+      };
+      setBriefIdea(null);
+      setBrief(null);
+      onUseTopic(context);
+    } finally { setBriefBusy(false); }
+  };
+
+  const saveForm = async () => {
+    if (!form?.title.trim()) return;
+    try {
+      if (editId) await updateIdea(editId, { ...form, persona: form.persona || persona });
+      else await createIdea({ ...form, stage: 'saved', persona });
+      setForm(null); setEditId('');
+      await load();
+      setTab('mine');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '保存失败'); }
+  };
+
+  const remove = async (idea: Idea) => {
+    try { await deleteIdea(idea.id); await load(); } catch (cause) { setError(cause instanceof Error ? cause.message : '删除失败'); }
+  };
+
+  const openEdit = (idea: Idea) => {
+    setEditId(idea.id);
+    setForm({
+      title: idea.title, note: idea.note, source: idea.source, status: idea.status,
+      stage: stageOf(idea) as IdeaInput['stage'], persona: idea.persona, angle: idea.angle, reason: idea.reason,
+      campaign_id: idea.campaign_id, campaign_rule_version: idea.campaign_rule_version,
+      trend_refs: idea.trend_refs, target_platforms: idea.target_platforms, requirements: idea.requirements,
+      pending_checks: idea.pending_checks, platform_plans: idea.platform_plans, source_refs: idea.source_refs, score: idea.score,
     });
-    showToast('已加入日历（今天）');
   };
 
-  const startIdeaContent = (it: Idea) => onUseTopic({
-    title: it.title, ideaId: it.id, angle: it.angle, reason: it.reason,
-    campaignId: it.campaign_id, campaignRuleVersion: it.campaign_rule_version,
-    trendRefs: it.trend_refs, targetPlatforms: it.target_platforms,
-    requirements: it.requirements, pendingChecks: it.pending_checks, source: it.source,
-  });
+  const showEvidence = async (idea: Idea) => {
+    setEvidenceIdea(idea);
+    setEvidenceSources([]);
+    if (!idea.run_id) return;
+    setEvidenceLoading(true);
+    try {
+      const run = await fetchIdeaRun(idea.run_id);
+      const refs = new Set(idea.source_refs || []);
+      setEvidenceSources((run.sources || []).filter((source) => refs.has(source.id)));
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : '来源依据读取失败');
+    } finally { setEvidenceLoading(false); }
+  };
 
-  const evaluateIdea = async (it: Idea) => {
-    setEvaluationIdea(it); setEvaluation(null); setEvaluationError(''); setEvaluating(true);
+  const saveSchedule = async () => {
+    if (!scheduleIdea || !scheduleDate || !scheduleTime) return;
+    try {
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai';
+      await planIdea(scheduleIdea.id, {
+        scheduled_local: scheduleDate + 'T' + scheduleTime,
+        timezone,
+        idempotency_key: keyFor('idea-plan-' + scheduleIdea.id),
+      });
+      setScheduleIdea(null); setScheduleDate(''); setScheduleTime('');
+      await load();
+      showToast('已加入创作计划');
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '排期失败'); }
+  };
+
+  const evaluate = async (idea: Idea) => {
+    if (!evaluationReady || evaluating) return;
+    setEvaluationIdea(idea); setEvaluation(null); setEvaluating(true);
     try {
       setEvaluation(await executeStructuredOperation<TopicEvaluationOutput>('topic_evaluate', {
-        title: it.title, note: it.note || '', platform: '', persona: persona || '',
-      }, { kind: 'idea', ref: it.id, version: String(it.created || ''), snapshot: { title: it.title, note: it.note, source: it.source, status: it.status } }));
-    } catch (e) { setEvaluationError(e instanceof Error ? e.message : '选题评估失败'); }
+        title: idea.title, note: idea.note || idea.angle || '',
+        platform: idea.target_platforms?.[0] || '', persona: persona || idea.persona || '',
+      }, { kind: 'idea', ref: idea.id, version: String(idea.updated || idea.created || ''), snapshot: { title: idea.title, source: idea.source, stage: stageOf(idea) } }));
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '选题评估失败'); }
     finally { setEvaluating(false); }
   };
 
-  const trendSelection = loadTrendSelection();
-  const trendLabels = TREND_PLATFORMS.filter((p) => trendSelection.includes(p.key)).map((p) => p.label);
-  const recommendDisabledReason = !persona
-    ? '先选择一个账号画像'
-    : !aiReady
-      ? 'AI 推荐服务未配置或不可用'
-      : trendSelection.length === 0
-        ? '至少选择一个热点来源'
-        : '';
-
-  const runRecommend = async () => {
-    if (recommendDisabledReason) return;
-    setRecommendOpen(true);
-    setRecommending(true);
-    setRecommendError('');
-    setRecommendResult(null);
-    setAddedRecommendations(new Set());
-    try {
-      setRecommendResult(await recommendIdeas({ persona, platforms: trendSelection, limit: 6 }));
-    } catch (e) {
-      setRecommendError(e instanceof Error ? e.message : 'AI 推荐失败');
-    } finally {
-      setRecommending(false);
-    }
-  };
-
-  const addRecommendation = async (rec: IdeaRecommendation) => {
-    if (addedRecommendations.has(rec.title) || ideas.some((it) => it.title.trim() === rec.title.trim())) return;
-    const refs = rec.trend_refs.length ? `\n\n关联热点：${rec.trend_refs.join('、')}` : '';
-    await createIdea({
-      title: rec.title,
-      note: `${rec.angle}\n\n推荐理由：${rec.reason}${refs}`,
-      source: `AI推荐 · ${persona}`,
-      status: 'pending',
-    });
-    setAddedRecommendations((prev) => new Set(prev).add(rec.title));
-    load();
-  };
-
-  const addAllRecommendations = async () => {
-    if (!recommendResult) return;
-    let count = 0;
-    for (const rec of recommendResult.recommendations) {
-      if (addedRecommendations.has(rec.title) || ideas.some((it) => it.title.trim() === rec.title.trim())) continue;
-      try { await addRecommendation(rec); count += 1; } catch { /* keep the remaining recommendations usable */ }
-    }
-    showToast(count ? `已加入 ${count} 个 AI 推荐选题` : '没有新的推荐需要加入');
-  };
-
-  return (
-    <div className="page-scroll ideas-page">
-      <div className="page-head">
-        <div>
-          <h1 className="page-title"><IconIdea size={21} /> 选题库</h1>
-          <p className="page-subtitle">从实时热点、账号画像和手动灵感中筛选选题，推进到「做内容」再进日历。</p>
-        </div>
-        <button className="btn btn-sm btn-primary" onClick={openNew}>+ 新建选题</button>
-      </div>
-
-      <div className="card idea-ai-panel">
-        <div className="idea-ai-copy">
-          <span className="idea-ai-icon"><IconSkills size={18} /></span>
-          <div>
-            <strong>AI 推荐选题</strong>
-            <div className="idea-ai-persona">
-              <label>推荐画像
-                <select aria-label="AI 推荐账号画像" value={persona} onChange={(e) => onPersonaChange(e.target.value)}>
-                  <option value="">选择账号画像</option>
-                  {personas.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
-                </select>
-              </label>
-              <button className="btn btn-sm" onClick={onNewPersona}>+ 创建画像</button>
-            </div>
-            <p>{recommendDisabledReason || `结合画像「${persona}」、${trendSelection.length} 个热点来源和 ${ideas.length} 个已有选题，推荐更匹配账号的内容角度。`}</p>
-            {trendSelection.length > 0 && <small>热点范围：{trendLabels.join('、')}</small>}
-          </div>
-        </div>
-        <button className="btn btn-sm btn-primary" disabled={!!recommendDisabledReason || recommending} title={recommendDisabledReason || '生成推荐'} onClick={() => void runRecommend()}>
-          <IconSkills size={14} /> {recommending ? '分析中…' : 'AI 推荐选题'}
-        </button>
-      </div>
-
-      <div className="kanban">
-        {COLUMNS.map((col) => (
-          <div key={col.key} className="kanban-col">
-            <div className="kanban-col-head">
-              <span className="kanban-dot" style={{ background: col.color }} />
-              {col.label}<span className="kanban-count">{byStatus[col.key].length}</span>
-            </div>
-            <div className="kanban-list">
-              {byStatus[col.key].length === 0 && <div className="kanban-empty">拖点选题进来吧</div>}
-              {byStatus[col.key].map((it) => (
-                <div key={it.id} className="card idea-card">
-                  <div className="idea-card-actions">
-                    <button className="session-act" title="编辑" onClick={() => openEdit(it)}><IconEdit size={13} /></button>
-                    <button className="session-act" title={evaluationReady ? '七维选题评估' : '需要先配置 Agent 模型'} disabled={!evaluationReady} onClick={() => void evaluateIdea(it)}><IconSkills size={13} /></button>
-                    <button className="session-act danger" title="删除" onClick={() => remove(it)}><IconTrash size={13} /></button>
-                  </div>
-                  <div className="idea-title">{it.title}</div>
-                  {it.source && <span className="badge" style={{ marginTop: 6 }}>{it.source}</span>}
-                  {it.note && <div className="idea-note">{it.note}</div>}
-                  {(it.campaign_id || !!it.trend_refs?.length) && <div className="idea-context-tags">
-                    {it.campaign_id && <span>活动选题 · v{it.campaign_rule_version || 1}</span>}
-                    {it.trend_refs?.slice(0, 2).map((ref) => <span key={ref}>热点 · {ref}</span>)}
-                  </div>}
-                  <div className="idea-foot">
-                    <button className="idea-act" onClick={() => startIdeaContent(it)}><IconChat size={13} /> 做内容</button>
-                    <button className="idea-act" onClick={() => schedule(it)}><IconCalendar size={13} /> 排期</button>
-                    <button className="idea-act next" onClick={() => advance(it)} title="推进状态">
-                      {COLUMNS.find((c) => c.key === NEXT[it.status])?.label} <IconChevron size={12} />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {evaluationIdea && (
-        <div className="overlay" onClick={() => !evaluating && setEvaluationIdea(null)}>
-          <div className="modal r2-topic-eval-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="idea-rec-head"><div><h3>选题评估</h3><p>{evaluationIdea.title}</p></div><button className="icon-btn" disabled={evaluating} onClick={() => setEvaluationIdea(null)}>×</button></div>
-            {evaluating && <div className="idea-rec-loading"><div className="spinner" />正在按统一七维口径评估…</div>}
-            {evaluationError && <div className="notice-error" style={{ marginTop: 12 }}>{evaluationError}</div>}
-            {evaluation && <div className="r2-topic-eval-body">
-              <div className="r2-topic-eval-summary"><div><strong>{evaluation.output.score}</strong><span>/ 100</span></div><div><b>{evaluation.output.decision}</b><p>{evaluation.output.summary}</p></div></div>
-              <div className="r2-topic-dimensions">{evaluation.output.dimensions.map((d) => <div key={d.name}><header><strong>{d.name}</strong><span>{d.score}/10</span></header><div className="r2-topic-score-track"><i style={{ width: `${d.score * 10}%` }} /></div><p>{d.reason}</p></div>)}</div>
-              {evaluation.output.assumptions.length > 0 && <section><h4>信息边界</h4><ul>{evaluation.output.assumptions.map((x) => <li key={x}>{x}</li>)}</ul></section>}
-              {evaluation.output.optimizations.length > 0 && <section><h4>优化建议</h4><ul>{evaluation.output.optimizations.map((x) => <li key={x}>{x}</li>)}</ul></section>}
-              {evaluation.output.alternatives.length > 0 && <section><h4>替代选题</h4><ul>{evaluation.output.alternatives.map((x) => <li key={x}>{x}</li>)}</ul></section>}
-              <footer><span>评估结果不会自动改变选题状态。</span><button className="btn btn-primary btn-sm" onClick={() => startIdeaContent(evaluationIdea)}>做内容</button></footer>
-            </div>}
-          </div>
-        </div>
-      )}
-
-      {recommendOpen && (
-        <div className="overlay" onClick={() => !recommending && setRecommendOpen(false)}>
-          <div className="modal idea-rec-modal" onClick={(e) => e.stopPropagation()}>
-            <div className="idea-rec-head">
-              <div>
-                <h3>AI 推荐选题</h3>
-                <p>实时热点 × 账号画像 × 已有选题去重</p>
-              </div>
-              <button className="icon-btn" disabled={recommending} onClick={() => setRecommendOpen(false)}>×</button>
-            </div>
-            {recommending && <div className="idea-rec-loading"><div className="spinner" />正在读取热点并结合画像分析…</div>}
-            {recommendError && <div className="notice-error" style={{ margin: '12px 0 0' }}>{recommendError}</div>}
-            {recommendResult && <>
-              <div className="idea-rec-context">
-                画像：{recommendResult.persona} · 热点来源 {recommendResult.trend_summary.filter((x) => x.count > 0).length}/{recommendResult.trend_summary.length} · 已避开 {recommendResult.existing_count} 个已有选题
-              </div>
-              <div className="idea-rec-list">
-                {recommendResult.recommendations.map((rec) => {
-                  const added = addedRecommendations.has(rec.title) || ideas.some((it) => it.title.trim() === rec.title.trim());
-                  return <div className="idea-rec-card" key={rec.title}>
-                    <div className="idea-rec-score">{rec.score}</div>
-                    <div className="idea-rec-main">
-                      <h4>{rec.title}</h4>
-                      <p className="idea-rec-angle">{rec.angle}</p>
-                      <p className="idea-rec-reason">{rec.reason}</p>
-                      <div className="idea-rec-tags">
-                        {rec.platforms.map((p) => <span className="idea-platform-tag" key={p}><PlatformIcon platform={p} size={12} />{platformDisplayName(p)}</span>)}
-                        {rec.trend_refs.map((p) => <span className="trend-ref" key={p}>热点 · {p}</span>)}
-                      </div>
-                    </div>
-                    <div className="idea-rec-actions">
-                      <button className="btn btn-sm" disabled={added} onClick={() => void addRecommendation(rec)}>{added ? '已加入' : '加入选题库'}</button>
-                      <button className="btn btn-sm" onClick={() => onUseTopic({
-                        title: rec.title, angle: rec.angle, reason: rec.reason, trendRefs: rec.trend_refs,
-                        targetPlatforms: rec.platforms, requirements: rec.requirements, pendingChecks: rec.pending_checks,
-                        campaignId: rec.campaign_id, campaignRuleVersion: rec.campaign_rule_version, source: `AI推荐 · ${persona}`,
-                      })}>做内容</button>
-                    </div>
-                  </div>;
-                })}
-              </div>
-              <div className="idea-rec-foot">
-                <span>AI 推荐用于选题判断；热点事实在创作前仍需核验。</span>
-                <button className="btn btn-sm btn-primary" onClick={() => void addAllRecommendations()}>全部加入选题库</button>
-              </div>
-            </>}
-          </div>
-        </div>
-      )}
-
-      {form && (
-        <div className="overlay" onClick={() => setForm(null)}>
-          <div className="modal" style={{ width: 440, maxWidth: '100%' }} onClick={(e) => e.stopPropagation()}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-              <h3 style={{ margin: 0 }}>{editId ? '编辑选题' : '新建选题'}</h3>
-              <button className="icon-btn" onClick={() => setForm(null)}>×</button>
-            </div>
-            <label className="field-label">选题 *</label>
-            <input className="field" value={form.title} autoFocus placeholder="想做的内容 / 角度"
-              onChange={(e) => setForm({ ...form, title: e.target.value })} />
-            <label className="field-label">备注 / 角度</label>
-            <textarea className="field" style={{ minHeight: 70 }} value={form.note}
-              onChange={(e) => setForm({ ...form, note: e.target.value })} />
-            <label className="field-label">来源</label>
-            <input className="field" value={form.source} placeholder="如：微博热搜 / 灵感"
-              onChange={(e) => setForm({ ...form, source: e.target.value })} />
-            <label className="field-label">状态</label>
-            <div style={{ display: 'flex', gap: 7 }}>
-              {COLUMNS.map((c) => (
-                <button key={c.key} className={`chip ${form.status === c.key ? 'active' : ''}`}
-                  onClick={() => setForm({ ...form, status: c.key })}>{c.label}</button>
-              ))}
-            </div>
-            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 18 }}>
-              <button className="btn btn-sm" onClick={() => setForm(null)}>取消</button>
-              <button className="btn btn-sm btn-primary" onClick={save} disabled={!form.title.trim()}>保存</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {toast && <div className="toast ok"><span className="toast-icon">✓</span>{toast}</div>}
+  const candidateCard = (idea: Idea) => <article className="idea-candidate-card card" key={idea.id}>
+    <div className="idea-candidate-top">
+      <div><span className="idea-match">{recommendationLevel(idea.score)}</span><h3>{idea.title}</h3></div>
+      <button className="idea-evidence-button" onClick={() => void showEvidence(idea)}>查看依据</button>
     </div>
-  );
+    <p className="idea-candidate-angle">{idea.angle || idea.note || '等待补充内容角度'}</p>
+    {idea.reason && <p className="idea-candidate-reason">{idea.reason}</p>}
+    <div className="idea-platform-list">{(idea.target_platforms || []).map((platform) => <span key={platform}><PlatformIcon platform={platform} size={13} />{platformDisplayName(platform)}</span>)}</div>
+    <div className="idea-source-summary">
+      {idea.campaign_id && <span>活动约束</span>}
+      {(idea.trend_refs || []).slice(0, 2).map((ref) => <span key={ref}>热点 · {ref}</span>)}
+      {!idea.campaign_id && !(idea.trend_refs || []).length && <span>赛道常青方向</span>}
+    </div>
+    {(idea.pending_checks?.length || idea.requirements?.length) ? <div className="idea-cost-line">
+      {idea.requirements?.length ? <span>已知约束 {idea.requirements.length}</span> : null}
+      {idea.pending_checks?.length ? <span className="warn">待核实 {idea.pending_checks.length}</span> : null}
+    </div> : null}
+    <div className="idea-candidate-actions">
+      <button className="btn btn-sm btn-primary" disabled={!!activeRun && ACTIVE_RUNS.has(activeRun.status)} onClick={() => void develop(idea)}><IconSkills size={13} /> 选定并深化</button>
+      <button className="btn btn-sm" onClick={() => void feedback(idea, 'stash')}>暂存</button>
+      <button className="r2-text-button" onClick={() => void feedback(idea, 'reject')}>不感兴趣</button>
+    </div>
+  </article>;
+
+  const mineCard = (idea: Idea) => {
+    const stage = stageOf(idea);
+    return <article className="idea-owned-card card" key={idea.id}>
+      <header><div><span className={'idea-stage stage-' + stage}>{STAGE_LABELS[stage] || stage}</span><h3>{idea.title}</h3></div>
+        <div className="idea-owned-menu">
+          <button title="编辑" onClick={() => openEdit(idea)}><IconEdit size={13} /></button>
+          <button title="删除" onClick={() => void remove(idea)}><IconTrash size={13} /></button>
+        </div>
+      </header>
+      {idea.angle && <p>{idea.angle}</p>}
+      <div className="idea-platform-list">{(idea.target_platforms || []).map((platform) => <span key={platform}><PlatformIcon platform={platform} size={12} />{platformDisplayName(platform)}</span>)}</div>
+      <footer>
+        {stage === 'saved' && <button className="btn btn-sm btn-primary" onClick={() => void develop(idea)} disabled={!aiReady}>深化策划</button>}
+        {stage === 'developing' && <span className="idea-progress-label">Agent 正在深化…</span>}
+        {['review', 'ready'].includes(stage) && <button className="btn btn-sm btn-primary" onClick={() => void openBrief(idea.id)}>{stage === 'ready' ? '查看已确认策划' : '继续策划'}</button>}
+        {stage === 'production' && idea.content_id && <button className="btn btn-sm btn-primary" onClick={() => onOpenContent ? onOpenContent(idea.content_id!) : onUseTopic({ title: idea.title, ideaId: idea.id, contentId: idea.content_id })}>打开内容</button>}
+        <button className="btn btn-sm" onClick={() => { setScheduleIdea(idea); setScheduleDate(''); setScheduleTime(''); }}><IconCalendar size={13} /> {idea.plan_id ? '调整排期' : '排期'}</button>
+        {evaluationReady && <button className="btn btn-sm" disabled={evaluating} onClick={() => void evaluate(idea)}>七维评估</button>}
+      </footer>
+    </article>;
+  };
+
+  return <div className="page-scroll ideas-page ideas-workbench">
+    <div className="page-head ideas-workbench-head">
+      <div><h1 className="page-title"><IconIdea size={21} /> 选题库</h1><p className="page-subtitle">让 Agent 结合账号定位、每日热点和活动机会，先给候选，再把你选中的方向深化成可制作策划。</p></div>
+      <div className="idea-head-actions"><button className="btn btn-sm" onClick={() => setHistoryOpen(true)}>历史批次</button><button className="btn btn-sm" onClick={() => { setEditId(''); setForm(blankIdea(persona)); }}>+ 记灵感</button></div>
+    </div>
+
+    <section className="idea-command card">
+      <div className="idea-command-primary">
+        <label>账号画像<select value={persona} aria-label="选题账号画像" onChange={(e) => onPersonaChange(e.target.value)}>
+          <option value="">选择账号画像</option>{personas.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}
+        </select></label>
+        <button className="r2-text-button" onClick={onNewPersona}>编辑 / 创建画像</button>
+        <div className="idea-target-platforms"><span>目标平台</span>
+          <button className={targetPlatforms.length === 0 ? 'chip active' : 'chip'} onClick={() => setTargetPlatforms([])}>智能分配</button>
+          {TARGET_PLATFORMS.map((platform) => <button key={platform} className={targetPlatforms.includes(platform) ? 'chip active' : 'chip'} onClick={() => setTargetPlatforms((current) => current.includes(platform) ? current.filter((x) => x !== platform) : [...current, platform])}><PlatformIcon platform={platform} size={12} />{platformDisplayName(platform)}</button>)}
+        </div>
+      </div>
+      <div className="idea-command-secondary">
+        <label>本次目标<input value={goal} maxLength={200} onChange={(e) => setGoal(e.target.value)} placeholder="例如：实用教程 / 活动投稿 / 新功能解读" /></label>
+        <label>制作投入<select value={effort} onChange={(e) => setEffort(Number(e.target.value))}><option value={0}>不限制</option><option value={60}>约 1 小时</option><option value={120}>约 2 小时</option><option value={240}>半天内</option><option value={480}>一天内</option></select></label>
+        <label className="idea-source-toggle"><input type="checkbox" checked={includeTrends} onChange={(e) => setIncludeTrends(e.target.checked)} />自动匹配热点</label>
+        <label className="idea-source-toggle"><input type="checkbox" checked={includeCampaigns} onChange={(e) => setIncludeCampaigns(e.target.checked)} />自动匹配活动</label>
+      </div>
+      {includeTrends && <small className="idea-trend-scope">热点来源：{trendLabels.length ? trendLabels.join('、') : '使用可用热点源'}</small>}
+      {fixedTrendTitles.length > 0 && <div className="idea-seed-note"><span>已带入热点：{fixedTrendTitles.join('、')}{fixedTrendPlatform ? ` · 来源 ${platformDisplayName(fixedTrendPlatform)}` : ''}</span><button className="r2-text-button" type="button" onClick={() => { setFixedTrendTitles([]); setFixedTrendPlatform(''); }}>移除固定热点</button></div>}
+      <div className="idea-command-bottom"><textarea value={instruction} maxLength={2000} onChange={(e) => setInstruction(e.target.value)} placeholder="补充要求，例如：只做有实测支撑的内容；不参与和科技工具无关的粉丝活动。" />
+        <button className="btn btn-primary idea-run-button" disabled={!persona || !aiReady || (!!activeRun && ACTIVE_RUNS.has(activeRun.status))} onClick={() => void startRun()}><IconSkills size={14} /> 帮我找选题</button>
+      </div>
+      {!persona && <p className="idea-command-hint">先选择账号画像，Agent 才能按赛道、受众和平台偏好筛选。</p>}
+      {persona && !aiReady && <p className="idea-command-hint warn">Agent 推荐服务未配置。仍可以记录和管理已有选题。</p>}
+    </section>
+
+    {activeRun && ACTIVE_RUNS.has(activeRun.status) && <section className="idea-run-bar" role="status">
+      <div><span className="spinner" /><strong>{activeRun.kind === 'recommend' ? '正在生成候选' : '正在深化策划'}</strong><span>{activeRun.stage || '任务已提交'}</span></div>
+      <button className="btn btn-sm" onClick={() => void cancelRun()}>取消后续生成</button>
+    </section>}
+    {activeRun?.status === 'interrupted' && <div className="campaign-snapshot-notice stale">上次任务在服务重启期间中断，没有自动重复调用模型。你可以重新发起。</div>}
+    {error && <div className="notice-error">{error}</div>}
+
+    <div className="idea-tabs">
+      <button className={tab === 'candidates' ? 'active' : ''} onClick={() => setTab('candidates')}>推荐候选 <b>{candidates.length}</b></button>
+      <button className={tab === 'mine' ? 'active' : ''} onClick={() => setTab('mine')}>我的选题 <b>{mine.length}</b></button>
+    </div>
+
+    {tab === 'candidates' ? <section className="idea-candidate-section">
+      {candidates.length === 0 ? <div className="idea-workbench-empty"><IconIdea size={26} /><strong>还没有候选</strong><p>选择画像与目标平台后点击“帮我找选题”。已有热点和活动会作为线索，找不到自然关联时也可以给赛道常青题。</p></div>
+        : <div className="idea-candidate-grid">{candidates.map(candidateCard)}</div>}
+      {rejected.length > 0 && <details className="idea-rejected"><summary>不感兴趣 / 已隐藏 {rejected.length}</summary><div>{rejected.slice(0, 20).map((idea) => <span key={idea.id}>{idea.title}<button className="r2-text-button" onClick={() => void feedback(idea, 'reopen')}>恢复</button></span>)}</div></details>}
+    </section> : <section className="idea-mine-section">
+      <div className="idea-mine-toolbar">
+        <input type="search" value={query} onChange={(e) => setQuery(e.target.value)} placeholder="搜索我的选题" />
+        <div>{[['all', '全部'], ['planning', '待策划'], ['ready', '可制作'], ['production', '制作中'], ['done', '已完成']].map(([value, label]) => <button key={value} className={mineFilter === value ? 'chip active' : 'chip'} onClick={() => setMineFilter(value)}>{label}</button>)}</div>
+        <div className="idea-view-toggle"><button className={mineView === 'list' ? 'active' : ''} onClick={() => setMineView('list')}>列表</button><button className={mineView === 'board' ? 'active' : ''} onClick={() => setMineView('board')}>看板</button></div>
+      </div>
+      {mineView === 'list' ? <div className="idea-owned-grid">{filteredMine.map(mineCard)}{filteredMine.length === 0 && <div className="idea-workbench-empty"><strong>当前筛选没有选题</strong><p>可以从推荐候选中暂存或选定，也可以手动记录灵感。</p></div>}</div>
+        : <div className="idea-board">{BOARD_COLUMNS.map((column) => <div className="idea-board-col" key={column.key}><header>{column.label}<b>{mine.filter((idea) => column.stages.includes(stageOf(idea))).length}</b></header><div>{mine.filter((idea) => column.stages.includes(stageOf(idea))).map(mineCard)}</div></div>)}</div>}
+    </section>}
+
+    {evidenceIdea && <div className="overlay" onClick={() => setEvidenceIdea(null)}><div className="modal idea-evidence-modal" onClick={(e) => e.stopPropagation()}>
+      <header><div><h3>来源依据</h3><p>{evidenceIdea.title}</p></div><button className="icon-btn" onClick={() => setEvidenceIdea(null)}>×</button></header>
+      {evidenceLoading && <div className="idea-rec-loading"><span className="spinner" />正在读取本次任务的来源快照…</div>}
+      {!evidenceLoading && evidenceSources.length === 0 && <p className="r2-muted">这是一条常青题或旧记录，本次没有绑定可追溯来源。</p>}
+      <div className="idea-evidence-list">{evidenceSources.map((source) => <article key={source.id}><div><span>{sourceLabel(source)}</span><PlatformIcon platform={source.platform} size={13} /><strong>{source.title}</strong></div><small>{source.fetched_at ? new Date(source.fetched_at * 1000).toLocaleString('zh-CN') : '时间未记录'}{source.version ? ' · 版本 ' + source.version : ''}</small>{source.url && <a href={source.url} target="_blank" rel="noreferrer">打开来源</a>}<code>{source.id}</code></article>)}</div>
+    </div></div>}
+
+    {historyOpen && <div className="overlay" onClick={() => setHistoryOpen(false)}><div className="modal idea-history-modal" onClick={(e) => e.stopPropagation()}>
+      <header><h3>Agent 选题批次</h3><button className="icon-btn" onClick={() => setHistoryOpen(false)}>×</button></header>
+      <div className="idea-run-history">{runs.length === 0 && <p className="r2-muted">还没有 Agent 选题批次。</p>}{runs.map((run) => <div key={run.id}><div><strong>{run.kind === 'recommend' ? '候选推荐' : '策划深化'}</strong><span className={'run-status status-' + run.status}>{run.status}</span></div><p>{run.stage || run.error || '任务已提交'}</p><small>{new Date(run.created_at).toLocaleString('zh-CN')} · {run.target_platforms.length ? run.target_platforms.map(platformDisplayName).join(' / ') : '智能平台'}</small>{run.error && <em>{run.error}</em>}</div>)}</div>
+    </div></div>}
+
+    {form && <div className="overlay" onClick={() => setForm(null)}><div className="modal idea-manual-modal" onClick={(e) => e.stopPropagation()}>
+      <header><h3>{editId ? '编辑选题' : '记录灵感'}</h3><button className="icon-btn" onClick={() => setForm(null)}>×</button></header>
+      <label className="field-label">选题 *</label><input className="field" value={form.title} autoFocus maxLength={240} onChange={(e) => setForm({ ...form, title: e.target.value })} />
+      <label className="field-label">备注 / 想法</label><textarea className="field" value={form.note || ''} onChange={(e) => setForm({ ...form, note: e.target.value })} />
+      <label className="field-label">来源</label><input className="field" value={form.source || ''} onChange={(e) => setForm({ ...form, source: e.target.value })} />
+      <footer><button className="btn btn-sm" onClick={() => setForm(null)}>取消</button><button className="btn btn-sm btn-primary" disabled={!form.title.trim()} onClick={() => void saveForm()}>保存到我的选题</button></footer>
+    </div></div>}
+
+    {briefIdea && brief && <IdeaBriefEditor idea={briefIdea} brief={brief} busy={briefBusy}
+      onSave={saveBrief} onConfirm={confirmBrief} onDevelop={async (text) => { await develop(briefIdea, text); }}
+      onStart={startContent} onClose={() => { if (!briefBusy) { setBriefIdea(null); setBrief(null); } }} />}
+
+    {briefIdea && !brief && briefBusy && <div className="idea-floating-status"><span className="spinner" />正在为「{briefIdea.title}」形成内容策划单，可继续浏览其他页面。</div>}
+
+    {scheduleIdea && <div className="overlay" onClick={() => setScheduleIdea(null)}><div className="modal idea-plan-modal" onClick={(e) => e.stopPropagation()}>
+      <header><div><h3>{scheduleIdea.plan_id ? '调整创作排期' : '加入创作计划'}</h3><p>{scheduleIdea.title}</p></div><button className="icon-btn" onClick={() => setScheduleIdea(null)}>×</button></header>
+      <label>日期<input type="date" value={scheduleDate} onChange={(e) => setScheduleDate(e.target.value)} /></label>
+      <label>时间<input type="time" value={scheduleTime} onChange={(e) => setScheduleTime(e.target.value)} /></label>
+      <small>使用当前浏览器时区：{Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Shanghai'}。排期只创建创作计划，不自动发布。</small>
+      <footer><button className="btn btn-sm" onClick={() => setScheduleIdea(null)}>取消</button><button className="btn btn-sm btn-primary" disabled={!scheduleDate || !scheduleTime} onClick={() => void saveSchedule()}><IconCalendar size={13} /> 保存排期</button></footer>
+    </div></div>}
+
+    {evaluationIdea && <div className="overlay" onClick={() => !evaluating && setEvaluationIdea(null)}><div className="modal r2-topic-eval-modal" onClick={(e) => e.stopPropagation()}>
+      <div className="idea-rec-head"><div><h3>七维选题评估</h3><p>{evaluationIdea.title}</p></div><button className="icon-btn" disabled={evaluating} onClick={() => setEvaluationIdea(null)}>×</button></div>
+      {evaluating && <div className="idea-rec-loading"><span className="spinner" />正在评估…</div>}
+      {evaluation && <div className="r2-topic-eval-body"><div className="r2-topic-eval-summary"><div><strong>{evaluation.output.score}</strong><span>/100</span></div><div><b>{evaluation.output.decision}</b><p>{evaluation.output.summary}</p></div></div><div className="r2-topic-dimensions">{evaluation.output.dimensions.map((dimension) => <div key={dimension.name}><header><strong>{dimension.name}</strong><span>{dimension.score}/10</span></header><div className="r2-topic-score-track"><i style={{ width: String(dimension.score * 10) + '%' }} /></div><p>{dimension.reason}</p></div>)}</div>{evaluation.output.assumptions.length > 0 && <section><h4>信息边界</h4><ul>{evaluation.output.assumptions.map((value) => <li key={value}>{value}</li>)}</ul></section>}</div>}
+    </div></div>}
+
+    {toast && <div className="toast ok"><span className="toast-icon"><IconCheck size={14} /></span>{toast}</div>}
+  </div>;
 }
