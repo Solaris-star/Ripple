@@ -55,15 +55,16 @@ export default function ContentAssistant({
   useEffect(() => {
     if (!session?.id) { setConfig(null); return; }
     let ignore = false;
-    Promise.allSettled([fetchAgentCapabilities(), fetchAgentSessionConfig(session.id), fetchAgentRuntimes(), fetchAgentProfiles()]).then(([cap, cfg, runtimeState, profileState]) => {
+    const requests = [
+      fetchAgentCapabilities().then((value) => { if (!ignore) setCatalog(value); }),
+      fetchAgentSessionConfig(session.id).then((value) => { if (!ignore) setConfig(value); }),
+      fetchAgentRuntimes().then((value) => { if (!ignore) setRuntimes(value); }),
+      fetchAgentProfiles().then((value) => { if (!ignore) setProfiles(value); }),
+    ];
+    Promise.allSettled(requests).then((results) => {
       if (ignore) return;
-      if (cap.status === 'fulfilled') setCatalog(cap.value);
-      if (cfg.status === 'fulfilled') setConfig(cfg.value);
-      if (runtimeState.status === 'fulfilled') setRuntimes(runtimeState.value);
-      if (profileState.status === 'fulfilled') setProfiles(profileState.value);
-      const failed = [cap, cfg, runtimeState, profileState].find((row) => row.status === 'rejected');
+      const failed = results.find((row) => row.status === 'rejected');
       setConfigError(failed?.status === 'rejected' ? errorText(failed.reason) : '');
-      setTurnSkills([]);
     });
     return () => { ignore = true; };
   }, [session?.id]);

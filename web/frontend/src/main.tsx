@@ -1,4 +1,3 @@
-import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.tsx'
@@ -11,10 +10,9 @@ console.log(`%cRipple build: ${BUILD_ID}`, 'color:#8b5cf6;font-weight:bold');
 
 initializeTheme();
 
+// 5173 is a user-facing local runtime; dev StrictMode double-mount would duplicate read effects and polling.
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  </StrictMode>,
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>,
 )

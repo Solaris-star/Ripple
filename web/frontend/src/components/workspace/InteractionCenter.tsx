@@ -120,14 +120,14 @@ export default function InteractionCenter({ persona, onNavigate }: { persona: st
   const initialPlatformApplied = useRef(false);
 
   const loadCore = useCallback(async () => {
-    const [caps, accountRows, sourceRows, interactionRows] = await Promise.all([
-      fetchInteractionCapabilities(), api<Account[]>('/api/ripple/accounts'),
-      fetchInteractionSources('', 24), fetchInteractions({ limit: 200 }),
+    const results = await Promise.allSettled([
+      fetchInteractionCapabilities().then((caps) => setCapabilities(caps.items)),
+      api<Account[]>('/api/ripple/accounts').then(setAccounts),
+      fetchInteractionSources('', 24).then((rows) => setSources(rows.items.filter((row) => row.kind === 'remote'))),
+      fetchInteractions({ limit: 200 }).then((rows) => setHistory(rows.items)),
     ]);
-    setCapabilities(caps.items);
-    setAccounts(accountRows);
-    setSources(sourceRows.items.filter((row) => row.kind === 'remote'));
-    setHistory(interactionRows.items);
+    const failure = results.find((row) => row.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
   }, []);
 
   useEffect(() => { void loadCore().catch((e) => setError(e instanceof Error ? e.message : '互动中心加载失败')); }, [loadCore]);

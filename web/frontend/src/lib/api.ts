@@ -8,20 +8,33 @@ function getBasePath(): string {
 
 const BASE = getBasePath();
 
+const inflightRequests = new Map<string, Promise<unknown>>();
+
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${url}`, securedFetchOptions(options));
-  if (!res.ok) {
-    // 优先显示后端返回的实质错误信息（FastAPI 的 {detail}），而不是无意义的 "API error: 400"
-    let detail = '';
-    try {
-      const j = await res.json();
-      detail = (j && (j.detail || j.message)) || '';
-    } catch {
-      /* 响应体不是 JSON，忽略 */
+  const method = String(options?.method || 'GET').toUpperCase();
+  const execute = async (): Promise<T> => {
+    const res = await fetch(`${BASE}${url}`, securedFetchOptions(options));
+    if (!res.ok) {
+      // 优先显示后端返回的实质错误信息（FastAPI 的 {detail}），而不是无意义的 "API error: 400"
+      let detail = '';
+      try {
+        const j = await res.json();
+        detail = (j && (j.detail || j.message)) || '';
+      } catch {
+        /* 响应体不是 JSON，忽略 */
+      }
+      throw new Error(detail || `请求失败（${res.status} ${res.statusText}）`);
     }
-    throw new Error(detail || `请求失败（${res.status} ${res.statusText}）`);
-  }
-  return res.json() as Promise<T>;
+    return res.json() as Promise<T>;
+  };
+  // Requests with an AbortSignal stay caller-owned; one cancelled view must not
+  // cancel another view that happens to read the same URL.
+  if (method !== 'GET' || options?.signal) return execute();
+  const existing = inflightRequests.get(url) as Promise<T> | undefined;
+  if (existing) return existing;
+  const pending = execute().finally(() => { if (inflightRequests.get(url) === pending) inflightRequests.delete(url); });
+  inflightRequests.set(url, pending);
+  return pending;
 }
 
 export interface StatusResponse {

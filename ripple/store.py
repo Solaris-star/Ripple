@@ -28,6 +28,12 @@ class JsonStore:
         self.path = self.directory / "state.json"
         with _LOCKS_GUARD:
             self._lock = _LOCKS.setdefault(str(self.path), threading.RLock())
+        # Read-only callers never mutate state; cache the parsed snapshot until the
+        # atomically replaced file changes. This avoids reparsing multi-MB workspace
+        # histories for every independent GET while the OS/file lock still protects
+        # cross-process consistency.
+        self._read_signature: tuple[int, int, int] | None = None
+        self._read_state: dict | None = None
 
     @contextmanager
     def transaction(self, *, write: bool = True):
@@ -54,16 +60,29 @@ class JsonStore:
                     time.sleep(0.025)
             try:
                 state = {"schema": 1, "tasks": {}}
+                previous: str | None = None
                 if self.path.exists():
                     try:
-                        if self.path.stat().st_size > MAX_STORE_BYTES:
+                        stat = self.path.stat()
+                        if stat.st_size > MAX_STORE_BYTES:
                             raise ValueError("too large")
-                        state = json.loads(self.path.read_text(encoding="utf-8"))
-                        if state.get("schema") != 1 or not isinstance(state.get("tasks"), dict):
-                            raise ValueError("invalid schema")
+                        signature = (int(stat.st_mtime_ns), int(stat.st_size), int(getattr(stat, "st_ino", 0)))
+                        if not write and self._read_signature == signature and self._read_state is not None:
+                            state = self._read_state
+                        else:
+                            raw = self.path.read_text(encoding="utf-8")
+                            state = json.loads(raw)
+                            if state.get("schema") != 1 or not isinstance(state.get("tasks"), dict):
+                                raise ValueError("invalid schema")
+                            if write:
+                                # Preserve the previous no-op semantics even if an external
+                                # writer used different whitespace or a trailing newline.
+                                previous = json.dumps(state, ensure_ascii=False, indent=2)
+                            else:
+                                self._read_signature = signature
+                                self._read_state = state
                     except (OSError, ValueError, TypeError, AttributeError):
                         raise StoreError("任务数据无法读取；已停止写入，请保留 state.json 排查。") from None
-                previous = json.dumps(state, ensure_ascii=False, indent=2) if write and self.path.exists() else None
                 yield state
                 if write:
                     text = json.dumps(state, ensure_ascii=False, indent=2)
@@ -78,6 +97,10 @@ class JsonStore:
                             stream.flush()
                             os.fsync(stream.fileno())
                         os.replace(name, self.path)
+                        # A write creates a new atomic snapshot. Let the next reader
+                        # repopulate the cache from that exact on-disk version.
+                        self._read_signature = None
+                        self._read_state = None
                     finally:
                         if os.path.exists(name):
                             os.unlink(name)

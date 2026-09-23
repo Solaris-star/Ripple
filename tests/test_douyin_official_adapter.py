@@ -14,6 +14,7 @@ from ripple import douyin_browser as browser, douyin_campaigns as parser, native
 from ripple.accounts import AccountInput
 from ripple.ai_providers import AIProviderService
 from ripple.campaign_sources import CampaignSourceService
+from ripple.campaign_enrichment import campaign_missing_fields
 from ripple.workspace import WorkspaceService
 from web import app as upstream
 
@@ -59,9 +60,80 @@ def test_actual_shape_ids_dates_and_response_scope():
     assert row["display_starts_at"] == "2026-09-01T00:00:00+08:00"
     assert row["display_ends_at"] == "2026-09-30T23:59:59+08:00"
     assert "starts_at" not in row and "submit_deadline" not in row
-    assert row["url"] == "" and row["detail_status"] == "app_only"
+    assert row["url"] == "" and row["detail_status"] == "not_fetched"
     assert row["challenge_ids"] == []
     assert result["scope"] == "creator_calendar_window"
+
+
+def test_creator_detail_maps_official_description_submission_reward_and_topics():
+    detail = parser.parse_activity_detail({
+        "status_code": 0,
+        "activity_description": "5月18日-11月14日，带活动话题 #定格光阴的模样 分享一个属于你的瞬间，期待看到大家的光阴模样～",
+        "activity_info": {"activity_id": "7641110832331871241", "activity_name": "秦昊Jeff邀你定格光阴的模样", "activity_type": 1, "reward_type": 0, "jump_link": "", "show_start_time": "2026.05.18", "show_end_time": "2026.11.14", "challenge_ids": [1699873637374990]},
+        "reward_rules": '{"text":"优质内容可以获得官方流量激励，还有可能被秦昊Jeff翻牌哦～","anchorText":"","anchorUri":""}',
+        "topics": ["秦昊jeff汽水星愿卡", "光阴的模样"], "topics_ids": ["1", "2"],
+    }, expected_id="7641110832331871241")
+    assert detail["starts_at"] == "2026-05-18"
+    assert detail["submit_deadline"] == "2026-11-14"
+    assert detail["required_topics"] == ["秦昊jeff汽水星愿卡", "光阴的模样", "定格光阴的模样"]
+    assert detail["content_requirements"] == [detail["description"]]
+    assert detail["reward_summary"].startswith("优质内容可以获得官方流量激励")
+    assert detail["reward_rules"] == detail["prizes"] == [detail["reward_summary"]]
+    assert detail["winning_conditions"] == ["优质内容"]
+    assert detail["activity_type"] == "创作投稿" and detail["reward_type"] == "流量激励"
+    assert detail["display_starts_at"] == "2026-05-18" and detail["display_ends_at"] == "2026-11-14"
+    assert detail["challenge_ids"] == ["1699873637374990"]
+    assert detail["detail_status"] == "parsed"
+    assert detail["detail_source"] == "creator_activity_detail_api"
+
+
+def test_creator_detail_extracts_precise_conference_submission_and_winning_thresholds():
+    detail = parser.parse_activity_detail({
+        "status_code": 0,
+        "activity_description": "2026年8月5日00:00至9月1日23:59（北京时间）期间内，发布时长≥20s的全网首次发布的原创视频，带#抖音创作者大会 主话题+投稿赛道话题+@抖音创作者大会 官方账号，晒出你的作品，即有机会获得线下参与抖音创作者大会资格。",
+        "activity_info": {"activity_id": "7669844259058504714", "activity_name": "2026抖音创作者大会", "activity_type": 1, "reward_type": 5, "activity_status": 2, "show_start_time": "2026.08.05", "show_end_time": "2026.09.01", "challenge_ids": [1642026158078987]},
+        "reward_rules": '{"text":"四大投稿话题下的优质投稿作品，点赞量排名靠前且账号粉丝量在征稿期内达到1万以上的创作者，将获得创作小镇见证团资格、线下大会门票、专属周边礼包和平台专属流量扶持。"}',
+        "topics": ["抖音创作者大会"], "topics_ids": ["1642026158078987"],
+    }, expected_id="7669844259058504714")
+    assert (detail["starts_at"], detail["submit_deadline"]) == ("2026-08-05", "2026-09-01")
+    assert detail["activity_type"] == "创作投稿"
+    assert detail["reward_type"] == "流量 + 礼品/权益"
+    assert "时长≥20s" in detail["content_requirements"][0]
+    assert detail["winning_conditions"] == ["四大投稿话题下的优质投稿作品，点赞量排名靠前且账号粉丝量在征稿期内达到1万以上的创作者"]
+    assert detail["required_topics"] == ["抖音创作者大会"]
+    campaign = {"platform": "douyin", "activity_type": detail["activity_type"], "reward_summary": detail["reward_summary"],
+                "eligibility": [], "content_requirements": detail["content_requirements"],
+                "winning_conditions": detail["winning_conditions"],
+                "submission_spec": {"video": {"min_seconds": 20}, "original_required": True},
+                "douyin_listing": {"detail_status": "parsed"}}
+    assert "eligibility" not in campaign_missing_fields(campaign)
+
+
+def test_creator_detail_classifies_non_submission_fan_benefit_without_fake_work_requirements():
+    detail = parser.parse_activity_detail({
+        "status_code": 0,
+        "activity_description": "我们为你喜欢的创作者量身打造了独家虚拟收藏卡牌，开通一个月星守护即可额外获得五次星愿卡抽卡机会。",
+        "activity_info": {"activity_id": "7644150488469296166", "activity_name": "星守护星愿卡", "activity_type": 1, "reward_type": 0, "show_start_time": "2026.05.26", "show_end_time": "2026.10.30"},
+        "reward_rules": '{"text":"解锁创作者的惊喜卡面，还有签名照、拍立得、演唱会门票等礼物随机掉落！"}',
+        "topics": [], "topics_ids": ["0"],
+    }, expected_id="7644150488469296166")
+    assert detail["activity_type"] == "粉丝福利"
+    assert detail["reward_type"] == "礼品/权益"
+    assert detail["content_requirements"] == [] and detail["winning_conditions"] == []
+    assert detail["eligibility"] == ["我们为你喜欢的创作者量身打造了独家虚拟收藏卡牌，开通一个月星守护即可额外获得五次星愿卡抽卡机会"]
+    assert detail["starts_at"] == detail["submit_deadline"] == ""
+    assert detail["prizes"] == [detail["reward_summary"]]
+    campaign = {"platform": "douyin", "activity_type": detail["activity_type"], "reward_summary": detail["reward_summary"],
+                "eligibility": detail["eligibility"], "content_requirements": detail["content_requirements"],
+                "winning_conditions": detail["winning_conditions"], "submission_spec": {},
+                "douyin_listing": {"detail_status": "parsed"}}
+    assert campaign_missing_fields(campaign) == []
+
+
+def test_creator_detail_rejects_wrong_or_missing_activity_id():
+    payload = {"status_code": 0, "activity_info": {"activity_id": "111", "activity_name": "活动"}}
+    with pytest.raises(parser.DouyinCampaignError, match="ID"):
+        parser.parse_activity_detail(payload, expected_id="222")
 
 
 def test_valid_empty_cap_and_malformed_rows_are_distinct():
@@ -243,6 +315,10 @@ def test_events_skip_taxonomy_and_never_click_task_buttons(tmp_path, monkeypatch
                 for handler in handlers: handler(response)
         def wait_for_timeout(self, value): pass
         def locator(self, value): return SimpleNamespace(inner_text=lambda **kwargs: "创作者中心")
+        def evaluate(self, script, identity):
+            return {"status_code": 0, "activity_description": f"2026年9月1日至2026年9月30日，带活动话题 #测试{identity} 投稿原创视频",
+                    "activity_info": {"activity_id": identity, "activity_name": "创作活动", "activity_type": 1, "reward_type": 0, "jump_link": "", "show_start_time": "2026.09.01", "show_end_time": "2026.09.30"},
+                    "reward_rules": '{"text":"优质内容可以获得官方流量激励"}', "topics": ["测试话题"], "topics_ids": ["1"]}
     monkeypatch.setattr(browser, "_launch", lambda *a, **k: (None, None, Page()))
     monkeypatch.setattr(browser, "_close", lambda *a: None)
     result = browser.events(tmp_path)
@@ -250,6 +326,9 @@ def test_events_skip_taxonomy_and_never_click_task_buttons(tmp_path, monkeypatch
     assert result["window"] == {"start_time": 1788192000, "end_time": 1790783999}
     assert "not-exported" not in json.dumps(result)
     assert not any(r["title"] == "摄影摄像" for r in result["items"])
+    assert all(r["detail_status"] == "parsed" for r in result["items"])
+    assert all(r["submit_deadline"] == "2026-09-30" for r in result["items"])
+    assert all(r["reward_summary"] == "优质内容可以获得官方流量激励" for r in result["items"])
 
 
 def test_taxonomy_repair_is_exact_backed_up_and_preserves_other_platforms(tmp_path):

@@ -1658,13 +1658,16 @@ class CampaignSourceService:
                 continue
             seen.add(external_id)
             url = douyin_detail_url(item.get("url"))
-            fields = ("eligibility", "content_requirements", "prizes", "winning_conditions", "reward_rules")
+            fields = ("eligibility", "content_requirements", "prizes", "winning_conditions", "reward_rules", "required_topics")
             detail_fields = {key: [str(v)[:240] for v in item.get(key, []) if isinstance(v, str)][:20]
                              for key in fields}
             detail_status = str(item.get("detail_status") or "not_fetched")
             if detail_status not in {"parsed", "no_structured_rules", "needs_visual_review", "failed", "app_only", "not_fetched"}:
                 detail_status = "not_fetched"
             spec = infer_submission_spec("\n".join(detail_fields["content_requirements"]))
+            reward_summary = str(item.get("reward_summary") or "")[:600]
+            reward_type = str(item.get("reward_type") or "")[:120]
+            activity_type = str(item.get("activity_type") or "平台活动")[:80]
             listing = {"display_starts_at": str(item.get("display_starts_at") or "")[:40],
                        "display_ends_at": str(item.get("display_ends_at") or "")[:40],
                        "detail_status": detail_status, "scope_note": scope_note,
@@ -1674,17 +1677,21 @@ class CampaignSourceService:
                 "provider_id": "douyin_creator_portal", "platform": "douyin",
                 "external_id": "douyin:" + external_id,
                 "title": title[:240], "organizer": "抖音创作者中心", "organizer_type": "platform",
-                "activity_type": "创作活动", "reward_type": "", "reward_summary": "",
+                "activity_type": activity_type, "reward_type": reward_type, "reward_summary": reward_summary,
                 "summary": str(item.get("description") or "")[:1200],
-                "starts_at": "", "signup_deadline": str(item.get("signup_deadline") or "")[:40],
+                "starts_at": str(item.get("starts_at") or "")[:40], "signup_deadline": str(item.get("signup_deadline") or "")[:40],
                 "submit_deadline": str(item.get("submit_deadline") or "")[:40],
                 "source_url": url, "source_type": "creator_activity_api_v2", "source_status": "verified",
                 "note": str(item.get("description") or "")[:3000], "account_id": str(account["id"]),
                 "qualification_state": "unknown", "qualification_basis": "列表对该账号可见；参与资格仍需核对具体活动规则。",
                 "submission_spec": spec, **detail_fields, "douyin_listing": listing,
-                "field_evidence": {key: {"source": "official_detail", "originals": values} for key, values in detail_fields.items() if values},
-                "evidence": {"kind": "platform_public_detail" if detail_status == "parsed" else "platform_public_list",
-                             "account_id": str(account["id"]), "url": url, "endpoint": "/web/api/v2/creator/activity/pc/list",
+                "field_evidence": {
+                    **{key: {"source": "official_creator_detail_api", "originals": values} for key, values in detail_fields.items() if values},
+                    **({"reward_summary": {"source": "official_creator_detail_api", "originals": [reward_summary]}} if reward_summary else {}),
+                },
+                "evidence": {"kind": "creator_account_detail" if detail_status == "parsed" else "platform_public_list",
+                             "account_id": str(account["id"]), "url": url,
+                             "endpoint": "/web/api/v2/creator/activity/detail/" if detail_status == "parsed" else "/web/api/v2/creator/activity/pc/list",
                              "activity_id": external_id, "scope_note": scope_note},
             })
         latest = self._state()

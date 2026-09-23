@@ -136,6 +136,7 @@ function sourceLabel(campaign: Campaign): string {
 
 function sourceVerificationLabel(campaign: Campaign): string {
   const label = sourceLabel(campaign);
+  if (campaign.platform === 'douyin' && campaign.douyin_listing?.detail_status === 'parsed' && campaign.source_status === 'verified') return '官方详情已核验';
   return (campaign.platform === 'xiaohongshu' || campaign.douyin_listing) && campaign.source_status === 'verified' ? '列表已同步' : label;
 }
 
@@ -190,7 +191,9 @@ function campaignTime(campaign: Campaign): string {
   if (campaign.douyin_listing && !campaign.starts_at && !campaign.submit_deadline) {
     const data = campaign.douyin_listing;
     const start = dateOnly(data.display_starts_at); const end = dateOnly(data.display_ends_at);
-    return `${start || '未说明'} → ${end || '未说明'} · 展示期，投稿截止未核实`;
+    return campaign.activity_type === '创作投稿'
+      ? `${start || '未说明'} → ${end || '未说明'} · 活动期，投稿截止未单独说明`
+      : `${start || '未说明'} → ${end || '未说明'} · 活动期`;
   }
   if (isLongTermProgram(campaign) && !dateOnly(campaign.starts_at) && !dateOnly(campaign.submit_deadline)) return '长期计划 · 未公布截止日期';
   const start = dateOnly(campaign.starts_at) || '开始时间未说明';
@@ -1042,7 +1045,7 @@ export default function CampaignsPage({
             {visible.map((campaign) => {
               const qualification = qualificationBadge(campaign);
               const sourceText = sourceName(campaign) + ' · ' + sourceVerificationLabel(campaign);
-              const specText = submissionSummary(campaign);
+              const specText = submissionSummary(campaign) || (campaign.douyin_listing && campaign.content_requirements?.length ? concise(campaign.content_requirements, '') : '');
               const missing = campaign.missing_fields || [];
               const incomplete = missing.length > 0;
               const xhsRuleStatus = campaign.platform === 'xiaohongshu' ? xhsDetailStatusText(campaign) : '';
@@ -1050,6 +1053,7 @@ export default function CampaignsPage({
                 ? concise(campaign.prizes, campaign.reward_summary || '')
                 : campaign.reward_rules?.length ? concise(campaign.reward_rules, '') : '';
               const longTerm = isLongTermProgram(campaign);
+              const douyinNonSubmission = Boolean(campaign.douyin_listing && campaign.activity_type !== '创作投稿');
               const conditionText = longTerm ? concise(campaign.reward_rules, '') : concise(campaign.winning_conditions, '');
               const canAgentEnrich = campaign.platform === 'bilibili' && incomplete;
               return (
@@ -1072,10 +1076,10 @@ export default function CampaignsPage({
                   <div className="campaign-card-facts">
                     <div><small>活动时间</small><strong>{campaignTime(campaign)}</strong></div>
                     <div><small>来源</small><strong>{sourceText}</strong></div>
-                    <div><small>参赛作品</small><span className={!specText ? 'campaign-fact-empty' : ''}>{specText || '—'}</span></div>
-                    <div><small>参与条件</small><span className={!campaign.eligibility?.length ? 'campaign-fact-empty' : ''}>{campaign.eligibility?.length ? concise(campaign.eligibility, '') : '—'}</span></div>
+                    <div><small>参赛作品</small><span className={!specText && !douyinNonSubmission ? 'campaign-fact-empty' : ''}>{specText || (douyinNonSubmission ? '不适用 · 非投稿活动' : '—')}</span></div>
+                    <div><small>参与条件</small><span className={!campaign.eligibility?.length ? 'campaign-fact-empty' : ''}>{campaign.eligibility?.length ? concise(campaign.eligibility, '') : campaign.douyin_listing?.detail_status === 'parsed' ? '官方详情未单独说明资格条件' : '—'}</span></div>
                     <div><small>{longTerm ? '收益方式' : '奖品 / 奖励'}</small><span className={!rewardText ? 'campaign-fact-empty' : ''}>{rewardText || '—'}</span></div>
-                    <div><small>{longTerm ? '收益规则' : '获奖条件'}</small><span className={!conditionText ? 'campaign-fact-empty' : ''}>{conditionText || '—'}</span></div>
+                    <div><small>{longTerm ? '收益规则' : douyinNonSubmission ? '获得条件' : '获奖条件'}</small><span className={!conditionText && !douyinNonSubmission ? 'campaign-fact-empty' : ''}>{conditionText || (douyinNonSubmission && campaign.douyin_listing?.detail_status === 'parsed' ? '官方详情未说明额外门槛' : '—')}</span></div>
                     <div className={incomplete ? 'campaign-missing' : 'campaign-complete'}><small>规则信息</small><span>{campaign.platform === 'xiaohongshu' ? (xhsRuleStatus + (campaign.xhs_detail_status === 'parsed' && incomplete ? ' · 仍缺：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '')) : campaign.douyin_listing ? douyinDetailStatusText(campaign) : campaign.platform === 'x' && xEnrichmentStatus?.current === campaign.id ? '整理中…' : campaign.platform === 'x' && campaign.x_enrichment_status === 'failed' ? '整理失败，等待重试' : incomplete ? '待补充：' + missing.map((key) => MISSING_LABELS[key] || key).join('、') : '已完整'}</span></div>
                   </div>
                   <div className="campaign-actions">
@@ -1131,7 +1135,7 @@ export default function CampaignsPage({
               </div>
             </div>
 
-            {selected.douyin_listing && <section><h4>抖音来源范围</h4><p className="campaign-copy">{selected.douyin_listing.scope_note}</p><p className="campaign-unknown">官方列表展示期：{dateOnly(selected.douyin_listing.display_starts_at) || '未说明'} → {dateOnly(selected.douyin_listing.display_ends_at) || '未说明'}。展示日期不等同报名或投稿截止日期。</p><p>{douyinDetailStatusText(selected)}</p>{selected.douyin_listing.challenge_ids.length > 0 && <p className="campaign-unknown">官方关联话题 ID：{selected.douyin_listing.challenge_ids.join('、')}（话题名称尚未核实）</p>}</section>}
+            {selected.douyin_listing && <section><h4>抖音来源范围</h4><p className="campaign-copy">{selected.douyin_listing.scope_note}</p><p className="campaign-unknown">官方详情活动时间：{dateOnly(selected.douyin_listing.display_starts_at) || '未说明'} → {dateOnly(selected.douyin_listing.display_ends_at) || '未说明'}。投稿截止只在详情明确提供投稿窗口时单独填写。</p><p>{douyinDetailStatusText(selected)}</p>{selected.douyin_listing.challenge_ids.length > 0 && <p className="campaign-unknown">官方关联话题 ID：{selected.douyin_listing.challenge_ids.join('、')}；话题名称以“指定话题 / 标签”中的官方详情为准。</p>}</section>}
 
             <section className="campaign-summary-section"><h4>活动摘要</h4><p className={selected.summary || selected.note ? 'campaign-copy' : 'campaign-unknown'}>{selected.summary || selected.note || '当前来源没有提供可结构化的活动摘要，建议打开原活动页查看。'}</p></section>
             <section>
@@ -1172,7 +1176,7 @@ export default function CampaignsPage({
             <section><h4>AI 使用要求</h4><p className="campaign-copy">{selected.ai_policy === 'unknown' || !selected.ai_policy ? '原活动规则未说明 AI 使用要求。' : selected.ai_policy}</p></section>
             <section><h4>来源与核验</h4>
               <p className="campaign-source-name"><strong>{sourceName(selected)}</strong> · {sourceVerificationLabel(selected)}</p>
-              {selected.source_url ? <a className="campaign-source-link" href={selected.source_url} target="_blank" rel="noreferrer">{selected.source_url}</a> : <p className="campaign-unknown">{selected.douyin_listing ? '官方列表未提供可打开的网页详情。请在抖音 App 按活动名称查看；不会使用创作者首页冒充详情。' : '没有保存来源链接。'}</p>}
+              {selected.source_url ? <a className="campaign-source-link" href={selected.source_url} target="_blank" rel="noreferrer">{selected.source_url}</a> : <p className="campaign-unknown">{selected.douyin_listing?.detail_status === 'parsed' ? '已从抖音创作者中心官方详情接口读取规则；平台未提供独立网页链接。' : selected.douyin_listing ? '当前尚未取得可打开的网页详情；不会使用创作者首页冒充详情。' : '没有保存来源链接。'}</p>}
               <p className="campaign-verify">首次发现：{selected.discovered_at ? new Date(selected.discovered_at * 1000).toLocaleString('zh-CN') : '未知'} · 最后看到：{selected.last_seen_at ? new Date(selected.last_seen_at * 1000).toLocaleString('zh-CN') : '未知'}</p>
               <p className="campaign-verify">规则最近核验：{selected.last_verified_at ? new Date(selected.last_verified_at * 1000).toLocaleString('zh-CN') : '尚未完整核验'} · 规则版本 v{selected.rule_version}</p>
               {selected.platform === 'xiaohongshu' && <p className="campaign-verify">详情解析：{xhsDetailStatusText(selected)}{selected.xhs_detail_fetched_at ? ' · ' + new Date(selected.xhs_detail_fetched_at * 1000).toLocaleString('zh-CN') : ''}{selected.xhs_detail_error ? ' · ' + selected.xhs_detail_error : ''}</p>}

@@ -24,14 +24,21 @@ export default function Analytics() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    Promise.all([
-      api<{ items: Task[]; real_counts: Record<string, number> }>('/api/ripple/tasks'),
-      api<Account[]>('/api/ripple/accounts'),
-    ]).then(([taskData, accountData]) => {
-      setTasks(taskData.items); setCounts(taskData.real_counts);
-      const xhs = accountData.filter((row) => row.platform === 'xiaohongshu' && row.status === 'connected' && row.adapter !== 'aitoearn-rest');
-      setAccounts(xhs); setXhsAccountId(xhs[0]?.id || '');
-    }).catch((e) => setError(errorText(e)));
+    let stopped = false;
+    const tasks = api<{ items: Task[]; real_counts: Record<string, number> }>('/api/ripple/tasks').then((taskData) => {
+      if (!stopped) { setTasks(taskData.items); setCounts(taskData.real_counts); }
+    });
+    const accountRows = api<Account[]>('/api/ripple/accounts').then((rows) => {
+      if (stopped) return;
+      const xhs = rows.filter((row) => row.platform === 'xiaohongshu' && row.status === 'connected' && row.adapter !== 'aitoearn-rest');
+      setAccounts(xhs); setXhsAccountId((current) => current && xhs.some((row) => row.id === current) ? current : xhs[0]?.id || '');
+    });
+    void Promise.allSettled([tasks, accountRows]).then((results) => {
+      if (stopped) return;
+      const failure = results.find((row) => row.status === 'rejected');
+      setError(failure?.status === 'rejected' ? errorText(failure.reason) : '');
+    });
+    return () => { stopped = true; };
   }, []);
 
   const platforms = [...new Set(tasks.filter((task) => task.content.mode === 'real').map((task) => task.content.platform))];

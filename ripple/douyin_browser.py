@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import uuid
 
 from .douyin_campaigns import (HOME, MAX_RESPONSE, DouyinCampaignError, fetch_public_detail,
-                               official_list_url, parse_activity_list)
+                               official_detail_url, official_list_url, parse_activity_detail, parse_activity_list)
 
 
 class DouyinBrowserError(RuntimeError):
@@ -225,11 +225,14 @@ def _candidates(value: Any, *, limit: int = 200) -> list[dict[str, Any]]:
 def events(directory: Path, limit: int = 200, *, browser_channel: str | None = None) -> dict[str, Any]:
     p, context, page = _launch(directory, browser_channel=browser_channel)
     payloads: list[dict[str, Any]] = []
+    details: dict[str, dict[str, Any]] = {}
     failures: list[str] = []
     observer = _IdentityObserver()
     try:
         def on_response(response):
-            if not official_list_url(response.url):
+            is_list = official_list_url(response.url)
+            is_detail = official_detail_url(response.url)
+            if not is_list and not is_detail:
                 return
             try:
                 if response.status != 200 or "json" not in response.headers.get("content-type", "").lower():
@@ -237,17 +240,24 @@ def events(directory: Path, limit: int = 200, *, browser_channel: str | None = N
                 raw = response.body()
                 if len(raw) > MAX_RESPONSE:
                     raise DouyinCampaignError("抖音活动响应超过安全上限。")
+                data = json.loads(raw)
+                if is_detail:
+                    query = parse_qs(urlsplit(response.url).query)
+                    expected = query.get("activity_id", [""])[0]
+                    detail = parse_activity_detail(data, expected_id=expected)
+                    details[detail["external_id"]] = detail
+                    return
                 # Python parses raw JSON so long numeric IDs are not rounded by JavaScript.
-                result = parse_activity_list(json.loads(raw), limit=limit)
+                result = parse_activity_list(data, limit=limit)
                 query = parse_qs(urlsplit(response.url).query)
                 result["window"] = {k: int(query[k][0]) for k in ("start_time", "end_time")
                                     if len(query.get(k, [])) == 1 and query[k][0].isdigit()}
                 if len(payloads) < 4:
                     payloads.append(result)
             except (ValueError, TypeError, KeyError):
-                failures.append("抖音官方活动列表响应无效，未回退到分类或首页文本。")
+                failures.append("抖音官方活动响应无效，未回退到分类或首页文本。")
             except Exception:
-                failures.append("抖音官方活动列表读取失败。")
+                failures.append("抖音官方活动读取失败。")
 
         page.on("response", observer.observe)
         page.on("response", on_response)
@@ -265,15 +275,44 @@ def events(directory: Path, limit: int = 200, *, browser_channel: str | None = N
         result = payloads[-1]
         result["page_url"] = HOME
         result["fetched_at"] = int(time.time())
+        # The list omits detail fields for many activities. The logged-in creator
+        # page exposes a same-origin read-only detail endpoint keyed by activity_id.
+        # Requesting it in page context preserves the platform session without
+        # exporting cookies or manufacturing anti-bot signatures.
+        detail_deadline = time.monotonic() + 35
+        for row in result["items"]:
+            identity = str(row.get("external_id") or "")
+            if not identity or identity in details or time.monotonic() >= detail_deadline:
+                continue
+            try:
+                data = page.evaluate("""async (activityId) => {
+                    const url = `/web/api/v2/creator/activity/detail/?activity_id=${encodeURIComponent(activityId)}&is_pc=1`;
+                    const response = await fetch(url, { credentials: 'include' });
+                    if (!response.ok) return null;
+                    return await response.json();
+                }""", identity)
+                if isinstance(data, dict):
+                    details[identity] = parse_activity_detail(data, expected_id=identity)
+            except Exception:
+                continue
+        for row in result["items"]:
+            detail = details.get(str(row.get("external_id") or ""))
+            if detail:
+                row.update(detail)
     finally:
         _close(p, context)
-    # Public details use no account credentials. Bound work and keep list rows on failure.
-    deadline, attempted = time.monotonic() + 45, 0
+    # Public H5 pages can supplement creator-detail fields without account credentials.
+    deadline, attempted = time.monotonic() + 30, 0
     for row in result["items"]:
         if row["url"] and attempted < 8 and time.monotonic() < deadline:
-            row.update(fetch_public_detail(row["url"]))
+            public = fetch_public_detail(row["url"])
+            for key, value in public.items():
+                if key == "detail_status" and row.get("detail_status") == "parsed":
+                    continue
+                if value and not row.get(key):
+                    row[key] = value
             attempted += 1
-    result["detail_attempted"] = attempted
+    result["detail_attempted"] = len(details) + attempted
     return result
 
 

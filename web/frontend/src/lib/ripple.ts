@@ -187,17 +187,28 @@ function detail(payload: { detail?: string | { msg: string }[] }, fallback: stri
   if (Array.isArray(payload.detail)) return payload.detail.map(v => v.msg).join('；');
   return fallback;
 }
+const inflightGets = new Map<string, Promise<unknown>>();
+
 export async function api<T>(path: string, method = 'GET', data?: unknown): Promise<T> {
-  const response = await fetch(`${base}${path}`, securedFetchOptions({
-    method, headers: data === undefined ? undefined : { 'Content-Type': 'application/json' },
-    body: data === undefined ? undefined : JSON.stringify(data),
-  }));
-  if (!response.ok) {
-    let message = `请求失败（${response.status}）`;
-    try { message = detail(await response.json(), message); } catch { /* Non-JSON server response. */ }
-    throw new Error(message);
-  }
-  return response.json() as Promise<T>;
+  const normalizedMethod = method.toUpperCase();
+  const execute = async (): Promise<T> => {
+    const response = await fetch(`${base}${path}`, securedFetchOptions({
+      method: normalizedMethod, headers: data === undefined ? undefined : { 'Content-Type': 'application/json' },
+      body: data === undefined ? undefined : JSON.stringify(data),
+    }));
+    if (!response.ok) {
+      let message = `请求失败（${response.status}）`;
+      try { message = detail(await response.json(), message); } catch { /* Non-JSON server response. */ }
+      throw new Error(message);
+    }
+    return response.json() as Promise<T>;
+  };
+  if (normalizedMethod !== 'GET' || data !== undefined) return execute();
+  const existing = inflightGets.get(path) as Promise<T> | undefined;
+  if (existing) return existing;
+  const pending = execute().finally(() => { if (inflightGets.get(path) === pending) inflightGets.delete(path); });
+  inflightGets.set(path, pending);
+  return pending;
 }
 
 export interface AgentModelMeta { id: string; name: string; effort_levels: string[]; supports_reasoning?: boolean; source?: string; }

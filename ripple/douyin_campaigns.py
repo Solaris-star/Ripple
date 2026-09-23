@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 import httpx
 
 LIST_PATH = "/web/api/v2/creator/activity/pc/list"
+DETAIL_PATH = "/web/api/v2/creator/activity/detail/"
 HOME = "https://creator.douyin.com/creator-micro/home"
 MAX_RESPONSE = 4 * 1024 * 1024
 DETAIL_HOSTS = {"creator.douyin.com", "www.douyin.com", "api.amemv.com"}
@@ -33,6 +34,16 @@ def official_list_url(url: str) -> bool:
         return (parsed.scheme == "https" and parsed.hostname == "creator.douyin.com"
                 and parsed.port in {None, 443} and not parsed.username and not parsed.password
                 and parsed.path == LIST_PATH)
+    except ValueError:
+        return False
+
+
+def official_detail_url(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme == "https" and parsed.hostname == "creator.douyin.com"
+                and parsed.port in {None, 443} and not parsed.username and not parsed.password
+                and parsed.path == DETAIL_PATH)
     except ValueError:
         return False
 
@@ -111,7 +122,7 @@ def parse_activity_list(value: Any, *, limit: int = 200) -> dict[str, Any]:
             "display_starts_at": display_date(item.get("show_start_time")),
             "display_ends_at": display_date(item.get("show_end_time")),
             "challenge_ids": challenge_ids, "jump_type": item.get("jump_type"),
-            "detail_status": "not_fetched" if url else "app_only", "description": "",
+            "detail_status": "not_fetched", "description": "",
         })
     if raw and not rows:
         raise DouyinCampaignError("抖音返回的条目缺少活动 ID 或 show_name，未按活动导入。")
@@ -120,6 +131,178 @@ def parse_activity_list(value: Any, *, limit: int = 200) -> dict[str, Any]:
     return {"items": rows[:limit], "source_count": len(rows), "rejected_count": rejected,
             "truncated": len(rows) > limit or has_more or rejected > 0,
             "scope": "creator_calendar_window", "source": "creator_activity_api_v2"}
+
+
+def _detail_date(value: Any) -> str:
+    text = str(value or "").strip()
+    match = re.fullmatch(r"(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", text)
+    if not match:
+        return ""
+    try:
+        return datetime(int(match[1]), int(match[2]), int(match[3])).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def _reward_text(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = value.strip()
+    try:
+        parsed = __import__("json").loads(text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+            text = parsed["text"].strip()
+    except (ValueError, TypeError):
+        pass
+    return re.sub(r"\s+", " ", text)[:1200]
+
+
+def _submission_requirements(description: str) -> list[str]:
+    rows = []
+    for line in re.split(r"[\n。！？；]+", description):
+        line = re.sub(r"\s+", " ", line).strip(" ，,。；;：:")
+        if not line:
+            continue
+        if re.search(r"(?:投稿|上传|发布|带活动话题|原创视频|首次发布|时长[≥<=]|@抖音)", line):
+            rows.append(line[:500])
+    return list(dict.fromkeys(rows))[:12]
+
+
+def _submission_window(description: str, info: dict[str, Any], has_submission: bool) -> tuple[str, str]:
+    if not has_submission:
+        return "", ""
+    year_match = re.search(r"^(20\d{2})[.]", str(info.get("show_start_time") or ""))
+    default_year = int(year_match[1]) if year_match else None
+    full = re.search(
+        r"(20\d{2})年(\d{1,2})月(\d{1,2})日(?:\d{1,2}:\d{2})?\s*(?:至|到|[-~～—])\s*"
+        r"(?:(20\d{2})年)?(\d{1,2})月(\d{1,2})日(?:\d{1,2}:\d{2})?",
+        description,
+    )
+    short = re.search(r"(?:^|[，。\s])(\d{1,2})月(\d{1,2})日\s*(?:至|到|[-~～—])\s*(\d{1,2})月(\d{1,2})日", description)
+    try:
+        if full:
+            start_year = int(full[1]); end_year = int(full[4] or start_year)
+            return (datetime(start_year, int(full[2]), int(full[3])).date().isoformat(),
+                    datetime(end_year, int(full[5]), int(full[6])).date().isoformat())
+        if short and default_year:
+            start = datetime(default_year, int(short[1]), int(short[2])).date()
+            end_year = default_year + (1 if (int(short[3]), int(short[4])) < (start.month, start.day) else 0)
+            end = datetime(end_year, int(short[3]), int(short[4])).date()
+            return start.isoformat(), end.isoformat()
+    except ValueError:
+        pass
+    if default_year:
+        start_only = re.search(r"(?:^|[，。\s])(\d{1,2})月(\d{1,2})日起", description)
+        if start_only:
+            try:
+                return datetime(default_year, int(start_only[1]), int(start_only[2])).date().isoformat(), ""
+            except ValueError:
+                pass
+    return "", ""
+
+
+def _reward_condition(reward: str) -> list[str]:
+    if not reward:
+        return []
+    match = re.match(r"(.{1,500}?)(?:，|,)?(?:将获得|可以获得|可获得|有机会获得|可享受)", reward)
+    if not match:
+        return []
+    value = match[1].strip(" ，,。；;：:")
+    return [value[:500]] if value else []
+
+
+def _activity_type(title: str, description: str, reward: str, requirements: list[str]) -> str:
+    text = f"{title}\n{description}\n{reward}"
+    if re.search(r"(?:名单.{0,8}(?:出炉|公示)|中奖名单|公示期)", text) and not requirements:
+        return "结果公示"
+    if requirements:
+        return "创作投稿"
+    if re.search(r"(?:星愿卡|卡池|星守护|抽卡|签名照|拍立得|演唱会门票)", text):
+        return "粉丝福利"
+    return "平台活动"
+
+
+def _reward_type(reward: str) -> str:
+    if not reward:
+        return ""
+    traffic = "流量" in reward
+    benefits = bool(re.search(r"(?:礼物|门票|周边|签名照|拍立得|身份|资格|权益)", reward))
+    if traffic and benefits:
+        return "流量 + 礼品/权益"
+    if traffic:
+        return "流量激励"
+    if benefits:
+        return "礼品/权益"
+    return "活动奖励"
+
+
+def _participation_conditions(description: str, activity_type: str) -> list[str]:
+    if activity_type != "粉丝福利" or not description:
+        return []
+    rows = []
+    for line in re.split(r"[\n。！？；]+", description):
+        line = re.sub(r"\s+", " ", line).strip(" ，,。；;：:")
+        if not line:
+            continue
+        if re.search(r"(?:开通|关注|参与|完成).{0,80}(?:即可|可获得|可参与|获得)", line):
+            rows.append(line[:500])
+    return list(dict.fromkeys(rows))[:8]
+
+
+def parse_activity_detail(value: Any, *, expected_id: str = "") -> dict[str, Any]:
+    if not isinstance(value, dict) or type(value.get("status_code")) is not int or value["status_code"] != 0:
+        raise DouyinCampaignError("抖音官方活动详情未返回成功状态。")
+    info = value.get("activity_info")
+    if not isinstance(info, dict):
+        raise DouyinCampaignError("抖音官方活动详情结构已变化。")
+    identity = str(info.get("activity_id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", identity) or (expected_id and identity != expected_id):
+        raise DouyinCampaignError("抖音官方活动详情 ID 与列表不一致。")
+    title = str(info.get("activity_name") or "").strip()[:240]
+    description = re.sub(r"\s+", " ", str(value.get("activity_description") or "")).strip()[:3000]
+    reward = _reward_text(value.get("reward_rules"))
+    raw_topics = value.get("topics") if isinstance(value.get("topics"), list) else []
+    topics = [str(x).strip()[:120] for x in raw_topics if isinstance(x, str) and str(x).strip()][:20]
+    hashtags = re.findall(r"#([^\s#，。！？；、]{1,60})", description)
+    required_topics = list(dict.fromkeys([*topics, *hashtags]))[:20]
+    requirements = _submission_requirements(description)
+    publish_start, publish_end = _submission_window(description, info, bool(requirements))
+    jump = detail_url(info.get("jump_link") or info.get("post_url"))
+    display_start = _detail_date(info.get("show_start_time"))
+    display_end = _detail_date(info.get("show_end_time"))
+    challenge_values = info.get("challenge_ids") if isinstance(info.get("challenge_ids"), list) else []
+    challenge_ids = list(dict.fromkeys(str(v) for v in challenge_values
+                         if isinstance(v, (str, int)) and not isinstance(v, bool)
+                         and re.fullmatch(r"[1-9][0-9]{0,24}", str(v))))[:20]
+    winning = _reward_condition(reward)
+    activity_type = _activity_type(title, description, reward, requirements)
+    reward_type = _reward_type(reward)
+    eligibility = _participation_conditions(description, activity_type)
+    return {
+        "external_id": identity,
+        "title": title,
+        "description": description,
+        "starts_at": publish_start,
+        "submit_deadline": publish_end,
+        "display_starts_at": display_start,
+        "display_ends_at": display_end,
+        "url": jump,
+        "required_topics": required_topics,
+        "challenge_ids": challenge_ids,
+        "content_requirements": requirements,
+        "reward_summary": reward,
+        "reward_rules": [reward] if reward else [],
+        "winning_conditions": winning,
+        "eligibility": eligibility,
+        "prizes": [reward] if reward else [],
+        "activity_type": activity_type,
+        "reward_type": reward_type,
+        "detail_status": "parsed" if any((description, reward, required_topics, requirements, display_start, display_end)) else "no_structured_rules",
+        "detail_source": "creator_activity_detail_api",
+        "activity_type_code": info.get("activity_type"),
+        "reward_type_code": info.get("reward_type"),
+        "activity_status_code": info.get("activity_status"),
+    }
 
 
 class _PageText(HTMLParser):

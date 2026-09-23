@@ -23,42 +23,64 @@ export default function Publisher({ onNavigate }: { onNavigate: (page: Page) => 
   const focusedOnce = useRef(false);
   const gate = useRef(false);
 
-  const refresh = useCallback(async () => {
-    const [first, accountRows, blogRows] = await Promise.all([
-      api<{ items: Task[]; total: number }>('/api/ripple/tasks'),
-      api<Account[]>('/api/ripple/accounts'),
-      api<{ items: BlogConnector[] }>('/api/ripple/blog/connectors'),
+  const refreshMetadata = useCallback(async () => {
+    const results = await Promise.allSettled([
+      api<Account[]>('/api/ripple/accounts').then(setAccounts),
+      api<{ items: BlogConnector[] }>('/api/ripple/blog/connectors').then((rows) => setBlogs(rows.items)),
+    ]);
+    const failure = results.find((row) => row.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
+  }, []);
+
+  const refreshTasks = useCallback(async (full = false) => {
+    const first = await api<{ items: Task[]; total: number }>('/api/ripple/tasks');
+    // Render the newest page immediately. Background polling updates only this page;
+    // older immutable history is loaded once or on explicit refresh.
+    setTasks((current) => first.total <= 200 ? first.items : [
+      ...first.items,
+      ...current.filter((task) => !first.items.some((fresh) => fresh.id === task.id)),
     ]);
     let all = first.items;
-    for (let offset = 200; offset < first.total; offset += 200) {
-      all = [...all, ...(await api<{ items: Task[] }>(`/api/ripple/tasks?offset=${offset}`)).items];
+    if (full && first.total > 200) {
+      const offsets = Array.from({ length: Math.ceil((first.total - 200) / 200) }, (_, index) => 200 + index * 200);
+      const tail = await Promise.all(offsets.map((offset) => api<{ items: Task[] }>(`/api/ripple/tasks?offset=${offset}`).then((rows) => rows.items)));
+      all = [...first.items, ...tail.flat()];
+      setTasks(all);
     }
-    setTasks(all); setAccounts(accountRows); setBlogs(blogRows.items);
-    if (!focusedOnce.current) {
-      focusedOnce.current = true;
-      const focus = sessionStorage.getItem('ripple_task_focus') || '';
-      sessionStorage.removeItem('ripple_task_focus');
-      if (focus && all.some((task) => task.id === focus)) setSelectedId(focus);
-      else if (all[0]) setSelectedId(all[0].id);
-    } else if (selectedId && !all.some((task) => task.id === selectedId)) {
-      setSelectedId(all[0]?.id || '');
-    }
+    setSelectedId((current) => {
+      if (!focusedOnce.current && (full || first.total <= 200)) {
+        focusedOnce.current = true;
+        const focus = sessionStorage.getItem('ripple_task_focus') || '';
+        sessionStorage.removeItem('ripple_task_focus');
+        return focus && all.some((task) => task.id === focus) ? focus : all[0]?.id || '';
+      }
+      return current && (all.some((task) => task.id === current) || (!full && first.total > 200)) ? current : all[0]?.id || '';
+    });
     return all;
-  }, [selectedId]);
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const results = await Promise.allSettled([refreshTasks(true), refreshMetadata()]);
+    const failure = results.find((row) => row.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
+    return results[0].status === 'fulfilled' ? results[0].value : [];
+  }, [refreshMetadata, refreshTasks]);
 
   useEffect(() => {
     let stopped = false, running = false;
-    const load = async () => {
+    const loadTasks = async (full = false) => {
       if (stopped || running) return;
       running = true;
-      try { await refresh(); if (!stopped) setError(''); }
+      try { await refreshTasks(full); if (!stopped) setError(''); }
       catch (e) { if (!stopped) setError(errorText(e)); }
       finally { running = false; }
     };
-    void load();
-    const timer = setInterval(() => void load(), 4000);
-    return () => { stopped = true; clearInterval(timer); };
-  }, [refresh]);
+    void loadTasks(true);
+    void refreshMetadata().catch((e) => { if (!stopped) setError(errorText(e)); });
+    const taskTimer = setInterval(() => void loadTasks(false), 4000);
+    const metadataTimer = setInterval(() => void refreshMetadata().catch(() => {}), 30000);
+    return () => { stopped = true; clearInterval(taskTimer); clearInterval(metadataTimer); };
+  }, [refreshMetadata, refreshTasks]);
 
   const run = async (fn: () => Promise<void>) => {
     if (gate.current) return;

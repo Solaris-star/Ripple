@@ -68,29 +68,28 @@ export default function Accounts({ onNavigate }: { onNavigate: (page: Page) => v
   const browserHint = currentBrowserChannel();
 
   const refresh = useCallback(async () => {
-    const [a, c, s, x, n] = await Promise.all([
-      api<Account[]>('/api/ripple/accounts'),
-      api<Channel[]>('/api/ripple/channels'),
-      api<RippleStatus>('/api/ripple/status'),
-      api<XConfig>('/api/ripple/x/config'),
-      api<{ items: ExecutionNode[] }>('/api/ripple/execution-nodes'),
+    const results = await Promise.allSettled([
+      api<Account[]>('/api/ripple/accounts').then(setAccounts),
+      api<Channel[]>('/api/ripple/channels').then(setChannels),
+      api<RippleStatus>('/api/ripple/status').then(setStatus),
+      api<XConfig>('/api/ripple/x/config').then((x) => { setXConfig(x); setXClientId(current => current || x.client_id); }),
+      api<{ items: ExecutionNode[] }>('/api/ripple/execution-nodes').then((n) => setNodes(n.items)),
+      api<{ items: BlogConnector[] }>('/api/ripple/blog/connectors').then((b) => { setBlogs(b.items); setBlogError(''); }),
     ]);
-    setAccounts(a); setChannels(c); setStatus(s); setXConfig(x); setNodes(n.items);
-    setXClientId(current => current || x.client_id);
-    try {
-      const b = await api<{ items: BlogConnector[] }>('/api/ripple/blog/connectors');
-      setBlogs(b.items); setBlogError('');
-    } catch (value) {
-      setBlogError(blogErrorText(value));
-    }
+    const blogFailure = results[5];
+    if (blogFailure.status === 'rejected') setBlogError(blogErrorText(blogFailure.reason));
+    const failure = results.slice(0, 5).find((row) => row.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
   }, []);
 
   useEffect(() => {
     let stopped = false, running = false;
-    const load = async () => { if (stopped || running) return; running = true; try { await refresh(); } catch (e) { if (!stopped) setError(errorText(e)); } finally { running = false; } };
+    const load = async () => { if (stopped || running) return; running = true; try { await refresh(); if (!stopped) setError(''); } catch (e) { if (!stopped) setError(errorText(e)); } finally { running = false; } };
+    const pollAccounts = () => void api<Account[]>('/api/ripple/accounts').then((rows) => { if (!stopped) setAccounts(rows); }).catch((e) => { if (!stopped) setError(errorText(e)); });
     void load();
-    const timer = setInterval(() => void load(), 2500);
-    return () => { stopped = true; clearInterval(timer); };
+    const accountTimer = setInterval(pollAccounts, 5000);
+    const metadataTimer = setInterval(() => void load(), 30000);
+    return () => { stopped = true; clearInterval(accountTimer); clearInterval(metadataTimer); };
   }, [refresh]);
 
   useEffect(() => {

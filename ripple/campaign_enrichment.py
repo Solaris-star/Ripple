@@ -127,6 +127,17 @@ def submission_spec_has_data(value: Any) -> bool:
 def campaign_missing_fields(campaign: dict[str, Any]) -> list[str]:
     missing: list[str] = []
     public_wechat = str(campaign.get("source_type") or "") == "wechat_public_official"
+    douyin_detail = (campaign.get("platform") == "douyin"
+                     and str((campaign.get("douyin_listing") or {}).get("detail_status") or "") == "parsed")
+    if douyin_detail:
+        activity_type = str(campaign.get("activity_type") or "")
+        if activity_type == "创作投稿" and not submission_spec_has_data(campaign.get("submission_spec")):
+            missing.append("submission_spec")
+        if not campaign.get("prizes") and not str(campaign.get("reward_summary") or "").strip():
+            missing.append("prizes")
+        if activity_type == "创作投稿" and not campaign.get("winning_conditions"):
+            missing.append("winning_conditions")
+        return missing
     if not campaign.get("eligibility"):
         missing.append("eligibility")
     if public_wechat:
