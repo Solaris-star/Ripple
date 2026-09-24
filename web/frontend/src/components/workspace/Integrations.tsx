@@ -22,11 +22,15 @@ export default function Integrations({
   onNavigate,
   onNewProfile,
   onEditProfile,
+  selectedProfileId,
+  onSelectProfile,
 }: {
   initialSection?: SettingsSection;
   onNavigate: (page: Page) => void;
   onNewProfile: () => void;
   onEditProfile: (name: string) => void;
+  selectedProfileId?: string;
+  onSelectProfile: (profileId: string) => void;
 }) {
   const fromUrl = new URLSearchParams(location.search).get('section') as SettingsSection | null;
   const [status, setStatus] = useState<RippleStatus | null>(null);
@@ -73,7 +77,7 @@ export default function Integrations({
         {tabs.map(([id, label]) => <button key={id} className={section === id ? 'active' : ''} onClick={() => selectSection(id)}>{label}</button>)}
       </nav>
       <div className="focus-settings-content">
-        {section === 'accounts' && <Accounts embedded onNavigate={onNavigate} onNewProfile={onNewProfile} onEditProfile={onEditProfile} />}
+        {section === 'accounts' && <Accounts embedded onNavigate={onNavigate} onNewProfile={onNewProfile} onEditProfile={onEditProfile} selectedProfileId={selectedProfileId} onSelectProfile={onSelectProfile} />}
         {section === 'agent' && <>
           <AgentRuntimeSettings />
           <section className="r2-settings-section">

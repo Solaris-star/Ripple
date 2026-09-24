@@ -1,5 +1,7 @@
 from pathlib import Path
 import shutil
+import json
+import sqlite3
 
 import pytest
 
@@ -16,12 +18,13 @@ def _legacy_profile(root: Path, name: str = "科技工具") -> Path:
     return directory
 
 
-def test_legacy_profile_gets_stable_id_and_revision(monkeypatch, tmp_path):
+def test_legacy_external_change_is_draft_not_auto_confirmed(monkeypatch, tmp_path):
     profiles = tmp_path / "profiles"
     monkeypatch.setattr(content_profiles, "PROFILES_DIR", profiles)
     directory = _legacy_profile(profiles)
 
-    service = ContentProfileService(tmp_path / "profiles.sqlite3")
+    db_path = tmp_path / "profiles.sqlite3"
+    service = ContentProfileService(db_path)
     first = service.list_profiles()[0]
     assert first["id"].startswith("cp_")
     assert first["current_revision"] == 1
@@ -30,8 +33,78 @@ def test_legacy_profile_gets_stable_id_and_revision(monkeypatch, tmp_path):
     service.sync_legacy_profiles()
     second = service.list_profiles()[0]
     assert second["id"] == first["id"]
-    assert second["current_revision"] == 2
-    assert "开发者工具实测" in service.get_profile(first["id"])["files"]["identity.md"]
+    assert second["current_revision"] == 1
+    assert "科技工具实测" in service.get_profile(first["id"])["files"]["identity.md"]
+
+    with sqlite3.connect(db_path) as db:
+        row = db.execute(
+            "SELECT revision,files_json,source,status FROM profile_revisions WHERE profile_id=? ORDER BY revision DESC LIMIT 1",
+            (first["id"],),
+        ).fetchone()
+    assert row[0] == 2
+    assert row[2:] == ("legacy_sync", "draft")
+    assert "开发者工具实测" in json.loads(row[1])["identity.md"]
+
+
+def test_confirmed_save_rolls_back_database_when_legacy_write_fails(monkeypatch, tmp_path):
+    profiles = tmp_path / "profiles"
+    monkeypatch.setattr(content_profiles, "PROFILES_DIR", profiles)
+    _legacy_profile(profiles)
+    service = ContentProfileService(tmp_path / "profiles.sqlite3")
+    profile = service.get_profile(service.list_profiles()[0]["id"])
+    changed = dict(profile["files"])
+    changed["identity.md"] = "# 身份定位\n\n不能半保存\n"
+
+    monkeypatch.setattr(content_profiles, "_write_legacy_files", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        service.save_revision(profile["id"], changed, source="test", expected_revision=1, confirm=True)
+
+    after = service.get_profile(profile["id"])
+    assert after["current_revision"] == 1
+    assert "科技工具实测" in after["files"]["identity.md"]
+
+
+def test_profile_create_rolls_back_database_when_legacy_write_fails(monkeypatch, tmp_path):
+    profiles = tmp_path / "profiles"
+    monkeypatch.setattr(content_profiles, "PROFILES_DIR", profiles)
+    service = ContentProfileService(tmp_path / "profiles.sqlite3")
+    monkeypatch.setattr(content_profiles, "_write_legacy_files", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")))
+
+    with pytest.raises(OSError, match="disk full"):
+        service.create_profile("事务画像", {"identity.md": "# 身份定位\n\n不能半创建\n"})
+
+    assert service.list_profiles() == []
+    assert not (profiles / "事务画像").exists()
+
+
+def test_profile_storage_name_rejects_windows_path_forms(monkeypatch, tmp_path):
+    monkeypatch.setattr(content_profiles, "PROFILES_DIR", tmp_path / "profiles")
+    service = ContentProfileService(tmp_path / "profiles.sqlite3")
+    files = {"identity.md": "# 身份定位\n\n安全名称\n"}
+    for name in ("C:review-profile", "CON", "name.", "..", "_internal"):
+        with pytest.raises(WorkflowError, match="画像名称无效"):
+            service.create_profile(name, files)
+
+
+def test_analysis_request_is_idempotent_and_terminal_status_does_not_regress(monkeypatch, tmp_path):
+    profiles = tmp_path / "profiles"
+    monkeypatch.setattr(content_profiles, "PROFILES_DIR", profiles)
+    _legacy_profile(profiles)
+    service = ContentProfileService(tmp_path / "profiles.sqlite3")
+    profile = service.list_profiles()[0]
+
+    kwargs = dict(
+        target_kind="account", account_id="douyin-tech", profile_id=profile["id"],
+        samples=[{"title": "样本"}], request_digest="idem-001",
+    )
+    first = service.create_analysis(**kwargs)
+    second = service.create_analysis(**kwargs)
+    assert second["id"] == first["id"]
+    service.set_analysis_status(first["id"], "running")
+    succeeded = service.save_analysis_proposal(first["id"], {"files": {"identity.md": "提案"}})
+    assert succeeded["status"] == "succeeded"
+    regressed = service.set_analysis_status(first["id"], "running")
+    assert regressed["status"] == "succeeded"
 
 
 def test_binding_resolves_profile_and_blocks_archive(monkeypatch, tmp_path):

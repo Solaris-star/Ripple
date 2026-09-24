@@ -4,8 +4,8 @@ import { LABELS } from '../../lib/ripple';
 import { PlatformIcon } from '../PlatformBrand';
 import { platformDisplayName } from '../../lib/platforms';
 
-export function Mark({ platform }: { platform: string }) {
-  return <span className={`r2-mark r2-mark-${platform}`} title={platformDisplayName(platform)} aria-hidden="true"><PlatformIcon platform={platform} size={17} /></span>;
+export function Mark({ platform, size = 17 }: { platform: string; size?: number }) {
+  return <span className={`r2-mark r2-mark-${platform}`} title={platformDisplayName(platform)} aria-hidden="true"><PlatformIcon platform={platform} size={size} /></span>;
 }
 export function Status({ status }: { status: string }) { return <span className={`r2-status r2-status-${status}`}><i />{LABELS[status] || status}</span>; }
 export function Empty({ title, description, children }: { title: string; description?: string; children?: ReactNode }) {

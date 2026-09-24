@@ -323,7 +323,11 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
 
     @router.delete("/accounts/{account_id}")
     def delete_account(account_id: str, req: DeleteAccountInput):
-        return service.delete_account(account_id, req.confirmed)
+        result = service.delete_account(account_id, req.confirmed)
+        profile_service = getattr(service, "content_profiles", None)
+        if profile_service is not None:
+            profile_service.unbind(target_kind="account", account_id=account_id)
+        return result
 
     @router.post("/accounts/{account_id}/login")
     def login(account_id: str, req: ConnectionAction):
@@ -739,8 +743,15 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
             "/api/ripple/accounts",
             "/api/ripple/execution-nodes/pairing",
             "/api/ripple/media/connections",
+            "/api/account-profile-bindings",
+            "/api/content-profiles",
+            "/api/profile-analysis",
+            "/api/profile/build",
+            "/api/persona",
         )
-        return any(path == prefix or path.startswith(prefix + "/") for prefix in control_prefixes)
+        if any(path == prefix or path.startswith(prefix + "/") for prefix in control_prefixes):
+            return True
+        return False
 
     @app.middleware("http")
     async def local_boundary(request: Request, call_next):

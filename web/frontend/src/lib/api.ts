@@ -102,7 +102,7 @@ export interface ProfileAnalysisRun {
   samples: Array<Record<string, unknown>>; proposal: {
     files?: Record<string, string>; observations?: string[]; assumptions?: string[];
     open_questions?: string[]; sample_summary?: string;
-  }; model: Record<string, unknown>; error: string; created_at: string; updated_at: string;
+  }; model: Record<string, unknown>; request_digest?: string; reused?: boolean; error: string; created_at: string; updated_at: string;
 }
 
 export function fetchContentProfileContext(params: { profile_name?: string; profile_id?: string; account_id?: string; target_kind?: string } = {}): Promise<ContentProfileContext> {
@@ -144,7 +144,7 @@ export function fetchProfileAnalysisCapability(targetKind: 'account' | 'blog', a
 }
 export function startProfileAnalysis(payload: {
   target_kind: 'account' | 'blog'; account_id: string; profile_id?: string; display_name?: string;
-  samples: Array<Record<string, unknown>>; use_account_history?: boolean; history_limit?: number; confirmed: boolean;
+  samples: Array<Record<string, unknown>>; use_account_history?: boolean; history_limit?: number; idempotency_key?: string; confirmed: boolean;
 }): Promise<ProfileAnalysisRun> {
   return request('/api/profile-analysis', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),

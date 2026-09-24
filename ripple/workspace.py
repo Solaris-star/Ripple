@@ -26,6 +26,7 @@ from .x_adapter import XService, ADAPTER as X_ADAPTER
 from .wechat_adapter import WeChatService, ADAPTER as WECHAT_ADAPTER
 from .catalog import CONNECTION_METHODS, NATIVE, NAMES, RECEIPT_HOSTS, X_BROWSER_ADAPTER
 from .library import ContentLibrary, add_mother, mother_snapshot
+from .plans import ContentPlanService
 from .variants import VariantService
 from .blog_connector import BlogConnectorService
 from .execution_nodes import LOCAL_NODE_ID, ExecutionNodeService
@@ -66,6 +67,7 @@ class WorkspaceService(PublishingService):
         self.x = XService(self)
         self.wechat = WeChatService(self)
         self.library = ContentLibrary(self)
+        self.plans = ContentPlanService(self)
         self.variants = VariantService(self)
         self.blogs = BlogConnectorService(self)
         self.watermarks = WatermarkService()

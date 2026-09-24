@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   applyProfileAnalysis,
   bindContentProfile,
@@ -37,6 +37,8 @@ type AnalysisState = {
   capability: ProfileAnalysisCapability | null;
   profileId: string;
   displayName: string;
+  baseFiles: Record<string, string>;
+  requestKey: string;
   sampleText: string;
   useAccountHistory: boolean;
   historyLimit: number;
@@ -50,6 +52,19 @@ type OverrideState = {
   formats: string;
   notes: string;
 };
+
+const PROFILE_FILE_LABELS: Record<string, string> = {
+  'identity.md': '身份定位',
+  'style.md': '内容风格',
+  'audience.md': '目标受众',
+  'platforms.md': '平台运营',
+  'preferences.md': '偏好与红线',
+  'memory.md': '经验沉淀',
+};
+
+function analysisRequestKey(): string {
+  return globalThis.crypto?.randomUUID?.() || `profile-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 function sampleRows(raw: string): Array<Record<string, unknown>> {
   return raw
@@ -115,6 +130,8 @@ export default function AccountProfileManager({
   blogs,
   onNewProfile,
   onEditProfile,
+  selectedProfileId,
+  onSelectProfile,
   onBindNewAccount,
   onManageConnections,
   onChanged,
@@ -123,6 +140,8 @@ export default function AccountProfileManager({
   blogs: BlogConnector[];
   onNewProfile: () => void;
   onEditProfile: (name: string) => void;
+  selectedProfileId?: string;
+  onSelectProfile: (profileId: string) => void;
   onBindNewAccount: (profileId: string, profileName: string) => void;
   onManageConnections: () => void;
   onChanged?: () => void;
@@ -136,19 +155,25 @@ export default function AccountProfileManager({
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
 
-  const load = async () => {
+  const load = useCallback(async () => {
     const next = await fetchContentProfileContext();
     setContext(next);
     setActiveProfileId((current) => {
+      if (selectedProfileId && next.profiles.some((item) => item.id === selectedProfileId)) return selectedProfileId;
       const fromUrl = new URLSearchParams(location.search).get('profile_id') || '';
       if (fromUrl && next.profiles.some((item) => item.id === fromUrl)) return fromUrl;
       if (current && next.profiles.some((item) => item.id === current)) return current;
       return next.profiles[0]?.id || '';
     });
-  };
-  useEffect(() => { void load().catch((e) => setError(errorText(e))); }, [accounts.length, blogs.length]);
+  }, [selectedProfileId]);
+  useEffect(() => { void load().catch((e) => setError(errorText(e))); }, [accounts.length, blogs.length, load]);
   useEffect(() => {
-    if (!activeProfileId) { setActiveDetail(null); return; }
+    if (!selectedProfileId || selectedProfileId === activeProfileId) return;
+    if (context?.profiles.some((item) => item.id === selectedProfileId)) setActiveProfileId(selectedProfileId);
+  }, [selectedProfileId, activeProfileId, context]);
+  useEffect(() => {
+    setActiveDetail(null);
+    if (!activeProfileId) return;
     let cancelled = false;
     void fetchContentProfile(activeProfileId)
       .then((value) => { if (!cancelled) setActiveDetail(value); })
@@ -186,7 +211,9 @@ export default function AccountProfileManager({
   const unassignedTargets = targets.filter((target) => !bindingFor(target));
 
   const selectProfile = (profileId: string) => {
+    setActiveDetail(null);
     setActiveProfileId(profileId);
+    onSelectProfile(profileId);
     setError(''); setNotice('');
     const url = new URL(location.href);
     url.searchParams.set('page', 'integrations');
@@ -249,21 +276,32 @@ export default function AccountProfileManager({
   const openAnalysis = async (target: Target, mode: 'current' | 'new' = 'current') => {
     setError(''); setNotice('');
     const binding = bindingFor(target);
+    const profileId = mode === 'current' ? (binding?.profile_id || activeProfileId) : '';
+    const initialFiles = profileId === activeDetail?.id ? { ...(activeDetail.files || {}) } : {};
     setAnalysis({
       target,
       capability: null,
-      profileId: mode === 'current' ? (binding?.profile_id || activeProfileId) : '',
+      profileId,
       displayName: mode === 'new'
         ? `${target.identityName || target.label}画像`
         : (binding ? profileFor(binding.profile_id)?.display_name || '' : activeProfile?.display_name || ''),
+      baseFiles: initialFiles,
+      requestKey: analysisRequestKey(),
       sampleText: '',
       useAccountHistory: false,
       historyLimit: 30,
       run: null,
     });
     try {
-      const capability = await fetchProfileAnalysisCapability(target.kind, target.id);
-      setAnalysis((current) => current && current.target.id === target.id ? { ...current, capability } : current);
+      const [capability, detail] = await Promise.all([
+        fetchProfileAnalysisCapability(target.kind, target.id),
+        profileId && !Object.keys(initialFiles).length ? fetchContentProfile(profileId) : Promise.resolve(null),
+      ]);
+      setAnalysis((current) => current && current.target.id === target.id ? {
+        ...current,
+        capability,
+        ...(detail ? { baseFiles: { ...(detail.files || {}) } } : {}),
+      } : current);
     } catch (e) { setError(errorText(e)); }
   };
 
@@ -281,6 +319,7 @@ export default function AccountProfileManager({
         samples,
         use_account_history: analysis.useAccountHistory,
         history_limit: analysis.historyLimit,
+        idempotency_key: analysis.requestKey,
         confirmed: true,
       });
       setAnalysis((current) => current ? { ...current, run } : current);
@@ -299,11 +338,12 @@ export default function AccountProfileManager({
     if (!analysis?.run || analysis.run.status !== 'succeeded') return;
     setBusy(true); setError(''); setNotice('');
     try {
-      const profile = analysis.profileId ? profileFor(analysis.profileId) : undefined;
+      const lockedProfileId = analysis.run.profile_id || '';
+      const baseRevision = Number(analysis.run.model?.base_profile_revision || 0);
       const result = await applyProfileAnalysis(analysis.run.id, {
-        profile_id: analysis.profileId,
+        profile_id: lockedProfileId,
         display_name: analysis.displayName.trim(),
-        expected_revision: profile?.current_revision || 0,
+        expected_revision: baseRevision,
         bind_target: true,
       });
       await load();
@@ -362,7 +402,7 @@ export default function AccountProfileManager({
           const binding = bindingFor(target)!;
           const hasOverrides = Object.values(binding.overrides || {}).some(Boolean);
           return <article className="profile-account-card" key={`${target.kind}:${target.id}`}>
-            <div className="profile-account-identity"><Mark platform={target.platform} /><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{target.identityName && target.label !== target.identityName ? target.label : target.kind === 'blog' ? 'Blog 连接' : `账号 ID ${target.id.slice(0, 8)}`}</small><span><i className={`profile-status-dot${target.status === 'connected' ? '' : ' warn'}`} />{statusText(target)}{target.checkedAt ? ` · 最近检查 ${target.checkedAt}` : ''}</span></div></div>
+            <div className="profile-account-identity"><Mark platform={target.platform} size={22} /><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{target.identityName && target.label !== target.identityName ? target.label : target.kind === 'blog' ? 'Blog 连接' : `账号 ID ${target.id.slice(0, 8)}`}</small><span><i className={`profile-status-dot${target.status === 'connected' ? '' : ' warn'}`} />{statusText(target)}{target.checkedAt ? ` · 最近检查 ${target.checkedAt}` : ''}</span></div></div>
             <div className="profile-account-override"><small>账号差异</small><strong>{hasOverrides ? String(binding.overrides?.formats || binding.overrides?.tone || '已设置账号差异') : '继承基础画像'}</strong></div>
             <div className="profile-account-actions"><button className="r2-text-button" type="button" disabled={busy} onClick={() => openOverrides(target)}>账号差异</button><button className="r2-text-button" type="button" disabled={busy} onClick={() => void openAnalysis(target)}>Agent 分析</button><button className="r2-text-button" type="button" onClick={onManageConnections}>账号设置</button></div>
           </article>;
@@ -373,7 +413,7 @@ export default function AccountProfileManager({
     {!!unassignedTargets.length && <section className="unassigned-account-section">
       <div className="unassigned-account-head"><div><h3>未归类账号 <span>{unassignedTargets.length}</span></h3><p className="r2-muted">这些账号已经连接，但还没有账号画像。这里只作为待办处理。</p></div></div>
       <div className="unassigned-account-list">{unassignedTargets.map((target) => <article className="unassigned-account-row" key={`${target.kind}:${target.id}`}>
-        <div className="profile-account-identity"><Mark platform={target.platform} /><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{statusText(target)}</small></div></div>
+        <div className="profile-account-identity"><Mark platform={target.platform} size={22} /><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{statusText(target)}</small></div></div>
         <div className="unassigned-account-actions">{activeProfile && <button className="r2-button" disabled={busy} onClick={() => void changeBinding(target, activeProfile.id)}>关联到当前画像</button>}<select aria-label={`为 ${target.identityName || target.label} 选择画像`} disabled={busy} value="" onChange={(event) => { if (event.target.value) void changeBinding(target, event.target.value); }}><option value="">选择其他画像…</option>{(context?.profiles || []).map((profile) => <option key={profile.id} value={profile.id}>{profile.display_name}</option>)}</select><button className="r2-text-button" type="button" disabled={busy} onClick={() => void openAnalysis(target, 'new')}>Agent 创建画像</button></div>
       </article>)}</div>
     </section>}
@@ -391,7 +431,7 @@ export default function AccountProfileManager({
       {analysis.capability && !analysis.capability.automatic_history_supported && <div className="r2-inline-warning">
         当前不会因为账号已登录就自动读取全部历史。请粘贴你确认可以用于分析的代表作品；后续接入平台只读历史能力时仍会在运行前确认样本范围。
       </div>}
-      <label className="r2-field"><span>应用到</span><select value={analysis.profileId} onChange={(e) => setAnalysis((current) => current ? { ...current, profileId: e.target.value } : current)}>
+      <label className="r2-field"><span>应用到</span><select disabled={!!analysis.run} value={analysis.profileId} onChange={(e) => setAnalysis((current) => current ? { ...current, profileId: e.target.value } : current)}>
         <option value="">新建画像</option>
         {(context?.profiles || []).map((item) => <option key={item.id} value={item.id}>{item.display_name} · V{item.current_revision}</option>)}
       </select></label>
@@ -407,12 +447,19 @@ export default function AccountProfileManager({
         {!!analysis.run.proposal.observations?.length && <><h4>历史观察</h4><ul>{analysis.run.proposal.observations.map((item) => <li key={item}>{item}</li>)}</ul></>}
         {!!analysis.run.proposal.assumptions?.length && <><h4>AI 推测 · 待确认</h4><ul>{analysis.run.proposal.assumptions.map((item) => <li key={item}>{item}</li>)}</ul></>}
         {!!analysis.run.proposal.open_questions?.length && <><h4>还需要你确认</h4><ul>{analysis.run.proposal.open_questions.map((item) => <li key={item}>{item}</li>)}</ul></>}
+        {!!analysis.run.proposal.files && <div className="profile-analysis-files"><h4>即将写入的画像内容</h4>{Object.entries(analysis.run.proposal.files).map(([filename, proposed]) => {
+          const current = analysis.baseFiles[filename] || '';
+          const protectedRedline = filename === 'preferences.md' && Boolean(current);
+          const effective = protectedRedline ? current : String(proposed || '');
+          const changed = effective.trim() !== current.trim();
+          return <details key={filename} open={changed} className="profile-analysis-file"><summary><span>{PROFILE_FILE_LABELS[filename] || filename}</span><em>{protectedRedline ? '保留用户红线' : changed ? '将更新' : '无变化'}</em></summary><div className="profile-analysis-compare"><div><small>当前</small><pre>{current || '（空）'}</pre></div><div><small>{protectedRedline ? '实际保留' : 'Agent 建议'}</small><pre>{effective || '（空）'}</pre></div></div></details>;
+        })}</div>}
       </div>}
       <Feedback error={error} />
       <footer>
         <button className="r2-button" type="button" disabled={busy} onClick={() => setAnalysis(null)}>取消</button>
         {analysis.run?.status === 'succeeded'
-          ? <button className="r2-button primary" type="button" disabled={busy || (!analysis.profileId && !analysis.displayName.trim())} onClick={() => void applyAnalysis()}>确认并应用提案</button>
+          ? <button className="r2-button primary" type="button" disabled={busy || (!analysis.run.profile_id && !analysis.displayName.trim())} onClick={() => void applyAnalysis()}>确认并应用提案</button>
           : <button className="r2-button primary" type="button" disabled={busy || (!analysis.sampleText.trim() && !analysis.useAccountHistory) || (!analysis.profileId && !analysis.displayName.trim())} onClick={() => void startAnalysis()}>{busy ? '分析中…' : '开始分析'}</button>}
       </footer>
     </Modal>}

@@ -71,6 +71,7 @@ function RippleApp() {
   const [recommendationAiReady, setRecommendationAiReady] = useState(false);
   const [showRecommend, setShowRecommend] = useState(false);
   const [showWizard, setShowWizard] = useState(false);
+  const [profileDirty, setProfileDirty] = useState(false);
 
   // 挂载时决定进哪个会话。规则：
   //  - 同一标签刷新（sessionStorage 记着本标签的会话）→ 直接续上（同标签不算冲突）。
@@ -195,6 +196,10 @@ function RippleApp() {
       .filter((item) => item.profile_id === profile.id && item.target_kind === 'account')
       .map((item) => item.account_id);
   }, [profileContext, selectedPersona, selectedTarget]);
+  const selectedProfileId = useMemo(() => {
+    const profile = (profileContext?.profiles || []).find((item) => item.legacy_name === selectedPersona);
+    return profile?.id || '';
+  }, [profileContext, selectedPersona]);
   const currentWorkScope = useMemo<SessionWorkScope | undefined>(() => {
     if (!selectedTarget || !profileContext) return undefined;
     const [targetKind, ...parts] = selectedTarget.split(':');
@@ -771,7 +776,7 @@ ${JSON.stringify(structured, null, 2)}
           onEditPersona={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} />;
       case 'channels':
       case 'accounts':
-        return <RippleIntegrations initialSection="accounts" onNavigate={navigate} onNewProfile={() => setShowWizard(true)} onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} />;
+        return <RippleIntegrations initialSection="accounts" onNavigate={navigate} onNewProfile={() => setShowWizard(true)} onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} selectedProfileId={selectedProfileId} onSelectProfile={(profileId) => handleScopeChange('profile:' + profileId)} />;
       case 'analytics':
         return <RippleAnalytics />;
       case 'chat':
@@ -787,7 +792,7 @@ ${JSON.stringify(structured, null, 2)}
           onAiNewSession={handleContentNewSession}
           onAiResend={(userIndex, displayText, attachments, legacyAgentText, injection) => { if (activeSession) handleResend(activeSession.id, userIndex, displayText, attachments, legacyAgentText, injection); }} />;
       case 'integrations':
-        return <RippleIntegrations onNavigate={navigate} onNewProfile={() => setShowWizard(true)} onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} />;
+        return <RippleIntegrations onNavigate={navigate} onNewProfile={() => setShowWizard(true)} onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} selectedProfileId={selectedProfileId} onSelectProfile={(profileId) => handleScopeChange('profile:' + profileId)} />;
       case 'trends':
         return <TrendsPage onOpenIdeas={(seed) => { try { sessionStorage.setItem('ripple_idea_seed', JSON.stringify(seed)); } catch { /* ignore */ } navigate('ideas'); }} onBreakdown={handleBreakdown} />;
       case 'campaigns':
@@ -816,20 +821,22 @@ ${JSON.stringify(structured, null, 2)}
       case 'outputs':
         return <OutputsPage />;
       case 'profile':
-        return <ProfilePage persona={selectedPersona} onNewProfile={() => setShowWizard(true)} onDeleted={handleProfileDeleted} />;
+        return <ProfilePage persona={selectedPersona} onNewProfile={() => setShowWizard(true)} onDeleted={handleProfileDeleted} onDirtyChange={setProfileDirty} />;
       default:
         return null;
     }
   };
 
   const handlePersonaChange = useCallback((persona: string) => {
+    if (profileDirty && currentPage === 'profile' && !window.dispatchEvent(new CustomEvent('ripple:before-navigate', { cancelable: true }))) return;
     setSelectedPersona(persona);
     setSelectedTarget('');
     savePersonaSelection(persona);
     saveTargetSelection('');
-  }, []);
+  }, [currentPage, profileDirty]);
 
   const handleScopeChange = useCallback((scope: string) => {
+    if (profileDirty && currentPage === 'profile' && !window.dispatchEvent(new CustomEvent('ripple:before-navigate', { cancelable: true }))) return;
     if (scope === '__new__') { setShowWizard(true); return; }
     if (scope === 'generic') {
       setSelectedPersona(''); setSelectedTarget('');
@@ -860,7 +867,7 @@ ${JSON.stringify(structured, null, 2)}
       setSelectedPersona(persona); setSelectedTarget(targetKey);
       savePersonaSelection(persona); saveTargetSelection(targetKey);
     }
-  }, [profileContext]);
+  }, [profileContext, currentPage, profileDirty]);
   const activeSessionScopeKey = activeSession?.workScope ? activeSession.workScope.targetKind + ':' + activeSession.workScope.accountId : '';
   const sessionScopeMismatch = !!activeSession && (activeSession.workScope
     ? selectedTarget !== activeSessionScopeKey
@@ -893,7 +900,6 @@ ${JSON.stringify(structured, null, 2)}
         onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }}
         onManageAccounts={() => {
           const url = new URL(location.href);
-          url.searchParams.set('page', 'integrations');
           url.searchParams.set('section', 'accounts');
           history.pushState({}, '', url);
           setCurrentPage('integrations');

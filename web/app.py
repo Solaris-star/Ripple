@@ -43,7 +43,7 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from ripple.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
-from ripple.content_profiles import ContentProfileService
+from ripple.content_profiles import ContentProfileService, validate_profile_storage_name
 from ripple.agent_runtime import AgentRuntimeError, AgentRuntimeManager, AgentToolBridgeConfig
 from ripple.agent_profiles import AgentProfileRegistry
 from ripple.agent_tool_bridge import AgentToolLease, RippleAgentToolBridge, install_agent_tool_bridge
@@ -1893,6 +1893,7 @@ class ProfileAnalysisCreateRequest(BaseModel):
     samples: list[dict[str, Any]] = Field(default_factory=list, max_length=40)
     use_account_history: bool = False
     history_limit: int = Field(default=30, ge=1, le=30)
+    idempotency_key: str = Field(default="", max_length=128, pattern=r"^[A-Za-z0-9._-]*$")
     confirmed: bool = False
 
 
@@ -1999,7 +2000,6 @@ async def api_account_profile_binding(target_kind: str, account_id: str, req: Co
 @app.delete("/api/account-profile-bindings/{target_kind}/{account_id}")
 async def api_account_profile_unbind(target_kind: str, account_id: str):
     try:
-        _profile_target(target_kind, account_id)
         _CONTENT_PROFILES.unbind(target_kind=target_kind, account_id=account_id)
         return {"ok": True}
     except WorkflowError as exc:
@@ -2028,6 +2028,14 @@ async def api_profile_analysis_create(req: ProfileAnalysisCreateRequest):
             target_kind=req.target_kind, account_id=req.account_id,
             platform=str(target.get("platform") or ("blog" if req.target_kind == "blog" else "")),
         )
+        current_binding = _CONTENT_PROFILES.binding(target_kind=req.target_kind, account_id=req.account_id)
+        base_profile_revision = 0
+        if req.profile_id:
+            profile = _CONTENT_PROFILES.get_profile(req.profile_id)
+            base_profile_revision = int(profile["current_revision"])
+            if current_binding and current_binding["profile_id"] != req.profile_id:
+                raise WorkflowError("该账号当前关联了其他画像，请刷新账号范围后重试。", 409)
+
         samples = []
         for row in req.samples[:40]:
             if not isinstance(row, dict):
@@ -2065,11 +2073,8 @@ async def api_profile_analysis_create(req: ProfileAnalysisCreateRequest):
                 )
                 if title:
                     samples.append({
-                        "title": title,
-                        "body": body[:2000],
-                        "url": url,
-                        "published_at": "",
-                        "kind": "account_history_title_only",
+                        "title": title, "body": body[:2000], "url": url,
+                        "published_at": "", "kind": "account_history_title_only",
                     })
 
         deduped = []
@@ -2082,16 +2087,27 @@ async def api_profile_analysis_create(req: ProfileAnalysisCreateRequest):
             deduped.append(sample)
         samples = deduped[:40]
 
+        request_digest = ""
+        if req.idempotency_key:
+            request_digest = hashlib.sha256(
+                f"{req.target_kind}|{req.account_id}|{req.idempotency_key}".encode("utf-8")
+            ).hexdigest()
+        model = {
+            "mode": "agent_proposal",
+            "display_name": req.display_name,
+            "history_used": history_used,
+            "history_limit": req.history_limit if history_used else 0,
+            "base_profile_revision": base_profile_revision,
+            "base_binding_revision": int((current_binding or {}).get("binding_revision") or 0),
+            "base_binding_profile_id": str((current_binding or {}).get("profile_id") or ""),
+            "base_overrides": dict((current_binding or {}).get("overrides") or {}),
+        }
         run = _CONTENT_PROFILES.create_analysis(
             target_kind=req.target_kind, account_id=req.account_id, profile_id=req.profile_id,
-            capability=capability, samples=samples,
-            model={
-                "mode": "agent_proposal",
-                "display_name": req.display_name,
-                "history_used": history_used,
-                "history_limit": req.history_limit if history_used else 0,
-            },
+            capability=capability, samples=samples, model=model, request_digest=request_digest,
         )
+        if run.get("reused"):
+            return run
         if not samples:
             return _CONTENT_PROFILES.set_analysis_status(
                 run["id"], "waiting_user",
@@ -2101,12 +2117,13 @@ async def api_profile_analysis_create(req: ProfileAnalysisCreateRequest):
             return _CONTENT_PROFILES.set_analysis_status(
                 run["id"], "waiting_user", error="Agent 模型尚未配置；样本已保存，可稍后重新分析。"
             )
+        running = _CONTENT_PROFILES.set_analysis_status(run["id"], "running")
         threading.Thread(
             target=_profile_analysis_worker,
             args=(run["id"], target, samples, req.profile_id),
             daemon=True,
         ).start()
-        return _CONTENT_PROFILES.set_analysis_status(run["id"], "running")
+        return running
     except WorkflowError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
 
@@ -2125,22 +2142,55 @@ async def api_profile_analysis_apply(run_id: str, req: ProfileAnalysisApplyReque
         run = _CONTENT_PROFILES.get_analysis(run_id)
         if run["status"] != "succeeded" or not run.get("proposal"):
             raise WorkflowError("画像分析尚未形成可应用提案。", 409)
+        model = dict(run.get("model") or {})
+        base_profile_id = str(run.get("profile_id") or "")
+        base_profile_revision = int(model.get("base_profile_revision") or 0)
+        base_binding_revision = int(model.get("base_binding_revision") or 0)
+        base_binding_profile_id = str(model.get("base_binding_profile_id") or "")
+        current_binding = _CONTENT_PROFILES.binding(
+            target_kind=run["target_kind"], account_id=run["account_id"]
+        )
+        current_binding_revision = int((current_binding or {}).get("binding_revision") or 0)
+        current_binding_profile_id = str((current_binding or {}).get("profile_id") or "")
+        if current_binding_revision != base_binding_revision or current_binding_profile_id != base_binding_profile_id:
+            raise WorkflowError("账号画像关联已在分析期间变化，请重新分析后再应用。", 409)
+
         files = dict(run["proposal"].get("files") or {})
-        if req.profile_id:
+        if base_profile_id:
+            if req.profile_id and req.profile_id != base_profile_id:
+                raise WorkflowError("该提案只能应用到分析时选定的画像。", 409)
+            profile_before = _CONTENT_PROFILES.get_profile(base_profile_id)
+            if int(profile_before["current_revision"]) != base_profile_revision:
+                raise WorkflowError("画像已在分析期间更新，请重新分析后再应用。", 409)
+            if req.expected_revision not in {0, base_profile_revision}:
+                raise WorkflowError("画像版本与分析基线不一致，请刷新后重试。", 409)
+            if profile_before.get("files", {}).get("preferences.md"):
+                files["preferences.md"] = profile_before["files"]["preferences.md"]
             profile = _CONTENT_PROFILES.save_revision(
-                req.profile_id, files, source="agent_analysis",
-                expected_revision=req.expected_revision, note="用户确认账号样本分析提案。", confirm=True,
+                base_profile_id, files, source="agent_analysis",
+                expected_revision=base_profile_revision, note="用户确认账号样本分析提案。", confirm=True,
             )
         else:
-            name = req.display_name or str(run.get("model", {}).get("display_name") or "").strip()
+            if req.profile_id:
+                raise WorkflowError("新画像提案不能直接覆盖已有画像。", 409)
+            name = req.display_name or str(model.get("display_name") or "").strip()
             if not name:
                 raise WorkflowError("请为新画像填写名称。", 422)
             profile = _CONTENT_PROFILES.create_profile(name, files, source="agent_analysis")
+
         binding = None
         if req.bind_target:
-            binding = _CONTENT_PROFILES.bind(
-                target_kind=run["target_kind"], account_id=run["account_id"], profile_id=profile["id"],
-            )
+            _profile_target(run["target_kind"], run["account_id"])
+            if current_binding and current_binding["profile_id"] == profile["id"]:
+                binding = _CONTENT_PROFILES.binding(
+                    target_kind=run["target_kind"], account_id=run["account_id"]
+                )
+            else:
+                binding = _CONTENT_PROFILES.bind(
+                    target_kind=run["target_kind"], account_id=run["account_id"], profile_id=profile["id"],
+                    overrides=dict((current_binding or {}).get("overrides") or model.get("base_overrides") or {}),
+                    expected_binding_revision=current_binding_revision if current_binding else None,
+                )
         return {"profile": profile, "binding": binding}
     except WorkflowError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
@@ -3430,42 +3480,20 @@ class ProfileBuildRequest(BaseModel):
 
 @app.post("/api/profile/build")
 async def api_profile_build(req: ProfileBuildRequest):
-    """首次引导：表单 → 写基线画像（确定性，秒可用）→ **后台**跑 agent 分析社媒链接增强。
-
-    改异步：立即返回（基线已写、画像即可用），避免 agent 增强(~2min)阻塞请求被 code-server
-    代理超时掐断（前端曾因此报 API 400）。前端轮询 /api/profile/build/status/{name} 看增强进度。
-    """
-    name = (req.name or '').strip()  # 自动去掉首尾空格
-    if not name:
-        raise HTTPException(400, '画像名不能为空（去掉首尾空格后为空，请输入有效名称）')
-    if '/' in name or '\\' in name:
-        raise HTTPException(400, '画像名不能包含 / 或 \\ 字符，请改掉后重试')
-    if name.startswith(('.', '_')):
-        raise HTTPException(400, '画像名不能以 . 或 _ 开头，请换个开头')
-    pd = PROFILES_DIR / name
-    if pd.exists():
-        raise HTTPException(409, f'画像「{name}」已存在，请换一个名字')
-    _write_baseline_profile(name, req.form or {})
-    _CONTENT_PROFILES.sync_legacy_profiles()
-    if os.environ.get("RIPPLE_ENABLE_AI") != "1":
-        return {'created': pd.is_dir(), 'name': name, 'async': False,
-                'status': 'done', 'log': '手动画像已保存；AI 增强未启用。'}
-    instruction = _form_to_instruction(name, req.form or {})
-    msg = (f"请执行 /skill-profile-builder 完善已存在的画像「{name}」。用户已通过表单提供以下信息，我已按此写好 profiles/{name}"
-           f"/ 的基线六维文件。请：①尽力抓取用户给的社媒链接分析已发内容/风格/受众（抓不到就降级，标注[待补充]，勿臆造）②据分析结果润色/补全各维度文件 ③给出一句话完成度摘要。表单信息如下：\n\n{instruction}")
-
-    _write_profile_status(name, 'running', 'AI 正在分析并增强画像…')
-
-    def _enhance() -> None:
-        try:
-            log = run_agent_sync(msg, TIMEOUT_PRODUCE, skill_ids=["skill-profile-builder"])
-            _write_profile_status(name, 'done', log)
-        except Exception as e:  # noqa: BLE001
-            _write_profile_status(name, 'failed', f'AI 增强失败（基线画像已可用）：{e}')
-
-    threading.Thread(target=_enhance, daemon=True).start()
-    # 基线已写、画像立即可用；增强在后台，前端轮询状态
-    return {'created': pd.is_dir(), 'name': name, 'async': True, 'status': 'running'}
+    """Create one confirmed manual baseline; AI enhancement remains an explicit proposal."""
+    try:
+        name = validate_profile_storage_name((req.name or "").strip())
+        profile = _CONTENT_PROFILES.create_profile(
+            name, _baseline_profile_files(req.form or {}), source="onboarding_manual",
+        )
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    log = "手动画像已保存。AI 增强只生成可审阅建议；请在设置 → 账号中使用 Agent 分析。"
+    _write_profile_status(name, "done", log)
+    return {
+        "created": True, "name": profile["legacy_name"], "profile_id": profile["id"],
+        "revision": profile["current_revision"], "async": False, "status": "done", "log": log,
+    }
 
 
 def _profile_status_file(name: str) -> Path:
@@ -3513,16 +3541,14 @@ def _form_to_instruction(name: str, form: dict) -> str:
             f"\n期望调性：{g('tone')}\n不做的内容/红线：{g('avoid')}\n")
 
 
-def _write_baseline_profile(name: str, form: dict) -> None:
-    """从表单确定性生成六维基线文件。链接派生字段标 [待 AI 分析]。"""
-    pd = PROFILES_DIR / name
-    pd.mkdir(parents=True, exist_ok=True)
-
+def _baseline_profile_files(form: dict) -> dict[str, str]:
+    """Build the six manual baseline files in memory; no model or filesystem side effects."""
     def g(k: str, default: str = '') -> str:
         v = form.get(k)
         if isinstance(v, list):
             return '、'.join(str(x) for x in v)
         return str(v).strip() if v not in (None, '') else default
+
     direction = g('direction') or '[待补充]'
     reason = g('reason') or '[待补充]'
     goal = g('goal')
@@ -3532,30 +3558,45 @@ def _write_baseline_profile(name: str, form: dict) -> None:
     avoid = g('avoid')
     platforms = form.get('platforms') or []
     links = form.get('links') or {}
-    (pd / 'identity.md').write_text(
-        f"# 身份定位\n\n## 我是谁\n\n{direction}\n\n## 差异化\n\n{reason}\n\n## 内容方向\n\n{direction}"
-        f"{'（形式：' + formats + '）' if formats else ''}\n"
-        f"{'运营目标：' + goal if goal else ''}\n",
-        encoding='utf-8')
-    (pd / 'style.md').write_text(
-        f"# 内容风格\n\n## 语气\n\n{tone}\n\n## 开头结构\n\n[待 AI 分析已发内容]\n\n## 视觉风格\n\n[待 AI 分析]\n\n## 内容节奏\n\n{formats or '[待补充]'}\n\n## 标志性元素\n\n[待 AI 分析]\n",
-        encoding='utf-8')
-    (pd / 'audience.md').write_text(
-        '# 目标受众\n\n## 核心人群\n\n[待 AI 分析/待补充]\n\n## 兴趣标签\n\n[待补充]\n\n## 痛点\n\n[待补充]\n\n## 互动特征\n\n[待 AI 分析已发内容]\n',
-        encoding='utf-8')
     plat_lines = []
-    for p in platforms:
-        url = links.get(p, '')
-        plat_lines.append(f"## {p}\n\n主页：{url or '[待补充]'}\n粉丝量级 / 内容形式：[待补充]\n")
-    (pd / 'platforms.md').write_text(
-        '# 平台运营\n\n' + ('\n'.join(plat_lines) if plat_lines else '[待补充]\n'),
-        encoding='utf-8')
-    (pd / 'preferences.md').write_text(
-        f"# 偏好与红线\n\n## 要做的\n\n{direction}\n\n## 不做的\n\n{avoid or '[待补充]'}\n\n## 合规底线\n\n{avoid or '[待补充]'}\n",
-        encoding='utf-8')
-    (pd / 'memory.md').write_text(
-        f"# 经验沉淀\n\n## 内容洞察\n\n{'喜欢的内容/对标：' + likes if likes else '[待 AI 分析已收藏/点赞]'}\n\n## 踩过的坑\n\n[待积累]\n",
-        encoding='utf-8')
+    for platform in platforms:
+        url = links.get(platform, '')
+        plat_lines.append(f"## {platform}\n\n主页：{url or '[待补充]'}\n粉丝量级 / 内容形式：[待补充]\n")
+
+    return {
+        'identity.md': (
+            f"# 身份定位\n\n## 我是谁\n\n{direction}\n\n## 差异化\n\n{reason}\n\n## 内容方向\n\n{direction}"
+            f"{'（形式：' + formats + '）' if formats else ''}\n"
+            f"{'运营目标：' + goal if goal else ''}\n"
+        ),
+        'style.md': (
+            f"# 内容风格\n\n## 语气\n\n{tone}\n\n## 开头结构\n\n[待 AI 分析已发内容]\n\n"
+            f"## 视觉风格\n\n[待 AI 分析]\n\n## 内容节奏\n\n{formats or '[待补充]'}\n\n"
+            "## 标志性元素\n\n[待 AI 分析]\n"
+        ),
+        'audience.md': (
+            '# 目标受众\n\n## 核心人群\n\n[待 AI 分析/待补充]\n\n## 兴趣标签\n\n[待补充]\n\n'
+            '## 痛点\n\n[待补充]\n\n## 互动特征\n\n[待 AI 分析已发内容]\n'
+        ),
+        'platforms.md': '# 平台运营\n\n' + ('\n'.join(plat_lines) if plat_lines else '[待补充]\n'),
+        'preferences.md': (
+            f"# 偏好与红线\n\n## 要做的\n\n{direction}\n\n## 不做的\n\n{avoid or '[待补充]'}\n\n"
+            f"## 合规底线\n\n{avoid or '[待补充]'}\n"
+        ),
+        'memory.md': (
+            f"# 经验沉淀\n\n## 内容洞察\n\n{'喜欢的内容/对标：' + likes if likes else '[待 AI 分析已收藏/点赞]'}\n\n"
+            "## 踩过的坑\n\n[待积累]\n"
+        ),
+    }
+
+
+def _write_baseline_profile(name: str, form: dict) -> None:
+    """Compatibility helper for deterministic tests/tools; API creation uses ContentProfileService."""
+    name = validate_profile_storage_name(name)
+    directory = PROFILES_DIR / name
+    directory.mkdir(parents=True, exist_ok=True)
+    for filename, content in _baseline_profile_files(form).items():
+        (directory / filename).write_text(content, encoding='utf-8')
 
 
 def _parse_profile_analysis_result(raw: str, current_files: dict[str, str]) -> dict:

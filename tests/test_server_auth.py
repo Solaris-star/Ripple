@@ -126,6 +126,14 @@ def test_member_cannot_mutate_control_plane(tmp_path, monkeypatch):
                 ("post", "/api/ripple/accounts", {"platform": "x", "label": "blocked", "idempotency_key": "blocked-member-account"}),
                 ("post", "/api/ripple/wechat/connect", {"label": "blocked", "app_id": "wx1234567890abcdef", "app_secret": "blocked-secret", "confirmed": True}),
                 ("post", "/api/ripple/blog/connectors", {"label": "blocked", "openapi_url": "https://example.com/openapi.json", "token": "blocked", "confirmed": True}),
+                ("put", "/api/account-profile-bindings/account/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", {"profile_id": "cp_12345678"}),
+                ("post", "/api/profile-analysis/pa_fixture/apply", {"profile_id": "cp_12345678", "expected_revision": 1, "bind_target": True}),
+                ("post", "/api/profile-analysis", {"target_kind": "account", "account_id": "a" * 32, "samples": [{"title": "blocked"}], "confirmed": True}),
+                ("put", "/api/content-profiles/cp_12345678/revision", {"expected_revision": 1, "files": {"identity.md": "blocked"}, "confirm": True}),
+                ("patch", "/api/content-profiles/cp_12345678", {"display_name": "blocked"}),
+                ("post", "/api/content-profiles/cp_12345678/copy", {"display_name": "blocked copy"}),
+                ("post", "/api/profile/build", {"name": "blocked-profile", "form": {}}),
+                ("put", "/api/persona/blocked/file", {"filename": "identity.md", "content": "blocked"}),
             ]
             for method, path, body in admin_only_requests:
                 blocked = member.request(method, path, headers=csrf_headers(member), json=body)

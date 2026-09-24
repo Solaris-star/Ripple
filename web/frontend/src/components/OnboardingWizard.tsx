@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { buildProfile, profileBuildStatus } from '../lib/api';
+import { useState } from 'react';
+import { buildProfile } from '../lib/api';
 import { PlatformIcon } from './PlatformBrand';
 
 const PLATFORMS = ['小红书', '抖音', 'B站', '视频号', '公众号', '微博', '知乎'];
@@ -35,7 +35,6 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<FormState>(EMPTY);
   const [submitting, setSubmitting] = useState(false);
-  const [phase, setPhase] = useState<'form' | 'enhancing'>('form');
   const [error, setError] = useState('');
 
   const set = <K extends keyof FormState>(k: K, v: FormState[K]) =>
@@ -58,11 +57,11 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
     setSubmitting(true);
     setError('');
     try {
-      // 后端异步：立即返回（基线已写、画像可用），不再长阻塞被代理超时掐断
-      const res = await buildProfile(form.name.trim(), form as unknown as Record<string, unknown>);
+      const name = form.name.trim();
+      const res = await buildProfile(name, form as unknown as Record<string, unknown>);
       if (res.created) {
         setSubmitting(false);
-        setPhase('enhancing'); // 进入后台增强等待（可跳过）
+        onCreated(name);
       } else {
         setError('画像创建失败，请重试');
         setSubmitting(false);
@@ -72,28 +71,6 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
       setSubmitting(false);
     }
   };
-
-  // 增强阶段：轮询后台 AI 增强进度；完成/失败即进入画像（基线已可用）
-  useEffect(() => {
-    if (phase !== 'enhancing') return;
-    let alive = true;
-    const name = form.name.trim();
-    const tick = async () => {
-      try {
-        const st = await profileBuildStatus(name);
-        if (!alive) return;
-        if (st.state === 'done' || st.state === 'failed' || st.state === 'unknown') {
-          onCreated(name);
-          return;
-        }
-      } catch {
-        /* 轮询失败忽略，继续 */
-      }
-      if (alive) setTimeout(tick, 5000);
-    };
-    const t = setTimeout(tick, 4000);
-    return () => { alive = false; clearTimeout(t); };
-  }, [phase]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const box: React.CSSProperties = {
     width: '100%', padding: '10px 12px', marginTop: 6, borderRadius: 'var(--radius)',
@@ -131,18 +108,6 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
           <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--text-secondary)' }}>
             <div className="spinner" style={{ margin: '0 auto 16px' }} />
             正在创建画像基线…
-          </div>
-        ) : phase === 'enhancing' ? (
-          <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-secondary)' }}>
-            <div className="spinner" style={{ margin: '0 auto 16px' }} />
-            <div style={{ color: 'var(--text)', fontSize: 15, marginBottom: 6 }}>画像已创建 ✓　AI 正在后台增强…</div>
-            <span style={{ fontSize: 12 }}>
-              正在尝试抓取社媒链接并完善各维度，可能需要 1-2 分钟。<br />
-              也可以现在就进去用，增强会在后台继续。
-            </span>
-            <div style={{ marginTop: 20 }}>
-              <button className="btn btn-primary" onClick={() => onCreated(form.name.trim())}>先进去用</button>
-            </div>
           </div>
         ) : (
           <div style={{ minHeight: 240 }}>
@@ -224,7 +189,7 @@ export default function OnboardingWizard({ onClose, onCreated }: OnboardingWizar
         )}
 
         {/* 底部按钮 */}
-        {phase === 'form' && !submitting && (
+        {!submitting && (
           <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 20 }}>
             <button className="btn" onClick={() => (step === 0 ? onClose() : setStep(step - 1))}>
               {step === 0 ? '取消' : '上一步'}

@@ -7,6 +7,7 @@ interface ProfilePageProps {
   persona: string;
   onNewProfile: () => void;
   onDeleted: (name: string) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }
 
 const DIM_META: Record<string, { label: string; icon: string }> = {
@@ -18,7 +19,7 @@ const DIM_META: Record<string, { label: string; icon: string }> = {
   'memory.md': { label: '经验沉淀', icon: '🧠' },
 };
 
-export default function ProfilePage({ persona, onNewProfile, onDeleted }: ProfilePageProps) {
+export default function ProfilePage({ persona, onNewProfile, onDeleted, onDirtyChange }: ProfilePageProps) {
   const [files, setFiles] = useState<PersonaFile[]>([]);
   const [contentProfile, setContentProfile] = useState<ContentProfileDetail | null>(null);
   const [displayName, setDisplayName] = useState('');
@@ -61,13 +62,26 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
 
   const dirty = files.some((file) => (drafts[file.filename] ?? '') !== file.content);
   const nameDirty = !!contentProfile && displayName.trim() !== contentProfile.display_name;
+  const hasUnsavedChanges = dirty || nameDirty;
 
   useEffect(() => {
-    if (!dirty && !nameDirty) return;
-    const guard = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
-    window.addEventListener('beforeunload', guard);
-    return () => window.removeEventListener('beforeunload', guard);
-  }, [dirty, nameDirty]);
+    onDirtyChange?.(hasUnsavedChanges);
+    return () => onDirtyChange?.(false);
+  }, [hasUnsavedChanges, onDirtyChange]);
+
+  useEffect(() => {
+    if (!hasUnsavedChanges) return;
+    const unloadGuard = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
+    const navigationGuard = (event: Event) => {
+      if (!window.confirm('还有未保存的画像修改。离开当前画像会放弃这些修改，继续吗？')) event.preventDefault();
+    };
+    window.addEventListener('beforeunload', unloadGuard);
+    window.addEventListener('ripple:before-navigate', navigationGuard);
+    return () => {
+      window.removeEventListener('beforeunload', unloadGuard);
+      window.removeEventListener('ripple:before-navigate', navigationGuard);
+    };
+  }, [hasUnsavedChanges]);
 
   const handleRename = async () => {
     if (!contentProfile || !nameDirty || !displayName.trim()) return;
@@ -164,7 +178,7 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
       <div className="profile-head">
         <div>
           {editing ? <div className="profile-name-edit"><input aria-label="画像显示名称" maxLength={120} value={displayName} onChange={(e) => setDisplayName(e.target.value)} /><button className="btn btn-sm" disabled={!nameDirty || saving || !displayName.trim()} onClick={() => void handleRename()}>保存名称</button></div> : <h1 className="page-title">{contentProfile?.display_name || persona}</h1>}
-          <p className="page-subtitle">账号画像 · {contentProfile ? `V${contentProfile.current_revision}` : '读取中'} · {contentProfile?.bindings.length || 0} 个关联账号{dirty || nameDirty ? ' · 有未保存修改' : ''}</p>
+          <p className="page-subtitle">账号画像 · {contentProfile ? `V${contentProfile.current_revision}` : '读取中'} · {contentProfile?.bindings.length || 0} 个关联账号{hasUnsavedChanges ? ' · 有未保存修改' : ''}</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
           {editing && <button className="btn btn-primary" disabled={!dirty || saving || !contentProfile} onClick={() => void handleSave()}>{saving ? '保存中…' : dirty ? '保存并确认生效' : '没有修改'}</button>}

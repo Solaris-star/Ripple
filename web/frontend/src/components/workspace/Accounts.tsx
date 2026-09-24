@@ -36,7 +36,7 @@ function LoginUrlRow({ label, value, open, onCopy }: { label: string; value: str
   return <div className="r2-login-url-row"><span>{label}</span><code title={value}>{value}</code><div><button type="button" className="r2-text-button" aria-label={`复制${label}`} onClick={() => onCopy(value, label)}>复制</button>{open && <a className="r2-text-button" aria-label={`打开${label}`} href={value} target="_blank" rel="noopener noreferrer">打开 ↗</a>}</div></div>;
 }
 
-export default function Accounts({ onNavigate, onNewProfile = () => {}, onEditProfile = () => {}, embedded = false }: { onNavigate: (page: Page) => void; onNewProfile?: () => void; onEditProfile?: (name: string) => void; embedded?: boolean }) {
+export default function Accounts({ onNavigate, onNewProfile = () => {}, onEditProfile = () => {}, selectedProfileId = '', onSelectProfile = () => {}, embedded = false }: { onNavigate: (page: Page) => void; onNewProfile?: () => void; onEditProfile?: (name: string) => void; selectedProfileId?: string; onSelectProfile?: (profileId: string) => void; embedded?: boolean }) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [blogs, setBlogs] = useState<BlogConnector[]>([]);
@@ -282,7 +282,7 @@ export default function Accounts({ onNavigate, onNewProfile = () => {}, onEditPr
   return <div className={embedded ? 'r2-account-settings' : 'page-scroll r2-page'}>
     {!embedded && <Header title="账号" subtitle="管理平台账号、账号画像与 Blog 连接"><span className="r2-environment">浏览器 {status?.environment.browser ? browserLabel(status.environment.browser) : '未检测到'} · B站发布 {status?.environment.biliup ? '可用' : '未就绪'}</span></Header>}
     <Feedback error={error} notice={notice} />{blogError && <div className="r2-inline-warning">{blogError}</div>}
-    <AccountProfileManager accounts={accounts} blogs={blogs} onNewProfile={onNewProfile} onEditProfile={onEditProfile} onBindNewAccount={beginProfileConnection} onManageConnections={openConnectionDirectory} onChanged={() => void refresh().catch(() => {})} />
+    <AccountProfileManager accounts={accounts} blogs={blogs} selectedProfileId={selectedProfileId} onSelectProfile={onSelectProfile} onNewProfile={onNewProfile} onEditProfile={onEditProfile} onBindNewAccount={beginProfileConnection} onManageConnections={openConnectionDirectory} onChanged={() => void refresh().catch(() => {})} />
     <details className="account-connection-directory" ref={connectionDirectoryRef}>
       <summary>平台连接与高级设置</summary>
       <div className="r2-account-help">X 浏览器模式使用执行设备上的 Ripple 独立 Profile。首次认证由普通 Chrome / Edge 完成人工 Google / X 登录，随后 Ripple 才用同一 Profile 检查状态和执行自动化；不会读取你日常 Chrome 的 Default / Profile 1 等现有 Profile，也不会把 Cookie 上传到 Ripple Server。<button className="r2-text-button" onClick={() => onNavigate('integrations')}>执行节点与环境设置 →</button></div>

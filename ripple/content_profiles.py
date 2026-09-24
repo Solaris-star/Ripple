@@ -15,7 +15,9 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+import os
+import shutil
 import sqlite3
 import threading
 from typing import Any
@@ -29,6 +31,27 @@ DEFAULT_WORKSPACE_ID = "00000000000000000000000000000001"
 TARGET_KINDS = {"account", "blog"}
 PROFILE_STATES = {"draft", "confirmed", "archived"}
 ANALYSIS_STATES = {"queued", "running", "waiting_user", "succeeded", "failed", "cancelled", "interrupted"}
+_ANALYSIS_TERMINAL_STATES = {"succeeded", "failed", "cancelled", "interrupted"}
+_WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+
+def validate_profile_storage_name(value: str) -> str:
+    name = str(value or "").strip()
+    win = PureWindowsPath(name)
+    stem = name.split(".", 1)[0].upper()
+    if (
+        not name or len(name) > 120 or name in {".", ".."} or name.startswith((".", "_"))
+        or name.endswith((" ", ".")) or "/" in name or "\\" in name or ":" in name
+        or win.drive or win.is_absolute() or stem in _WINDOWS_RESERVED
+    ):
+        raise WorkflowError("画像名称无效；不要使用路径、盘符或 Windows 保留名称。", 422)
+    root = PROFILES_DIR.resolve()
+    candidate = (PROFILES_DIR / name).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise WorkflowError("画像名称不能跳出画像目录。", 422) from exc
+    return name
 
 
 def _now_iso() -> str:
@@ -66,15 +89,59 @@ def _read_legacy_files(name: str) -> dict[str, str]:
 
 
 def _write_legacy_files(name: str, files: dict[str, str]) -> None:
+    name = validate_profile_storage_name(name)
     directory = PROFILES_DIR / name
     directory.mkdir(parents=True, exist_ok=True)
-    for filename, content in files.items():
-        if not filename.endswith(".md") or "/" in filename or "\\" in filename or filename.startswith("."):
-            continue
-        path = directory / filename
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(str(content), encoding="utf-8")
-        tmp.replace(path)
+    prepared: list[tuple[Path, Path, Path | None]] = []
+    replaced: list[tuple[Path, Path | None]] = []
+    try:
+        for filename, content in files.items():
+            if not filename.endswith(".md") or "/" in filename or "\\" in filename or filename.startswith("."):
+                continue
+            path = directory / filename
+            token = uuid.uuid4().hex
+            tmp = directory / f".{filename}.{token}.tmp"
+            backup = directory / f".{filename}.{token}.bak" if path.exists() else None
+            tmp.write_text(str(content), encoding="utf-8")
+            prepared.append((path, tmp, backup))
+        for path, tmp, backup in prepared:
+            if backup is not None:
+                os.replace(path, backup)
+            try:
+                os.replace(tmp, path)
+            except Exception:
+                if backup is not None and backup.exists():
+                    os.replace(backup, path)
+                raise
+            replaced.append((path, backup))
+        for _path, backup in replaced:
+            if backup is not None and backup.exists():
+                try:
+                    backup.unlink()
+                except OSError:
+                    # Backup cleanup is best-effort after every target file has been replaced.
+                    pass
+    except Exception:
+        for path, _tmp, backup in reversed(prepared):
+            try:
+                if backup is not None and backup.exists():
+                    if path.exists():
+                        path.unlink()
+                    os.replace(backup, path)
+                elif backup is None and path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        for _path, tmp, backup in prepared:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+                if backup is not None and backup.exists():
+                    backup.unlink()
+            except OSError:
+                pass
 
 
 class ContentProfileService:
@@ -151,6 +218,7 @@ class ContentProfileService:
                     sample_manifest_json TEXT NOT NULL DEFAULT '[]',
                     proposal_json TEXT NOT NULL DEFAULT '{}',
                     model_json TEXT NOT NULL DEFAULT '{}',
+                    request_digest TEXT NOT NULL DEFAULT '',
                     error TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -158,6 +226,13 @@ class ContentProfileService:
                 CREATE INDEX IF NOT EXISTS profile_analysis_runs_target_idx
                     ON profile_analysis_runs(workspace_id, target_kind, account_id, created_at DESC);
                 """
+            )
+            columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(profile_analysis_runs)").fetchall()}
+            if "request_digest" not in columns:
+                db.execute("ALTER TABLE profile_analysis_runs ADD COLUMN request_digest TEXT NOT NULL DEFAULT ''")
+            db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS profile_analysis_runs_request_idx "
+                "ON profile_analysis_runs(workspace_id, request_digest) WHERE request_digest<>''"
             )
 
     def _interrupt_runs(self) -> None:
@@ -204,22 +279,32 @@ class ContentProfileService:
         ) if PROFILES_DIR.is_dir() else []
         with self._lock, self._connect() as db:
             for name in names:
+                try:
+                    validate_profile_storage_name(name)
+                except WorkflowError:
+                    continue
                 pid = _profile_id(self.workspace_id, name)
-                current = db.execute("SELECT * FROM content_profiles WHERE legacy_name=?", (name,)).fetchone()
+                current = db.execute(
+                    "SELECT * FROM content_profiles WHERE workspace_id=? AND legacy_name=?",
+                    (self.workspace_id, name),
+                ).fetchone()
                 files = _read_legacy_files(name)
                 if current:
-                    now = _now_iso()
                     if current["state"] == "archived":
-                        db.execute(
-                            "UPDATE content_profiles SET state='confirmed',display_name=?,updated_at=? WHERE id=?",
-                            (name, now, current["id"]),
-                        )
+                        continue
                     current_revision = int(current["current_revision"])
                     stored = db.execute(
                         "SELECT files_json FROM profile_revisions WHERE profile_id=? AND revision=?",
                         (current["id"], current_revision),
                     ).fetchone()
                     if stored and _loads(stored["files_json"], {}) == files:
+                        continue
+                    encoded = _json(files)
+                    duplicate = db.execute(
+                        "SELECT revision FROM profile_revisions WHERE profile_id=? AND files_json=? ORDER BY revision DESC LIMIT 1",
+                        (current["id"], encoded),
+                    ).fetchone()
+                    if duplicate:
                         continue
                     max_revision = int(db.execute(
                         "SELECT COALESCE(MAX(revision),0) AS n FROM profile_revisions WHERE profile_id=?",
@@ -229,16 +314,8 @@ class ContentProfileService:
                     db.execute(
                         "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
                         "VALUES(?,?,?,?,?,?,?)",
-                        (current["id"], revision, _json(files), "legacy_sync", "confirmed",
-                         "检测到现有 Markdown 画像变化，已登记为兼容版本。", now),
-                    )
-                    db.execute(
-                        "UPDATE content_profiles SET current_revision=?,state='confirmed',updated_at=? WHERE id=?",
-                        (revision, now, current["id"]),
-                    )
-                    db.execute(
-                        "UPDATE account_profile_bindings SET profile_revision=?,updated_at=? WHERE profile_id=?",
-                        (revision, now, current["id"]),
+                        (current["id"], revision, encoded, "legacy_sync", "draft",
+                         "检测到外部 Markdown 变化；未自动生效，等待人工确认。", _now_iso()),
                     )
                     continue
                 now = _now_iso()
@@ -339,9 +416,7 @@ class ContentProfileService:
         return self.get_profile(profile["id"])
 
     def create_profile(self, display_name: str, files: dict[str, str], *, source: str = "manual") -> dict[str, Any]:
-        name = str(display_name or "").strip()
-        if not name or "/" in name or "\\" in name or name.startswith((".", "_")):
-            raise WorkflowError("画像名称无效。", 422)
+        name = validate_profile_storage_name(display_name)
         normalized = {
             str(filename): str(content)
             for filename, content in files.items()
@@ -349,38 +424,44 @@ class ContentProfileService:
         }
         if not normalized:
             raise WorkflowError("画像内容不能为空。", 422)
-        with self._lock, self._connect() as db:
-            existing = db.execute(
-                "SELECT * FROM content_profiles WHERE workspace_id=? AND (display_name=? OR legacy_name=?)",
-                (self.workspace_id, name, name),
-            ).fetchone()
-            if (existing and existing["state"] != "archived") or (PROFILES_DIR / name).exists():
-                raise WorkflowError(f"画像「{name}」已存在。", 409)
-            now = _now_iso()
-            if existing:
-                pid = str(existing["id"])
-                max_revision = int(db.execute(
-                    "SELECT COALESCE(MAX(revision),0) AS n FROM profile_revisions WHERE profile_id=?",
-                    (pid,),
-                ).fetchone()["n"])
-                revision = max_revision + 1
+        directory_existed = (PROFILES_DIR / name).exists()
+        try:
+            with self._lock, self._connect() as db:
+                existing = db.execute(
+                    "SELECT * FROM content_profiles WHERE workspace_id=? AND (display_name=? OR legacy_name=?)",
+                    (self.workspace_id, name, name),
+                ).fetchone()
+                if (existing and existing["state"] != "archived") or directory_existed:
+                    raise WorkflowError(f"画像「{name}」已存在。", 409)
+                now = _now_iso()
+                if existing:
+                    pid = str(existing["id"])
+                    max_revision = int(db.execute(
+                        "SELECT COALESCE(MAX(revision),0) AS n FROM profile_revisions WHERE profile_id=?",
+                        (pid,),
+                    ).fetchone()["n"])
+                    revision = max_revision + 1
+                    db.execute(
+                        "UPDATE content_profiles SET display_name=?,legacy_name=?,current_revision=?,state='confirmed',updated_at=? WHERE id=?",
+                        (name, name, revision, now, pid),
+                    )
+                else:
+                    pid = "cp_" + uuid.uuid4().hex[:24]
+                    revision = 1
+                    db.execute(
+                        "INSERT INTO content_profiles(id,workspace_id,display_name,legacy_name,current_revision,state,created_at,updated_at) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (pid, self.workspace_id, name, name, revision, "confirmed", now, now),
+                    )
                 db.execute(
-                    "UPDATE content_profiles SET display_name=?,legacy_name=?,current_revision=?,state='confirmed',updated_at=? WHERE id=?",
-                    (name, name, revision, now, pid),
+                    "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (pid, revision, _json(normalized), source[:40], "confirmed", "新建账号画像。", now),
                 )
-            else:
-                pid = "cp_" + uuid.uuid4().hex[:24]
-                revision = 1
-                db.execute(
-                    "INSERT INTO content_profiles(id,workspace_id,display_name,legacy_name,current_revision,state,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (pid, self.workspace_id, name, name, revision, "confirmed", now, now),
-                )
-            db.execute(
-                "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) VALUES(?,?,?,?,?,?,?)",
-                (pid, revision, _json(normalized), source[:40], "confirmed", "新建账号画像。", now),
-            )
-        _write_legacy_files(name, normalized)
+                _write_legacy_files(name, normalized)
+        except Exception:
+            if not directory_existed:
+                shutil.rmtree(PROFILES_DIR / name, ignore_errors=True)
+            raise
         return self.get_profile(pid)
 
     def rename_profile(self, profile_id: str, display_name: str) -> dict[str, Any]:
@@ -432,36 +513,43 @@ class ContentProfileService:
             raise WorkflowError("画像内容不能为空。", 422)
         now = _now_iso()
         status = "confirmed" if confirm else "draft"
-        with self._lock, self._connect() as db:
-            current = db.execute(
-                "SELECT current_revision FROM content_profiles WHERE id=? AND workspace_id=?",
-                (profile_id, self.workspace_id),
-            ).fetchone()
-            if not current:
-                raise WorkflowError("账号画像不存在。", 404)
-            if int(current["current_revision"]) != int(expected_revision):
-                raise WorkflowError("画像已被修改，请刷新后重试。", 409)
-            max_revision = int(db.execute(
-                "SELECT COALESCE(MAX(revision),0) AS n FROM profile_revisions WHERE profile_id=?",
-                (profile_id,),
-            ).fetchone()["n"])
-            revision = max(int(expected_revision), max_revision) + 1
-            db.execute(
-                "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (profile_id, revision, _json(normalized), source[:40], status, note[:500], now),
-            )
+        try:
+            with self._lock, self._connect() as db:
+                current = db.execute(
+                    "SELECT current_revision FROM content_profiles WHERE id=? AND workspace_id=?",
+                    (profile_id, self.workspace_id),
+                ).fetchone()
+                if not current:
+                    raise WorkflowError("账号画像不存在。", 404)
+                if int(current["current_revision"]) != int(expected_revision):
+                    raise WorkflowError("画像已被修改，请刷新后重试。", 409)
+                max_revision = int(db.execute(
+                    "SELECT COALESCE(MAX(revision),0) AS n FROM profile_revisions WHERE profile_id=?",
+                    (profile_id,),
+                ).fetchone()["n"])
+                revision = max(int(expected_revision), max_revision) + 1
+                db.execute(
+                    "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (profile_id, revision, _json(normalized), source[:40], status, note[:500], now),
+                )
+                if confirm:
+                    db.execute(
+                        "UPDATE content_profiles SET current_revision=?,updated_at=? WHERE id=?",
+                        (revision, now, profile_id),
+                    )
+                    db.execute(
+                        "UPDATE account_profile_bindings SET profile_revision=?,updated_at=? WHERE profile_id=?",
+                        (revision, now, profile_id),
+                    )
+                    _write_legacy_files(profile["legacy_name"], normalized)
+        except Exception:
             if confirm:
-                db.execute(
-                    "UPDATE content_profiles SET current_revision=?,updated_at=? WHERE id=?",
-                    (revision, now, profile_id),
-                )
-                db.execute(
-                    "UPDATE account_profile_bindings SET profile_revision=?,updated_at=? WHERE profile_id=?",
-                    (revision, now, profile_id),
-                )
-        if confirm:
-            _write_legacy_files(profile["legacy_name"], normalized)
+                try:
+                    _write_legacy_files(profile["legacy_name"], dict(profile.get("files") or {}))
+                except Exception:
+                    pass
+            raise
         return self.get_profile(profile_id)
 
     def bind(
@@ -626,28 +714,44 @@ class ContentProfileService:
         capability: dict[str, Any] | None = None,
         samples: list[dict[str, Any]] | None = None,
         model: dict[str, Any] | None = None,
+        request_digest: str = "",
     ) -> dict[str, Any]:
         if target_kind not in TARGET_KINDS:
             raise WorkflowError("不支持的账号类型。", 422)
         if profile_id:
             self.get_profile(profile_id)
-        run_id = "pa_" + uuid.uuid4().hex
-        now = _now_iso()
+        request_digest = str(request_digest or "")[:128]
+        existing_id = ""
+        reused = False
         with self._lock, self._connect() as db:
-            db.execute(
-                """
-                INSERT INTO profile_analysis_runs(
-                    id,workspace_id,target_kind,account_id,profile_id,status,
-                    capability_json,sample_manifest_json,proposal_json,model_json,error,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    run_id, self.workspace_id, target_kind, account_id, profile_id,
-                    "waiting_user", _json(capability or {}), _json(samples or []), "{}",
-                    _json(model or {}), "", now, now,
-                ),
-            )
-        return self.get_analysis(run_id)
+            if request_digest:
+                existing = db.execute(
+                    "SELECT id FROM profile_analysis_runs WHERE workspace_id=? AND request_digest=?",
+                    (self.workspace_id, request_digest),
+                ).fetchone()
+                if existing:
+                    existing_id = str(existing["id"])
+                    reused = True
+            if not existing_id:
+                run_id = "pa_" + uuid.uuid4().hex
+                now = _now_iso()
+                db.execute(
+                    """
+                    INSERT INTO profile_analysis_runs(
+                        id,workspace_id,target_kind,account_id,profile_id,status,
+                        capability_json,sample_manifest_json,proposal_json,model_json,request_digest,error,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        run_id, self.workspace_id, target_kind, account_id, profile_id,
+                        "waiting_user", _json(capability or {}), _json(samples or []), "{}",
+                        _json(model or {}), request_digest, "", now, now,
+                    ),
+                )
+                existing_id = run_id
+        result = self.get_analysis(existing_id)
+        result["reused"] = reused
+        return result
 
     def get_analysis(self, run_id: str) -> dict[str, Any]:
         with self._connect() as db:
@@ -669,6 +773,7 @@ class ContentProfileService:
             "samples": _loads(value["sample_manifest_json"], []),
             "proposal": _loads(value["proposal_json"], {}),
             "model": _loads(value["model_json"], {}),
+            "request_digest": str(value.get("request_digest") or ""),
             "error": value["error"],
             "created_at": value["created_at"],
             "updated_at": value["updated_at"],
@@ -678,24 +783,36 @@ class ContentProfileService:
         if status not in ANALYSIS_STATES:
             raise WorkflowError("画像分析状态无效。", 422)
         with self._lock, self._connect() as db:
-            cur = db.execute(
+            current = db.execute(
+                "SELECT status FROM profile_analysis_runs WHERE id=? AND workspace_id=?",
+                (run_id, self.workspace_id),
+            ).fetchone()
+            if not current:
+                raise WorkflowError("画像分析任务不存在。", 404)
+            current_status = str(current["status"])
+            if current_status in _ANALYSIS_TERMINAL_STATES:
+                return self.get_analysis(run_id)
+            db.execute(
                 "UPDATE profile_analysis_runs SET status=?,error=?,updated_at=? WHERE id=? AND workspace_id=?",
                 (status, error[:1200], _now_iso(), run_id, self.workspace_id),
             )
-            if not cur.rowcount:
-                raise WorkflowError("画像分析任务不存在。", 404)
         return self.get_analysis(run_id)
 
     def save_analysis_proposal(self, run_id: str, proposal: dict[str, Any], *, error: str = "") -> dict[str, Any]:
         with self._lock, self._connect() as db:
             current = db.execute(
-                "SELECT id FROM profile_analysis_runs WHERE id=? AND workspace_id=?",
+                "SELECT status FROM profile_analysis_runs WHERE id=? AND workspace_id=?",
                 (run_id, self.workspace_id),
             ).fetchone()
             if not current:
                 raise WorkflowError("画像分析任务不存在。", 404)
+            current_status = str(current["status"])
+            if current_status == "succeeded":
+                return self.get_analysis(run_id)
+            if current_status in {"cancelled", "interrupted"}:
+                raise WorkflowError("画像分析任务已结束，不能再写入提案。", 409)
             db.execute(
-                "UPDATE profile_analysis_runs SET status=?,proposal_json=?,error=?,updated_at=? WHERE id=?",
-                ("succeeded" if proposal else "failed", _json(proposal), error[:1200], _now_iso(), run_id),
+                "UPDATE profile_analysis_runs SET status=?,proposal_json=?,error=?,updated_at=? WHERE id=? AND workspace_id=?",
+                ("succeeded" if proposal else "failed", _json(proposal), error[:1200], _now_iso(), run_id, self.workspace_id),
             )
         return self.get_analysis(run_id)
