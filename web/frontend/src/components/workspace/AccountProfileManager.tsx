@@ -20,7 +20,7 @@ import type {
 import type { Account, BlogConnector } from '../../lib/ripple';
 import { dateText, errorText } from '../../lib/ripple';
 import { platformDisplayName } from '../../lib/platforms';
-import { Feedback, Modal } from './Common';
+import { Feedback, Mark, Modal } from './Common';
 
 type Target = {
   id: string;
@@ -362,7 +362,7 @@ export default function AccountProfileManager({
           const binding = bindingFor(target)!;
           const hasOverrides = Object.values(binding.overrides || {}).some(Boolean);
           return <article className="profile-account-card" key={`${target.kind}:${target.id}`}>
-            <div className="profile-account-identity"><span className="profile-platform-mark">{platformDisplayName(target.platform).slice(0, 1)}</span><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{target.identityName && target.label !== target.identityName ? target.label : target.kind === 'blog' ? 'Blog 连接' : `账号 ID ${target.id.slice(0, 8)}`}</small><span><i className={`profile-status-dot${target.status === 'connected' ? '' : ' warn'}`} />{statusText(target)}{target.checkedAt ? ` · 最近检查 ${target.checkedAt}` : ''}</span></div></div>
+            <div className="profile-account-identity"><Mark platform={target.platform} /><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{target.identityName && target.label !== target.identityName ? target.label : target.kind === 'blog' ? 'Blog 连接' : `账号 ID ${target.id.slice(0, 8)}`}</small><span><i className={`profile-status-dot${target.status === 'connected' ? '' : ' warn'}`} />{statusText(target)}{target.checkedAt ? ` · 最近检查 ${target.checkedAt}` : ''}</span></div></div>
             <div className="profile-account-override"><small>账号差异</small><strong>{hasOverrides ? String(binding.overrides?.formats || binding.overrides?.tone || '已设置账号差异') : '继承基础画像'}</strong></div>
             <div className="profile-account-actions"><button className="r2-text-button" type="button" disabled={busy} onClick={() => openOverrides(target)}>账号差异</button><button className="r2-text-button" type="button" disabled={busy} onClick={() => void openAnalysis(target)}>Agent 分析</button><button className="r2-text-button" type="button" onClick={onManageConnections}>账号设置</button></div>
           </article>;
@@ -373,7 +373,7 @@ export default function AccountProfileManager({
     {!!unassignedTargets.length && <section className="unassigned-account-section">
       <div className="unassigned-account-head"><div><h3>未归类账号 <span>{unassignedTargets.length}</span></h3><p className="r2-muted">这些账号已经连接，但还没有账号画像。这里只作为待办处理。</p></div></div>
       <div className="unassigned-account-list">{unassignedTargets.map((target) => <article className="unassigned-account-row" key={`${target.kind}:${target.id}`}>
-        <div className="profile-account-identity"><span className="profile-platform-mark">{platformDisplayName(target.platform).slice(0, 1)}</span><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{statusText(target)}</small></div></div>
+        <div className="profile-account-identity"><Mark platform={target.platform} /><div><strong>{platformDisplayName(target.platform)} · {target.identityName || target.label}</strong><small>{statusText(target)}</small></div></div>
         <div className="unassigned-account-actions">{activeProfile && <button className="r2-button" disabled={busy} onClick={() => void changeBinding(target, activeProfile.id)}>关联到当前画像</button>}<select aria-label={`为 ${target.identityName || target.label} 选择画像`} disabled={busy} value="" onChange={(event) => { if (event.target.value) void changeBinding(target, event.target.value); }}><option value="">选择其他画像…</option>{(context?.profiles || []).map((profile) => <option key={profile.id} value={profile.id}>{profile.display_name}</option>)}</select><button className="r2-text-button" type="button" disabled={busy} onClick={() => void openAnalysis(target, 'new')}>Agent 创建画像</button></div>
       </article>)}</div>
     </section>}
