@@ -59,6 +59,108 @@ export interface PersonaDetail {
   name: string;
   content: string;
 }
+export interface ContentProfileSummary {
+  id: string; workspace_id: string; display_name: string; legacy_name: string;
+  current_revision: number; state: string; account_count?: number; created_at: string; updated_at: string;
+}
+export interface ContentProfileBinding {
+  workspace_id: string; target_kind: 'account' | 'blog'; account_id: string; profile_id: string;
+  profile_revision: number; overrides: Record<string, unknown>; binding_revision: number;
+  created_at: string; updated_at: string;
+}
+export interface ContentTargetSummary {
+  id: string; target_kind: 'account' | 'blog'; platform: string; label: string; status: string;
+  identity: { logged_in?: boolean; name?: string; remote_id?: string } | null;
+  live_verified: boolean; auth_revision: number;
+}
+export interface ContentProfileContext {
+  profiles: ContentProfileSummary[];
+  bindings: ContentProfileBinding[];
+  accounts: ContentTargetSummary[];
+  blogs: ContentTargetSummary[];
+  resolved: {
+    workspace_id: string;
+    profile: Pick<ContentProfileSummary, 'id' | 'display_name' | 'legacy_name' | 'current_revision' | 'state'> | null;
+    binding: ContentProfileBinding | null;
+    effective_files: Record<string, string>;
+    overrides?: Record<string, unknown>;
+    scope: 'generic' | 'profile' | 'account';
+  };
+}
+export interface ContentProfileDetail extends ContentProfileSummary {
+  files: Record<string, string>; revision_source: string; bindings: ContentProfileBinding[];
+}
+export interface ProfileAnalysisCapability {
+  target_kind: 'account' | 'blog'; account_id: string; platform: string;
+  automatic_history_supported: boolean; automatic_history_planned: boolean;
+  automatic_history_fields?: string[];
+  import_samples_supported: boolean; accepted_sample_fields: string[]; note: string;
+}
+export interface ProfileAnalysisRun {
+  id: string; workspace_id: string; target_kind: 'account' | 'blog'; account_id: string; profile_id: string;
+  status: string; capability: ProfileAnalysisCapability | Record<string, unknown>;
+  samples: Array<Record<string, unknown>>; proposal: {
+    files?: Record<string, string>; observations?: string[]; assumptions?: string[];
+    open_questions?: string[]; sample_summary?: string;
+  }; model: Record<string, unknown>; error: string; created_at: string; updated_at: string;
+}
+
+export function fetchContentProfileContext(params: { profile_name?: string; profile_id?: string; account_id?: string; target_kind?: string } = {}): Promise<ContentProfileContext> {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) if (value) q.set(key, value);
+  return request<ContentProfileContext>(`/api/content-profile-context${q.size ? `?${q}` : ''}`);
+}
+export function fetchContentProfiles(): Promise<{ items: ContentProfileSummary[] }> {
+  return request('/api/content-profiles');
+}
+export function fetchContentProfile(profileId: string): Promise<ContentProfileDetail> {
+  return request(`/api/content-profiles/${encodeURIComponent(profileId)}`);
+}
+export function renameContentProfile(profileId: string, displayName: string): Promise<ContentProfileDetail> {
+  return request(`/api/content-profiles/${encodeURIComponent(profileId)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: displayName }),
+  });
+}
+export function copyContentProfile(profileId: string, displayName: string): Promise<ContentProfileDetail> {
+  return request(`/api/content-profiles/${encodeURIComponent(profileId)}/copy`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: displayName }),
+  });
+}
+export function saveContentProfileRevision(profileId: string, payload: { expected_revision: number; files: Record<string, string>; note?: string; confirm?: boolean }): Promise<ContentProfileDetail> {
+  return request(`/api/content-profiles/${encodeURIComponent(profileId)}/revision`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+export function bindContentProfile(targetKind: 'account' | 'blog', accountId: string, payload: { profile_id: string; overrides?: Record<string, unknown>; expected_binding_revision?: number }): Promise<ContentProfileBinding> {
+  return request(`/api/account-profile-bindings/${targetKind}/${encodeURIComponent(accountId)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+export function unbindContentProfile(targetKind: 'account' | 'blog', accountId: string): Promise<{ ok: boolean }> {
+  return request(`/api/account-profile-bindings/${targetKind}/${encodeURIComponent(accountId)}`, { method: 'DELETE' });
+}
+export function fetchProfileAnalysisCapability(targetKind: 'account' | 'blog', accountId: string): Promise<ProfileAnalysisCapability> {
+  return request(`/api/profile-analysis/capability/${targetKind}/${encodeURIComponent(accountId)}`);
+}
+export function startProfileAnalysis(payload: {
+  target_kind: 'account' | 'blog'; account_id: string; profile_id?: string; display_name?: string;
+  samples: Array<Record<string, unknown>>; use_account_history?: boolean; history_limit?: number; confirmed: boolean;
+}): Promise<ProfileAnalysisRun> {
+  return request('/api/profile-analysis', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+export function fetchProfileAnalysis(runId: string): Promise<ProfileAnalysisRun> {
+  return request(`/api/profile-analysis/${encodeURIComponent(runId)}`);
+}
+export function applyProfileAnalysis(runId: string, payload: {
+  profile_id?: string; display_name?: string; expected_revision?: number; bind_target?: boolean;
+}): Promise<{ profile: ContentProfileDetail; binding: ContentProfileBinding | null }> {
+  return request(`/api/profile-analysis/${encodeURIComponent(runId)}/apply`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
 
 export interface StructuredSkillOperation {
   id: string; version: string; label: string; module: string; risk: string; kind: string;
@@ -655,7 +757,7 @@ export interface IdeaRecommendResponse {
   recommendations: IdeaRecommendation[];
 }
 export function recommendIdeas(input: {
-  persona: string; platforms?: string[]; trend_sources?: string[]; target_platforms?: string[];
+  persona: string; platforms?: string[]; trend_sources?: string[]; target_platforms?: string[]; account_ids?: string[];
   campaign_id?: string; limit?: number;
 }): Promise<IdeaRecommendResponse> {
   return request('/api/ideas/recommend', {
@@ -676,7 +778,7 @@ export interface IdeaRun {
   sources?: IdeaSourceSnapshot[]; ideas?: Idea[];
 }
 export function createIdeaRun(input: {
-  persona: string; target_platforms: string[]; trend_sources: string[]; trend_titles?: string[];
+  persona: string; target_platforms: string[]; account_ids?: string[]; trend_sources: string[]; trend_titles?: string[];
   include_trends: boolean; include_campaigns: boolean; campaign_ids?: string[];
   instruction?: string; goal?: string; effort_minutes?: number; limit?: number; idempotency_key: string;
 }): Promise<IdeaRun> {
@@ -736,6 +838,8 @@ export function fetchIdeaDiscoveryAccounts(): Promise<IdeaDiscoveryAccount[]> {
 export interface IdeaDiscoveryPolicy {
   id: string; persona: string; enabled: boolean; revision: number;
   target_platforms: string[]; trend_sources: string[]; account_ids: string[];
+  profile_id: string; profile_revision: number; current_profile_revision?: number;
+  requires_review?: boolean; review_reason?: string;
   mode: 'balanced' | 'combo_only'; focus_keywords: string[]; effort_minutes: number;
   max_daily_runs: number; max_daily_candidates: number; max_daily_notices: number;
   min_candidate_score: number; timezone: string; quiet_start: string; quiet_end: string;
@@ -1041,6 +1145,13 @@ export interface ChatArtifactRef {
 }
 
 export interface AgentTurnInjection { skills?: string[]; }
+export interface ChatContentScope {
+  profileId: string;
+  profileRevision: number;
+  accountId: string;
+  bindingRevision: number;
+  overrides: Record<string, unknown>;
+}
 
 function parseChatArtifact(data: string): ChatArtifactRef | null {
   try {
@@ -1071,6 +1182,7 @@ export function streamChat(
   attachments: UploadedFile[] = [],
   onArtifact?: (artifact: ChatArtifactRef) => void,
   injection: AgentTurnInjection = {},
+  contentScope?: ChatContentScope,
 ): AbortController {
   const controller = new AbortController();
   let lastEventId = 0;
@@ -1156,7 +1268,16 @@ export function streamChat(
         const res = first
           ? await fetch(`${BASE}/api/chat/stream`, securedFetchOptions({
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ message, persona: persona || undefined, sessionId, turnId, attachments, turnSkills: injection.skills || [] }),
+              body: JSON.stringify({
+                message, persona: persona || undefined, sessionId, turnId, attachments, turnSkills: injection.skills || [],
+                ...(contentScope ? {
+                  contentProfileId: contentScope.profileId,
+                  contentProfileRevision: contentScope.profileRevision,
+                  contentAccountId: contentScope.accountId,
+                  bindingRevision: contentScope.bindingRevision,
+                  accountOverrides: contentScope.overrides || {},
+                } : {}),
+              }),
               signal: controller.signal,
             }))
           : await fetch(`${BASE}/api/chat/jobs/${encodeURIComponent(turnId || '')}/stream?after=${lastEventId}`, securedFetchOptions({

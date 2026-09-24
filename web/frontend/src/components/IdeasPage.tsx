@@ -23,6 +23,7 @@ interface IdeasPageProps {
   onOpenContent?: (id: string) => void;
   persona: string;
   aiReady: boolean;
+  accountIds?: string[];
   personas: PersonaItem[];
   onPersonaChange: (name: string) => void;
   onNewPersona: () => void;
@@ -62,7 +63,7 @@ function sourceLabel(source: IdeaSourceSnapshot): string {
 }
 
 export default function IdeasPage({
-  onUseTopic, onOpenContent, persona, aiReady, personas, onPersonaChange, onNewPersona,
+  onUseTopic, onOpenContent, persona, aiReady, accountIds = [], personas, onPersonaChange, onNewPersona,
 }: IdeasPageProps) {
   const [ideas, setIdeas] = useState<Idea[]>([]);
   const [runs, setRuns] = useState<IdeaRun[]>([]);
@@ -175,6 +176,9 @@ export default function IdeasPage({
     setPolicyEditing(false);
   }, [persona]);
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    if (!discovery?.policy) setPolicyAccountIds(accountIds);
+  }, [accountIds, discovery?.policy]);
   useEffect(() => {
     if (!persona || !discovery?.policy?.enabled) return;
     let stopped = false;
@@ -304,6 +308,7 @@ export default function IdeasPage({
       const run = await createIdeaRun({
         persona,
         target_platforms: targetPlatforms,
+        account_ids: accountIds,
         trend_sources: includeTrends ? Array.from(new Set([...trendSelection, fixedTrendPlatform].filter(Boolean))) : [],
         trend_titles: includeTrends ? fixedTrendTitles : [],
         include_trends: includeTrends,
@@ -570,9 +575,10 @@ export default function IdeasPage({
     </div>
 
     {workbenchMode === 'proactive' ? <section className="idea-discovery-panel card">
-      <header className="idea-discovery-head"><div><div className="idea-discovery-title"><span className={'idea-discovery-dot ' + (discoveryPolicy?.enabled ? 'on' : 'off')} /><strong>主动发现</strong><span>{discoveryPolicy?.enabled ? '已开启' : '未开启'}</span></div><p>不用每天先想主题。Ripple 只在已同步热点/活动出现有效变化、且预算允许时让 Agent 形成候选。</p></div><button className="btn btn-sm" onClick={() => setWorkbenchMode('manual')}>按需找选题</button></header>
+      <header className="idea-discovery-head"><div><div className="idea-discovery-title"><span className={'idea-discovery-dot ' + (discoveryPolicy?.enabled && !discoveryPolicy.requires_review ? 'on' : 'off')} /><strong>主动发现</strong><span>{discoveryPolicy?.requires_review ? '待复核' : discoveryPolicy?.enabled ? '已开启' : '未开启'}</span></div><p>不用每天先想主题。Ripple 只在已同步热点/活动出现有效变化、且预算允许时让 Agent 形成候选。</p></div><button className="btn btn-sm" onClick={() => setWorkbenchMode('manual')}>按需找选题</button></header>
+      {discoveryPolicy?.requires_review && <div className="campaign-snapshot-notice stale">{discoveryPolicy.review_reason || '画像或账号范围已变化，请确认策略后再继续主动发现。'} 当前不会启动新的模型分析。</div>}
       {!persona ? <div className="idea-discovery-empty"><strong>先选择账号画像</strong><p>主动发现需要一个长期账号策略；首次只需确认方向和目标平台。</p><button className="btn btn-sm" onClick={onNewPersona}>选择 / 创建画像</button></div>
-        : (!discoveryPolicy?.enabled || policyEditing) ? <div className="idea-policy-form">
+        : (!discoveryPolicy?.enabled || policyEditing || discoveryPolicy?.requires_review) ? <div className="idea-policy-form">
           <div className="idea-policy-row"><span>目标平台 *</span><div className="idea-target-platforms">{TARGET_PLATFORMS.map((platform) => <button key={platform} className={policyTargets.includes(platform) ? 'chip active' : 'chip'} onClick={() => setPolicyTargets((current) => current.includes(platform) ? current.filter((value) => value !== platform) : [...current, platform])}><PlatformIcon platform={platform} size={12} />{platformDisplayName(platform)}</button>)}</div></div>
           <div className="idea-policy-grid">
             <label className="wide">关注方向<input value={policyFocus} maxLength={800} onChange={(e) => setPolicyFocus(e.target.value)} placeholder="留空时沿用画像；也可填：AI工具实测，办公效率，真实体验" /></label>
@@ -586,7 +592,7 @@ export default function IdeasPage({
           </div>
           {policyAvailableAccounts.length > 0 && <div className="idea-policy-accounts"><span>活动账号范围</span><div>{policyAvailableAccounts.map((account) => <label key={account.id}><input type="checkbox" checked={policyAccountIds.includes(account.id)} onChange={(e) => setPolicyAccountIds((current) => e.target.checked ? Array.from(new Set([...current, account.id])) : current.filter((value) => value !== account.id))} />{account.label} · {platformDisplayName(account.platform)}</label>)}</div><small>未勾选时允许使用所选平台的公开活动；勾选后额外限制账号私有活动。</small></div>}
           <div className="idea-policy-note">热点来源沿用当前热点设置：{trendLabels.length ? trendLabels.join('、') : '全部可用热点源'}。当前只投递站内机会，不自动写稿、发布或报名，也不会提高平台采集频率。</div>
-          <div className="idea-policy-actions">{discoveryPolicy?.enabled && <button className="btn btn-sm" disabled={policySaving} onClick={() => setPolicyEditing(false)}>取消</button>}<button className="btn btn-sm btn-primary" disabled={policySaving || !persona || !aiReady || policyTargets.length === 0} onClick={() => void saveDiscovery(true)}>{policySaving ? '保存中…' : discoveryPolicy?.enabled ? '保存策略' : '开启主动发现'}</button></div>
+          <div className="idea-policy-actions">{discoveryPolicy?.enabled && !discoveryPolicy.requires_review && <button className="btn btn-sm" disabled={policySaving} onClick={() => setPolicyEditing(false)}>取消</button>}<button className="btn btn-sm btn-primary" disabled={policySaving || !persona || !aiReady || policyTargets.length === 0} onClick={() => void saveDiscovery(true)}>{policySaving ? '保存中…' : discoveryPolicy?.requires_review ? '确认新画像版本并继续' : discoveryPolicy?.enabled ? '保存策略' : '开启主动发现'}</button></div>
         </div> : <div className="idea-discovery-summary">
           <div className="idea-discovery-metrics"><span><b>{discovery?.unread || 0}</b> 新机会</span><span><b>{discovery?.waiting || 0}</b> 等待 / 分析中</span><span><b>{discovery?.today.runs || 0}/{discoveryPolicy.max_daily_runs}</b> 今日分析</span><span><b>{discovery?.today.candidates || 0}/{discoveryPolicy.max_daily_candidates}</b> 候选预算</span><span><b>{discovery?.today.notices || 0}/{discoveryPolicy.max_daily_notices}</b> 今日新机会提醒</span></div>
           <div className="idea-discovery-strategy"><span>方向：{discoveryPolicy.focus_keywords.length ? discoveryPolicy.focus_keywords.join('、') : '沿用账号画像'}</span><span>平台：{discoveryPolicy.target_platforms.map(platformDisplayName).join('、')}</span><span>模式：{discoveryPolicy.mode === 'combo_only' ? '仅热点 + 活动组合' : '组合优先'}</span><span>投入：约 {Math.max(1, Math.round(discoveryPolicy.effort_minutes / 60))} 小时</span></div>

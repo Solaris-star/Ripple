@@ -294,12 +294,29 @@ def test_scheduler_is_cache_only_and_never_triggers_trend_collection(tmp_path, m
     scanned = []
     monkeypatch.setattr(upstream, "_DISCOVERY_TICK_LOCK", asyncio.Lock())
     monkeypatch.setattr(upstream._DISCOVERY, "list_enabled", lambda: [policy])
+    monkeypatch.setattr(upstream, "_discovery_policy_context_status", lambda p: {"requires_review": False, "review_reason": "", "current_profile_revision": 1})
     monkeypatch.setattr(upstream, "_reconcile_discovery_jobs", lambda: asyncio.sleep(0))
     monkeypatch.setattr(upstream, "_dispatch_discovery_job", lambda now: asyncio.sleep(0))
     monkeypatch.setattr(upstream, "_scan_discovery_policy", lambda p, now: scanned.append((p["id"], now)) or {"admitted": 0})
     monkeypatch.setattr(upstream._TREND_SERVICE, "get_group", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("discovery must not collect trends")))
     asyncio.run(upstream._idea_discovery_scheduler_tick())
     assert len(scanned) == 1 and scanned[0][0] == "policy-one"
+
+
+def test_scheduler_skips_scan_when_profile_context_requires_review(monkeypatch):
+    import asyncio
+    from web import app as upstream
+
+    policy = {**policy_payload(), "id": "policy-review", "persona": "测试画像", "revision": 1, "trend_sources": ["weibo"]}
+    scanned = []
+    monkeypatch.setattr(upstream, "_DISCOVERY_TICK_LOCK", asyncio.Lock())
+    monkeypatch.setattr(upstream._DISCOVERY, "list_enabled", lambda: [policy])
+    monkeypatch.setattr(upstream, "_reconcile_discovery_jobs", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(upstream, "_dispatch_discovery_job", lambda now: asyncio.sleep(0))
+    monkeypatch.setattr(upstream, "_discovery_policy_context_status", lambda p: {"requires_review": True, "review_reason": "画像已更新", "current_profile_revision": 2})
+    monkeypatch.setattr(upstream, "_scan_discovery_policy", lambda p, now: scanned.append((p["id"], now)))
+    asyncio.run(upstream._idea_discovery_scheduler_tick())
+    assert scanned == []
 
 
 def test_source_change_waits_for_stable_window_before_scan(tmp_path):
@@ -333,6 +350,7 @@ def test_dispatch_creates_automatic_run_but_does_not_execute_model_in_test(tmp_p
     monkeypatch.setattr(upstream, "_DISCOVERY", discovery_service)
     monkeypatch.setattr(upstream, "_IDEATION", ideas)
     monkeypatch.setattr(upstream, "_recommendation_ai_backend", lambda: "direct")
+    monkeypatch.setattr(upstream, "_discovery_policy_context_status", lambda p: {"requires_review": False, "review_reason": "", "current_profile_revision": 1})
     monkeypatch.setattr(upstream, "_spawn_idea_job", lambda run_id: spawned.append(run_id))
     asyncio.run(upstream._dispatch_discovery_job(now + 1))
     stored_job = discovery_service.state("测试画像", now=now + 1)["jobs"][0]
@@ -342,4 +360,35 @@ def test_dispatch_creates_automatic_run_but_does_not_execute_model_in_test(tmp_p
     assert run["policy_id"] == policy["id"]
     assert run["opportunity_key"] == "opp-auto"
     assert spawned == [run["id"]]
+
+
+def test_dispatch_cancels_claimed_job_when_profile_context_changed(tmp_path, monkeypatch):
+    import asyncio
+    from web import app as upstream
+
+    ideas = ideation(tmp_path)
+    discovery_service = IdeaDiscoveryService(tmp_path / "ideas.sqlite3")
+    now = 1790201000.0
+    policy = discovery_service.configure("测试画像", policy_payload(), now=now)
+    request = {
+        "persona": "测试画像", "target_platforms": ["xiaohongshu"], "trend_sources": ["weibo"],
+        "trend_titles": ["AI办公效率"], "include_trends": True, "include_campaigns": False,
+        "campaign_ids": [], "instruction": "只生成一个候选", "goal": "主动发现", "effort_minutes": 120,
+        "limit": 1, "origin": "automatic", "policy_id": policy["id"], "opportunity_key": "opp-review",
+        "trigger_summary": "来源变化", "min_candidate_score": 68,
+    }
+    job = discovery_service.admit(policy, {**opportunity("opp-review", "ev-review"), "request": request}, source_digest_value="digest-review", trigger_type="source_change", now=now)
+    assert job is not None
+    spawned = []
+    monkeypatch.setattr(upstream, "_DISCOVERY", discovery_service)
+    monkeypatch.setattr(upstream, "_IDEATION", ideas)
+    monkeypatch.setattr(upstream, "_recommendation_ai_backend", lambda: "direct")
+    monkeypatch.setattr(upstream, "_discovery_policy_context_status", lambda p: {"requires_review": True, "review_reason": "画像已更新，请复核", "current_profile_revision": 2})
+    monkeypatch.setattr(upstream, "_spawn_idea_job", lambda run_id: spawned.append(run_id))
+    asyncio.run(upstream._dispatch_discovery_job(now + 1))
+    stored_job = discovery_service.state("测试画像", now=now + 1)["jobs"][0]
+    assert stored_job["status"] == "cancelled"
+    assert "画像已更新" in stored_job["error"]
+    assert spawned == []
+    assert ideas.list_runs(10, persona="测试画像") == []
     assert ideas.list_runs(origin="manual") == []

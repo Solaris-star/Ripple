@@ -14,6 +14,18 @@ export interface ContentChatContext {
   title: string;
 }
 
+export interface SessionWorkScope {
+  targetKind: 'account' | 'blog';
+  accountId: string;
+  platform: string;
+  accountLabel: string;
+  profileId: string;
+  profileRevision: number;
+  profileName: string;
+  bindingRevision: number;
+  overrides: Record<string, unknown>;
+}
+
 export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
@@ -37,6 +49,7 @@ export interface ChatSession {
   archived?: boolean;   // 归档：从 History 主列表移到「已归档」区
   contentContext?: ContentChatContext; // 从内容工作台进入的既有主稿引用；不复制正文到 localStorage
   topicContext?: TopicUseContext; // 从热点/活动/选题进入创作时保留结构化约束，供内容工作台展示与续接
+  workScope?: SessionWorkScope; // 首次发送时固定的账号/画像范围；后续切换全局范围不改写旧会话
 }
 
 /** 进行中的流式状态（存于 App，不随页面切换/ChatPage 卸载而丢失）。 */
@@ -167,12 +180,13 @@ export function saveSessions(sessions: ChatSession[]): void {
   writeBrowserLocalValue('sessions', JSON.stringify(prune(sessions)));
 }
 
-export function createSession(persona?: string): ChatSession {
+export function createSession(persona?: string, workScope?: SessionWorkScope): ChatSession {
   return {
     id: generateId(),
     title: 'New Chat',
     messages: [],
     persona,
+    workScope,
     created: Date.now(),
   };
 }

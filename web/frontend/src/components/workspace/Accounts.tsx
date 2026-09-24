@@ -4,6 +4,8 @@ import { api, base, dateText, errorText, ACCOUNT_LABELS } from '../../lib/ripple
 import { newId } from '../../lib/id';
 import type { Account, BlogConnector, Channel, ExecutionNode, RippleStatus } from '../../lib/ripple';
 import { Header, Feedback, Mark, Modal } from './Common';
+import AccountProfileManager from './AccountProfileManager';
+import type { AccountProfileView } from './AccountProfileManager';
 
 interface XConfig { configured: boolean; client_id: string; callback_url: string; scopes: string[]; adapter: string; }
 interface XConnectResult { account: Account; authorize_url: string; callback_url: string; }
@@ -34,7 +36,9 @@ function LoginUrlRow({ label, value, open, onCopy }: { label: string; value: str
   return <div className="r2-login-url-row"><span>{label}</span><code title={value}>{value}</code><div><button type="button" className="r2-text-button" aria-label={`复制${label}`} onClick={() => onCopy(value, label)}>复制</button>{open && <a className="r2-text-button" aria-label={`打开${label}`} href={value} target="_blank" rel="noopener noreferrer">打开 ↗</a>}</div></div>;
 }
 
-export default function Accounts({ onNavigate }: { onNavigate: (page: Page) => void }) {
+export default function Accounts({ onNavigate, onNewProfile = () => {}, onEditProfile = () => {}, embedded = false }: { onNavigate: (page: Page) => void; onNewProfile?: () => void; onEditProfile?: (name: string) => void; embedded?: boolean }) {
+  const initialView = new URLSearchParams(location.search).get('view');
+  const [accountView, setAccountView] = useState<AccountProfileView>(initialView === 'profiles' || initialView === 'pending' ? initialView : 'bound');
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [blogs, setBlogs] = useState<BlogConnector[]>([]);
@@ -236,10 +240,27 @@ export default function Accounts({ onNavigate }: { onNavigate: (page: Page) => v
   const nodeFor = (account: Account) => nodes.find(item => item.id === (account.execution_node_id || 'local'));
   const formatNames: Record<string, string> = { text: '文字', images: '图文', video: '视频', markdown: 'Markdown', media: '素材' };
 
-  return <div className="page-scroll r2-page">
-    <Header title="账号与平台" subtitle="管理平台账号与 Blog 连接"><span className="r2-environment">浏览器 {status?.environment.browser ? browserLabel(status.environment.browser) : '未检测到'} · B站发布 {status?.environment.biliup ? '可用' : '未就绪'}</span></Header>
+  const changeView = (view: AccountProfileView) => {
+    setAccountView(view);
+    const url = new URL(location.href);
+    url.searchParams.set('page', 'integrations');
+    url.searchParams.set('section', 'accounts');
+    url.searchParams.set('view', view);
+    history.replaceState({}, '', url);
+  };
+
+  return <div className={embedded ? 'r2-account-settings' : 'page-scroll r2-page'}>
+    {!embedded && <Header title="账号" subtitle="管理平台账号、账号画像与 Blog 连接"><span className="r2-environment">浏览器 {status?.environment.browser ? browserLabel(status.environment.browser) : '未检测到'} · B站发布 {status?.environment.biliup ? '可用' : '未就绪'}</span></Header>}
     <Feedback error={error} notice={notice} />{blogError && <div className="r2-inline-warning">{blogError}</div>}
-    <div className="r2-account-help">X 浏览器模式使用执行设备上的 Ripple 独立 Profile。首次认证由普通 Chrome / Edge 完成人工 Google / X 登录，随后 Ripple 才用同一 Profile 检查状态和执行自动化；不会读取你日常 Chrome 的 Default / Profile 1 等现有 Profile，也不会把 Cookie 上传到 Ripple Server。<button className="r2-text-button" onClick={() => onNavigate('integrations')}>执行节点与环境设置 →</button></div>
+    <div className="account-settings-tabs" role="tablist" aria-label="账号视图">
+      <button type="button" role="tab" aria-selected={accountView === 'bound'} className={accountView === 'bound' ? 'active' : ''} onClick={() => changeView('bound')}>已绑定</button>
+      <button type="button" role="tab" aria-selected={accountView === 'profiles'} className={accountView === 'profiles' ? 'active' : ''} onClick={() => changeView('profiles')}>画像</button>
+      <button type="button" role="tab" aria-selected={accountView === 'pending'} className={accountView === 'pending' ? 'active' : ''} onClick={() => changeView('pending')}>待处理</button>
+    </div>
+    <AccountProfileManager accounts={accounts} blogs={blogs} view={accountView} onNewProfile={onNewProfile} onEditProfile={onEditProfile} onChanged={() => void refresh().catch(() => {})} />
+    <details className="account-connection-directory">
+      <summary>添加 / 管理平台连接</summary>
+      <div className="r2-account-help">X 浏览器模式使用执行设备上的 Ripple 独立 Profile。首次认证由普通 Chrome / Edge 完成人工 Google / X 登录，随后 Ripple 才用同一 Profile 检查状态和执行自动化；不会读取你日常 Chrome 的 Default / Profile 1 等现有 Profile，也不会把 Cookie 上传到 Ripple Server。<button className="r2-text-button" onClick={() => onNavigate('integrations')}>执行节点与环境设置 →</button></div>
     <div className="r2-channel-list">{channels.map(c => {
       const rows = accounts.filter(a => a.platform === c.id);
       return <section className="r2-channel" key={c.id} data-platform={c.id}><header><Mark platform={c.id} /><div><h2>{c.name}</h2><span>{c.formats.map(f => formatNames[f] || f).join(' / ') || ((c.connection_options?.length || 0) > 0 ? '接入规划' : '尚未接入')}{c.id === 'blog' ? ` · OpenAPI / Markdown${blogs.length ? ` · ${blogs.length} 个连接` : ' · 未连接'}` : c.adapter_available ? ` · ${c.adapter === 'x-multi' ? '浏览器 / 官方 API' : c.adapter === 'wechat-api' ? '官方 API' : c.adapter === 'biliup' ? '本地上传程序' : '独立浏览器'}${rows.length === 0 ? ' · 未连接' : ''}` : ''}</span></div><div className="r2-channel-action">{c.id === 'blog' ? <button className="r2-button" disabled={busy} onClick={() => openBlog()}>连接 Blog</button> : c.id === 'wechat' && c.adapter_available ? <button className="r2-button" disabled={busy} onClick={() => openWechat()}>连接公众号</button> : c.adapter_available ? <button className="r2-button" disabled={busy} onClick={() => openAdd(c.id)}>连接账号</button> : c.local_export ? <button className="r2-button" onClick={() => { sessionStorage.setItem('ripple_new_mode', 'blog'); onNavigate('publish'); }}>创建导出</button> : <span className="r2-muted">{(c.connection_options?.length || 0) > 0 ? '计划中' : '尚未接入'}</span>}</div></header>
@@ -253,6 +274,7 @@ export default function Accounts({ onNavigate }: { onNavigate: (page: Page) => v
         {c.adapter_available && !c.environment_ready && <p className="r2-channel-foot">执行环境尚未就绪，请到设置中检查。</p>}
       </section>;
     })}</div>
+    </details>
 
     {add === 'blog' && <Modal title={blogEditId ? '编辑 Blog 连接' : '连接 Blog'} busy={busy} onClose={() => { setAdd(null); setBlogToken(''); setBlogEditId(null); }}><p>填写 Blog 提供的 OpenAPI 文档地址。Ripple 会读取语义能力声明，不依赖具体 CMS 名称或固定 API 路径。</p><label className="r2-field">连接名称<input autoFocus value={label} maxLength={80} placeholder="例如：个人 Blog" onChange={e => setLabel(e.target.value)} /></label><label className="r2-field">OpenAPI URL<input value={blogOpenapi} maxLength={2048} placeholder="https://your-blog.example/openapi.json" onChange={e => setBlogOpenapi(e.target.value)} /></label><label className="r2-field">Agent Token<input type="password" autoComplete="off" value={blogToken} maxLength={4096} placeholder={blogEditId ? '留空则继续使用当前 Token' : 'Bearer Token'} onChange={e => setBlogToken(e.target.value)} /></label><p className="r2-muted">Token 会使用系统密钥加密后保存在 Ripple 私有目录，保存后不会再次显示明文。公网 Blog 只允许 HTTPS；本机服务可使用 HTTP。</p><label className="r2-checkbox"><input type="checkbox" checked={consent} onChange={e => setConsent(e.target.checked)} />允许 Ripple 读取该 OpenAPI、验证 Token，并保存此 Blog 连接</label><footer><button className="r2-button" disabled={busy} onClick={() => { setAdd(null); setBlogToken(''); setBlogEditId(null); }}>取消</button><button className="r2-button primary" disabled={busy || !label.trim() || !blogOpenapi.trim() || !consent || (!blogEditId && !blogToken.trim())} onClick={() => void connect()}>{busy ? '正在验证…' : blogEditId ? '保存连接' : '验证并连接'}</button></footer></Modal>}
 

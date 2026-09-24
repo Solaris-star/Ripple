@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Sidebar from './components/Sidebar';
 import type { Page } from './components/Sidebar';
 import SkillPage from './components/SkillPage';
@@ -9,13 +9,13 @@ import TrendsPage from './components/TrendsPage';
 import CampaignsPage from './components/CampaignsPage';
 import CalendarPage from './components/CalendarPage';
 import IdeasPage from './components/IdeasPage';
-import { RippleHome, RipplePublish, RippleInteractions, RippleChannels, RippleContents, RippleCalendar, RippleIntegrations, RippleAnalytics } from './components/RippleWorkspace';
+import { RippleHome, RipplePublish, RippleInteractions, RippleContents, RippleCalendar, RippleIntegrations, RippleAnalytics } from './components/RippleWorkspace';
 import BreakdownPage from './components/BreakdownPage';
 import SubNav from './components/SubNav';
 import OnboardingWizard from './components/OnboardingWizard';
 import AuthBoundary from './components/AuthBoundary';
-import { fetchStatus, fetchPersonas, streamChat, fetchLastTurn, stopChat, fetchIdea, fetchCampaign } from './lib/api';
-import type { AgentTurnInjection, ChatArtifactRef, PersonaItem, UploadedFile, TopicUseContext, Campaign } from './lib/api';
+import { fetchStatus, fetchPersonas, fetchContentProfileContext, streamChat, fetchLastTurn, stopChat, fetchIdea, fetchCampaign } from './lib/api';
+import type { AgentTurnInjection, ChatArtifactRef, PersonaItem, UploadedFile, TopicUseContext, Campaign, ContentProfileContext } from './lib/api';
 import {
   loadSessions,
   saveSessions,
@@ -28,7 +28,7 @@ import {
   readBrowserLocalValue,
   writeBrowserLocalValue,
 } from './lib/store';
-import type { ChatSession, ChatMessage, StreamState } from './lib/store';
+import type { ChatSession, ChatMessage, StreamState, SessionWorkScope } from './lib/store';
 import { api as rippleApi } from './lib/ripple';
 import type { Mother } from './lib/ripple';
 
@@ -45,6 +45,12 @@ function loadPersonaSelection(): string {
 function savePersonaSelection(name: string) {
   writeBrowserLocalValue('selected_persona_v1', name || null);
 }
+function loadTargetSelection(): string {
+  return readBrowserLocalValue('selected_content_target_v1') || '';
+}
+function saveTargetSelection(value: string) {
+  writeBrowserLocalValue('selected_content_target_v1', value || null);
+}
 
 export default function App() {
   return <AuthBoundary><RippleApp /></AuthBoundary>;
@@ -57,6 +63,8 @@ function RippleApp() {
   }, []);
   const [personas, setPersonas] = useState<PersonaItem[]>([]);
   const [selectedPersona, setSelectedPersona] = useState(() => loadPersonaSelection());
+  const [profileContext, setProfileContext] = useState<ContentProfileContext | null>(null);
+  const [selectedTarget, setSelectedTarget] = useState(() => loadTargetSelection());
   const [sessions, setSessions] = useState<ChatSession[]>(() => loadSessions());
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [agentStatus, setAgentStatus] = useState('connecting');
@@ -169,7 +177,45 @@ function RippleApp() {
       });
   }, []);
 
+  const refreshProfileContext = useCallback(() => fetchContentProfileContext().then(setProfileContext), []);
+  useEffect(() => {
+    void refreshProfileContext().catch(() => {});
+    const refresh = () => void refreshProfileContext().catch(() => {});
+    window.addEventListener('ripple:profile-context-changed', refresh);
+    return () => window.removeEventListener('ripple:profile-context-changed', refresh);
+  }, [refreshProfileContext]);
+
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
+  const scopeAccountIds = useMemo(() => {
+    if (selectedTarget.startsWith('account:')) return [selectedTarget.slice('account:'.length)];
+    if (selectedTarget) return [];
+    const profile = (profileContext?.profiles || []).find((item) => item.legacy_name === selectedPersona);
+    if (!profile) return [];
+    return (profileContext?.bindings || [])
+      .filter((item) => item.profile_id === profile.id && item.target_kind === 'account')
+      .map((item) => item.account_id);
+  }, [profileContext, selectedPersona, selectedTarget]);
+  const currentWorkScope = useMemo<SessionWorkScope | undefined>(() => {
+    if (!selectedTarget || !profileContext) return undefined;
+    const [targetKind, ...parts] = selectedTarget.split(':');
+    if (targetKind !== 'account' && targetKind !== 'blog') return undefined;
+    const accountId = parts.join(':');
+    const binding = profileContext.bindings.find((item) => item.target_kind === targetKind && item.account_id === accountId);
+    const profile = binding ? profileContext.profiles.find((item) => item.id === binding.profile_id) : undefined;
+    const target = [...profileContext.accounts, ...profileContext.blogs].find((item) => item.target_kind === targetKind && item.id === accountId);
+    if (!binding || !profile || !target) return undefined;
+    return {
+      targetKind,
+      accountId,
+      platform: target.platform,
+      accountLabel: target.identity?.name || target.label,
+      profileId: profile.id,
+      profileRevision: profile.current_revision,
+      profileName: profile.display_name,
+      bindingRevision: binding.binding_revision,
+      overrides: { ...(binding.overrides || {}) },
+    };
+  }, [profileContext, selectedTarget]);
 
   // 最新 sessions 的 ref，供回调里读取而不必进依赖数组（避免闭包过期/频繁重建）
   const sessionsRef = useRef(sessions);
@@ -214,6 +260,7 @@ function RippleApp() {
     persona: string | undefined,
     attachments: UploadedFile[] = [],
     injection: AgentTurnInjection = {},
+    workScope?: SessionWorkScope,
   ) => {
     const turnId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     try { sessionStorage.setItem(browserSessionKey(`pending_turn:${sessionId}`), turnId); } catch { /* ignore */ }
@@ -276,6 +323,13 @@ function RippleApp() {
         setStreams((p) => (p[sessionId] ? { ...p, [sessionId]: { ...p[sessionId], artifacts: [...a.artifacts] } } : p));
       },
       injection,
+      workScope ? {
+        profileId: workScope.profileId,
+        profileRevision: workScope.profileRevision,
+        accountId: workScope.accountId,
+        bindingRevision: workScope.bindingRevision,
+        overrides: workScope.overrides,
+      } : undefined,
     );
   }, [appendAssistant, clearStream]);
 
@@ -376,13 +430,17 @@ function RippleApp() {
     const agentMessage = (legacyAgentText || displayText).trim();
     if ((!agentMessage && attachments.length === 0) || streamCtl.current[sessionId]) return;
     const cur = sessionsRef.current.find((s) => s.id === sessionId);
-    const persona = cur?.persona || selectedPersona || undefined;
+    const initialBind = !!cur && cur.messages.length === 0 && !cur.sessionKey && !cur.pendingTurnId;
+    const persona = cur?.persona || (initialBind ? selectedPersona || undefined : undefined);
+    const workScope = cur?.workScope || (initialBind && (!cur?.persona || cur.persona === selectedPersona) ? currentWorkScope : undefined);
     setSessions((prev) => {
       const next = prev.map((s) => {
         if (s.id !== sessionId) return s;
         const base = truncateAt != null ? s.messages.slice(0, truncateAt) : s.messages;
         const updated = {
           ...s,
+          ...(initialBind && !s.persona && persona ? { persona } : {}),
+          ...(initialBind && !s.workScope && workScope ? { workScope } : {}),
           messages: [...base, {
             role: 'user',
             content: visible,
@@ -397,8 +455,8 @@ function RippleApp() {
       saveSessions(next);
       return next;
     });
-    startStream(sessionId, agentMessage, persona, attachments, injection);
-  }, [selectedPersona, startStream]);
+    startStream(sessionId, agentMessage, persona, attachments, injection, workScope);
+  }, [currentWorkScope, selectedPersona, startStream]);
 
   const contentContextMessage = useCallback(async (sessionId: string, visible: string): Promise<string> => {
     const session = sessionsRef.current.find((item) => item.id === sessionId);
@@ -510,7 +568,7 @@ ${JSON.stringify(structured, null, 2)}
       if (context.contentId) {
         try { sessionStorage.setItem('ripple_content_focus', context.contentId); } catch { /* ignore */ }
       }
-      const ns = createSession(selectedPersona || undefined);
+      const ns = createSession(selectedPersona || undefined, currentWorkScope);
       ns.topicContext = context;
       setSessions((prev) => { const u = [ns, ...prev]; saveSessions(u); return u; });
       setActiveSessionId(ns.id);
@@ -521,7 +579,7 @@ ${JSON.stringify(structured, null, 2)}
       }
       sendUserAndStream(ns.id, visible, [], agentText);
     })();
-  }, [selectedPersona, sendUserAndStream, setCurrentPage]);
+  }, [currentWorkScope, selectedPersona, sendUserAndStream, setCurrentPage]);
 
   const commitSessions = useCallback((next: ChatSession[]) => {
     sessionsRef.current = next; setSessions(next); saveSessions(next);
@@ -535,7 +593,7 @@ ${JSON.stringify(structured, null, 2)}
         ? current.find((item) => !item.archived && !item.contentContext && item.messages.length === 0)
         : undefined;
     if (!target) {
-      const created = createSession(selectedPersona || undefined);
+      const created = createSession(selectedPersona || undefined, currentWorkScope);
       if (content) {
         const label = content.content.title.trim() || '未命名内容';
         created.title = `${Array.from(label).slice(0, 18).join('')} · AI协作`;
@@ -549,7 +607,7 @@ ${JSON.stringify(structured, null, 2)}
     activeIdRef.current = target.id;
     setActiveSessionId(target.id);
     return target.id;
-  }, [commitSessions, selectedPersona]);
+  }, [commitSessions, currentWorkScope, selectedPersona]);
 
   const handleContentFocus = useCallback((content: Mother | null) => {
     const current = sessionsRef.current;
@@ -578,16 +636,16 @@ ${JSON.stringify(structured, null, 2)}
       if (existing) { activeIdRef.current = existing.id; setActiveSessionId(existing.id); return; }
       const blank = current.find((item) => !item.archived && !item.contentContext && item.messages.length === 0);
       if (blank) { activeIdRef.current = blank.id; setActiveSessionId(blank.id); return; }
-      const created = createSession(selectedPersona || undefined);
+      const created = createSession(selectedPersona || undefined, currentWorkScope);
       commitSessions([created, ...current]); activeIdRef.current = created.id; setActiveSessionId(created.id);
       return;
     }
     if (active && !active.contentContext) return;
     const blank = current.find((item) => !item.archived && !item.contentContext && item.messages.length === 0);
     if (blank) { activeIdRef.current = blank.id; setActiveSessionId(blank.id); return; }
-    const created = createSession(selectedPersona || undefined);
+    const created = createSession(selectedPersona || undefined, currentWorkScope);
     commitSessions([created, ...current]); activeIdRef.current = created.id; setActiveSessionId(created.id);
-  }, [commitSessions, selectedPersona]);
+  }, [commitSessions, currentWorkScope, selectedPersona]);
 
   const handleContentNewSession = useCallback((content: Mother | null) => {
     ensureContentSession(content, true);
@@ -663,13 +721,12 @@ ${JSON.stringify(structured, null, 2)}
     fetchPersonas().then((list) => {
       setPersonas(list);
       setSelectedPersona(name);
+      setSelectedTarget('');
       savePersonaSelection(name);
-      setSessions((prev) => {
-        const updated = prev.map((s) => s.id === activeSessionId ? { ...s, persona: name } : s);
-        saveSessions(updated); return updated;
-      });
+      saveTargetSelection('');
+      void refreshProfileContext().catch(() => {});
     }).catch(() => {});
-  }, [activeSessionId]);
+  }, [refreshProfileContext]);
 
   // 画像删除完成：刷新列表 + 若删的是当前选中的则清空选择
   const handleProfileDeleted = useCallback((name: string) => {
@@ -677,11 +734,14 @@ ${JSON.stringify(structured, null, 2)}
       setPersonas(list);
       setSelectedPersona((cur) => {
         if (cur !== name) return cur;
+        setSelectedTarget('');
         savePersonaSelection('');
+        saveTargetSelection('');
         return '';
       });
+      void refreshProfileContext().catch(() => {});
     }).catch(() => {});
-  }, []);
+  }, [refreshProfileContext]);
 
   const ensureGlobalSession = useCallback((): string => {
     const current = sessionsRef.current;
@@ -692,10 +752,10 @@ ${JSON.stringify(structured, null, 2)}
     if (target) {
       activeIdRef.current = target.id; setActiveSessionId(target.id); return target.id;
     }
-    const created = createSession(selectedPersona || undefined);
+    const created = createSession(selectedPersona || undefined, currentWorkScope);
     commitSessions([created, ...current]); activeIdRef.current = created.id; setActiveSessionId(created.id);
     return created.id;
-  }, [commitSessions, selectedPersona]);
+  }, [commitSessions, currentWorkScope, selectedPersona]);
 
   const navigate = useCallback((page: Page) => {
     if (page === 'chat') ensureGlobalSession();
@@ -710,7 +770,8 @@ ${JSON.stringify(structured, null, 2)}
           onPersonaChange={handlePersonaChange} onNewPersona={() => setShowWizard(true)}
           onEditPersona={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} />;
       case 'channels':
-        return <RippleChannels onNavigate={navigate} />;
+      case 'accounts':
+        return <RippleIntegrations initialSection="accounts" onNavigate={navigate} onNewProfile={() => setShowWizard(true)} onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} />;
       case 'analytics':
         return <RippleAnalytics />;
       case 'chat':
@@ -726,18 +787,19 @@ ${JSON.stringify(structured, null, 2)}
           onAiNewSession={handleContentNewSession}
           onAiResend={(userIndex, displayText, attachments, legacyAgentText, injection) => { if (activeSession) handleResend(activeSession.id, userIndex, displayText, attachments, legacyAgentText, injection); }} />;
       case 'integrations':
-        return <RippleIntegrations />;
+        return <RippleIntegrations onNavigate={navigate} onNewProfile={() => setShowWizard(true)} onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }} />;
       case 'trends':
         return <TrendsPage onOpenIdeas={(seed) => { try { sessionStorage.setItem('ripple_idea_seed', JSON.stringify(seed)); } catch { /* ignore */ } navigate('ideas'); }} onBreakdown={handleBreakdown} />;
       case 'campaigns':
         return <CampaignsPage persona={selectedPersona} aiReady={recommendationAiReady}
+          accountIds={scopeAccountIds} currentAccountId={selectedTarget.startsWith('account:') ? selectedTarget.slice('account:'.length) : ''}
           personas={personas} onPersonaChange={handlePersonaChange} onNewPersona={() => setShowWizard(true)}
           onOpenSettings={() => setCurrentPage('integrations')}
           onOpenIdeas={(id) => { try { sessionStorage.setItem('ripple_idea_focus', id); } catch { /* ignore */ } navigate('ideas'); }} />;
       case 'ideas':
         return <IdeasPage onUseTopic={handleUseTopic}
           onOpenContent={(id) => { try { sessionStorage.setItem('ripple_content_focus', id); } catch { /* ignore */ } navigate('contents'); }}
-          persona={selectedPersona} aiReady={recommendationAiReady}
+          persona={selectedPersona} aiReady={recommendationAiReady} accountIds={scopeAccountIds}
           personas={personas} onPersonaChange={handlePersonaChange} onNewPersona={() => setShowWizard(true)} />;
       case 'calendar':
         return <RippleCalendar onNavigate={navigate} />;
@@ -753,8 +815,6 @@ ${JSON.stringify(structured, null, 2)}
         return <SkillPage persona={selectedPersona} onNavigate={navigate} />;
       case 'outputs':
         return <OutputsPage />;
-      case 'accounts':
-        return <RippleChannels onNavigate={navigate} />;
       case 'profile':
         return <ProfilePage persona={selectedPersona} onNewProfile={() => setShowWizard(true)} onDeleted={handleProfileDeleted} />;
       default:
@@ -764,13 +824,61 @@ ${JSON.stringify(structured, null, 2)}
 
   const handlePersonaChange = useCallback((persona: string) => {
     setSelectedPersona(persona);
+    setSelectedTarget('');
     savePersonaSelection(persona);
-    setSessions((prev) => {
-      const updated = prev.map((s) => s.id === activeSessionId ? { ...s, persona: persona || undefined } : s);
-      saveSessions(updated);
-      return updated;
-    });
-  }, [activeSessionId]);
+    saveTargetSelection('');
+  }, []);
+
+  const handleScopeChange = useCallback((scope: string) => {
+    if (scope === '__new__') { setShowWizard(true); return; }
+    if (scope === 'generic') {
+      setSelectedPersona(''); setSelectedTarget('');
+      savePersonaSelection(''); saveTargetSelection('');
+      return;
+    }
+    if (scope.startsWith('legacy:')) {
+      const persona = scope.slice('legacy:'.length);
+      setSelectedPersona(persona); setSelectedTarget('');
+      savePersonaSelection(persona); saveTargetSelection('');
+      return;
+    }
+    if (scope.startsWith('profile:')) {
+      const profileId = scope.slice('profile:'.length);
+      const profile = profileContext?.profiles.find((item) => item.id === profileId);
+      const persona = profile?.legacy_name || '';
+      setSelectedPersona(persona); setSelectedTarget('');
+      savePersonaSelection(persona); saveTargetSelection('');
+      return;
+    }
+    if (scope.startsWith('target:')) {
+      const [, targetKind, ...rest] = scope.split(':');
+      const targetId = rest.join(':');
+      const binding = profileContext?.bindings.find((item) => item.target_kind === targetKind && item.account_id === targetId);
+      const profile = binding ? profileContext?.profiles.find((item) => item.id === binding.profile_id) : undefined;
+      const persona = profile?.legacy_name || '';
+      const targetKey = targetKind + ':' + targetId;
+      setSelectedPersona(persona); setSelectedTarget(targetKey);
+      savePersonaSelection(persona); saveTargetSelection(targetKey);
+    }
+  }, [profileContext]);
+  const activeSessionScopeKey = activeSession?.workScope ? activeSession.workScope.targetKind + ':' + activeSession.workScope.accountId : '';
+  const sessionScopeMismatch = !!activeSession && (activeSession.workScope
+    ? selectedTarget !== activeSessionScopeKey
+    : !!activeSession.persona && activeSession.persona !== selectedPersona);
+  const restoreActiveSessionScope = () => {
+    if (activeSession?.workScope) {
+      handleScopeChange('target:' + activeSession.workScope.targetKind + ':' + activeSession.workScope.accountId);
+    } else if (activeSession?.persona) {
+      handlePersonaChange(activeSession.persona);
+    }
+  };
+  const startCurrentScopeConversation = useCallback(() => {
+    const created = createSession(selectedPersona || undefined, currentWorkScope);
+    commitSessions([created, ...sessionsRef.current]);
+    activeIdRef.current = created.id;
+    setActiveSessionId(created.id);
+    setCurrentPage('chat');
+  }, [commitSessions, currentWorkScope, selectedPersona, setCurrentPage]);
 
   return (
     <div className="app-layout">
@@ -779,12 +887,25 @@ ${JSON.stringify(structured, null, 2)}
         onPageChange={navigate}
         personas={personas}
         selectedPersona={selectedPersona}
-        onPersonaChange={handlePersonaChange}
-        onNewProfile={() => setShowWizard(true)}
+        profileContext={profileContext}
+        selectedTarget={selectedTarget}
+        onScopeChange={handleScopeChange}
+        onEditProfile={(name) => { handlePersonaChange(name); setCurrentPage('profile'); }}
+        onManageAccounts={() => {
+          const url = new URL(location.href);
+          url.searchParams.set('page', 'integrations');
+          url.searchParams.set('section', 'accounts');
+          history.pushState({}, '', url);
+          setCurrentPage('integrations');
+        }}
         agentStatus={agentStatus}
         recommendationAiReady={recommendationAiReady}
       />
       <main className="main-content">
+        {sessionScopeMismatch && (currentPage === 'chat' || currentPage === 'contents') && <div role="status" className="session-scope-alert">
+          <span>此会话固定于 {activeSession?.workScope ? activeSession.workScope.accountLabel + ' · ' + activeSession.workScope.profileName + ' V' + activeSession.workScope.profileRevision : '画像 ' + activeSession?.persona}；左上角切换不会改写它。</span>
+          <div><button type="button" onClick={restoreActiveSessionScope}>切回会话范围</button><button type="button" onClick={startCurrentScopeConversation}>按当前范围新建会话</button></div>
+        </div>}
         {(['trends', 'campaigns', 'ideas', 'planning', 'breakdown', 'publish', 'interactions', 'calendar', 'analytics'] as Page[]).includes(currentPage) && (
           <SubNav current={currentPage} onNavigate={setCurrentPage} />
         )}

@@ -255,7 +255,7 @@ export default function OutputsPage() {
         <div>
           <h1 className="page-title">
             <IconOutputs size={21} />
-            <span className="crumb" onClick={() => goTo(0)}>素材与成品</span>
+            <span className="crumb" onClick={() => goTo(0)}>素材</span>
             {stack.map((name, i) => (
               <span key={i}>
                 <span className="crumb-sep">/</span>

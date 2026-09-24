@@ -87,7 +87,7 @@ export default function SkillPage({ persona, onNavigate }: SkillPageProps) {
   return (
     <div className="skills-page">
       <div className="skills-page-head">
-        <h1 className="page-title">技能库</h1>
+        <h1 className="page-title">技能</h1>
         <p className="page-subtitle">
           共 {skills.length} 个技能，按流水线层分区浏览。Skill 用来指导 Agent 的工作方法；模型与媒体服务凭据统一在「设置」管理。
           {needApiCount > 0 && ` 当前有 ${needApiCount} 个依赖服务尚未就绪。`}

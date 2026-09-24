@@ -10,18 +10,18 @@ interface SubNavProps {
 type ToolItem = { page: Page; Icon: ComponentType<{ size?: number }>; label: string };
 
 const TOPIC_TOOLS: ToolItem[] = [
-  { page: 'trends', Icon: IconFire, label: '热点雷达' },
-  { page: 'campaigns', Icon: IconCompass, label: '活动广场' },
+  { page: 'trends', Icon: IconFire, label: '热点' },
+  { page: 'campaigns', Icon: IconCompass, label: '活动' },
   { page: 'ideas', Icon: IconIdea, label: '选题库' },
-  { page: 'planning', Icon: IconCalendar, label: '选题日历' },
-  { page: 'breakdown', Icon: IconSkills, label: '爆款拆解' },
+  { page: 'planning', Icon: IconCalendar, label: '排期' },
+  { page: 'breakdown', Icon: IconSkills, label: '拆解' },
 ];
 
 const PUBLISH_TOOLS: ToolItem[] = [
-  { page: 'publish', Icon: IconPublish, label: '发布任务' },
-  { page: 'interactions', Icon: IconSkills, label: '互动管理' },
-  { page: 'calendar', Icon: IconCalendar, label: '发布日历' },
-  { page: 'analytics', Icon: IconChart, label: '发布记录' },
+  { page: 'publish', Icon: IconPublish, label: '任务' },
+  { page: 'interactions', Icon: IconSkills, label: '互动' },
+  { page: 'calendar', Icon: IconCalendar, label: '日历' },
+  { page: 'analytics', Icon: IconChart, label: '记录' },
 ];
 
 export default function SubNav({ current, onNavigate }: SubNavProps) {

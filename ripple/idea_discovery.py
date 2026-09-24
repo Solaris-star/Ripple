@@ -359,6 +359,8 @@ class IdeaDiscoveryService:
                     target_platforms_json TEXT NOT NULL DEFAULT '[]',
                     trend_sources_json TEXT NOT NULL DEFAULT '[]',
                     account_ids_json TEXT NOT NULL DEFAULT '[]',
+                    profile_id TEXT NOT NULL DEFAULT '',
+                    profile_revision INTEGER NOT NULL DEFAULT 0,
                     mode TEXT NOT NULL DEFAULT 'balanced',
                     focus_keywords_json TEXT NOT NULL DEFAULT '[]',
                     effort_minutes INTEGER NOT NULL DEFAULT 120,
@@ -428,6 +430,10 @@ class IdeaDiscoveryService:
                 db.execute("ALTER TABLE discovery_policies ADD COLUMN pending_source_digest TEXT NOT NULL DEFAULT ''")
             if "pending_since" not in policy_columns:
                 db.execute("ALTER TABLE discovery_policies ADD COLUMN pending_since INTEGER NOT NULL DEFAULT 0")
+            if "profile_id" not in policy_columns:
+                db.execute("ALTER TABLE discovery_policies ADD COLUMN profile_id TEXT NOT NULL DEFAULT ''")
+            if "profile_revision" not in policy_columns:
+                db.execute("ALTER TABLE discovery_policies ADD COLUMN profile_revision INTEGER NOT NULL DEFAULT 0")
             notice_columns = {str(row["name"]) for row in db.execute("PRAGMA table_info(discovery_notices)").fetchall()}
             if "budget_date" not in notice_columns:
                 db.execute("ALTER TABLE discovery_notices ADD COLUMN budget_date TEXT NOT NULL DEFAULT ''")
@@ -455,6 +461,8 @@ class IdeaDiscoveryService:
             "target_platforms": _loads(value["target_platforms_json"], []),
             "trend_sources": _loads(value["trend_sources_json"], []),
             "account_ids": _loads(value["account_ids_json"], []),
+            "profile_id": str(value.get("profile_id") or ""),
+            "profile_revision": int(value.get("profile_revision") or 0),
             "mode": value["mode"], "focus_keywords": _loads(value["focus_keywords_json"], []),
             "effort_minutes": int(value["effort_minutes"]),
             "max_daily_runs": int(value["max_daily_runs"]),
@@ -514,6 +522,8 @@ class IdeaDiscoveryService:
         targets = list(dict.fromkeys(str(item)[:40] for item in value.get("target_platforms", []) if str(item).strip()))[:12]
         trends = list(dict.fromkeys(str(item)[:40] for item in value.get("trend_sources", []) if str(item).strip()))[:12]
         accounts = list(dict.fromkeys(str(item)[:64] for item in value.get("account_ids", []) if str(item).strip()))[:30]
+        profile_id = str(value.get("profile_id") or "")[:80]
+        profile_revision = max(0, int(value.get("profile_revision") or 0))
         focus = list(dict.fromkeys(str(item).strip()[:80] for item in value.get("focus_keywords", []) if str(item).strip()))[:30]
         effort = max(30, min(int(value.get("effort_minutes") or 120), 1440))
         max_runs = max(1, min(int(value.get("max_daily_runs") or 6), 24))
@@ -533,15 +543,16 @@ class IdeaDiscoveryService:
                 """
                 INSERT INTO discovery_policies(
                     id,persona,enabled,revision,target_platforms_json,trend_sources_json,account_ids_json,
-                    mode,focus_keywords_json,effort_minutes,max_daily_runs,max_daily_candidates,max_daily_notices,
+                    profile_id,profile_revision,mode,focus_keywords_json,effort_minutes,max_daily_runs,max_daily_candidates,max_daily_notices,
                     min_candidate_score,timezone,quiet_start,quiet_end,important_notifications,last_scan_at,
                     last_daily_review,last_source_digest,pending_source_digest,pending_since,
                     source_health_json,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(id) DO UPDATE SET
                     enabled=excluded.enabled,revision=excluded.revision,
                     target_platforms_json=excluded.target_platforms_json,trend_sources_json=excluded.trend_sources_json,
-                    account_ids_json=excluded.account_ids_json,mode=excluded.mode,
+                    account_ids_json=excluded.account_ids_json,profile_id=excluded.profile_id,
+                    profile_revision=excluded.profile_revision,mode=excluded.mode,
                     focus_keywords_json=excluded.focus_keywords_json,effort_minutes=excluded.effort_minutes,
                     max_daily_runs=excluded.max_daily_runs,max_daily_candidates=excluded.max_daily_candidates,
                     max_daily_notices=excluded.max_daily_notices,min_candidate_score=excluded.min_candidate_score,
@@ -551,7 +562,7 @@ class IdeaDiscoveryService:
                 """,
                 (
                     pid, persona, int(enabled), revision, _json(targets), _json(trends), _json(accounts),
-                    mode, _json(focus), effort, max_runs, max_candidates, max_notices, min_score,
+                    profile_id, profile_revision, mode, _json(focus), effort, max_runs, max_candidates, max_notices, min_score,
                     zone, quiet_start, quiet_end, int(bool(value.get("important_notifications"))), 0,
                     "", last_digest, "", 0, "{}", created, now_iso, last_digest,
                 ),

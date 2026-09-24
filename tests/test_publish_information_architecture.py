@@ -46,7 +46,8 @@ def test_content_workbench_owns_variant_editing_and_publish_execution():
 
 def test_publish_subnav_uses_task_management_label():
     source = text("web/frontend/src/components/SubNav.tsx")
-    assert "发布任务" in source
+    assert "{ page: 'publish', Icon: IconPublish, label: '任务' }" in source
+    assert "发布任务" not in source
     assert "发布工作台" not in source
     assert "subnav-group-label" not in source
     assert "groupLabel" not in source
@@ -54,9 +55,10 @@ def test_publish_subnav_uses_task_management_label():
 
 def test_accounts_page_localizes_optional_blog_connector_failure():
     source = text("web/frontend/src/components/workspace/Accounts.tsx")
-    assert "const [a, c, s, x, n] = await Promise.all" in source
+    assert "const results = await Promise.allSettled" in source
     assert "'/api/ripple/execution-nodes'" in source
-    assert "setBlogError(blogErrorText(value))" in source
+    assert "const blogFailure = results[5]" in source
+    assert "setBlogError(blogErrorText(blogFailure.reason))" in source
     assert "其他平台账号不受影响" in source
 
 
@@ -89,5 +91,8 @@ def test_server_auth_shell_and_settings_exist_without_changing_local_mode():
     assert "<AuthBoundary><RippleApp /></AuthBoundary>" in app
     assert "if (status.local || status.authenticated)" in auth
     assert "Server 安全配置未完成" in auth
-    assert "用户与访问" in text("web/frontend/src/components/workspace/Integrations.tsx")
+    integrations = text("web/frontend/src/components/workspace/Integrations.tsx")
+    assert "['members', '成员']" in integrations
+    assert "auth?.mode === 'server'" in integrations
+    assert "!auth?.local" in integrations
     assert "本机模式" in settings and "默认免登录" in settings

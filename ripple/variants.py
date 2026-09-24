@@ -28,6 +28,7 @@ class VariantTarget(BaseModel):
     """One platform selection. Account/remote target is intentionally optional."""
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     platform: str
+    account_id: str = Field(default="", max_length=100)
 
     @field_validator("platform")
     @classmethod
@@ -45,9 +46,9 @@ class VariantBatchInput(BaseModel):
 
     @model_validator(mode="after")
     def unique_platforms(self):
-        keys = [item.platform for item in self.targets]
+        keys = [(item.platform, item.account_id or "") for item in self.targets]
         if len(set(keys)) != len(keys):
-            raise ValueError("同一批次不能重复选择平台")
+            raise ValueError("同一批次不能重复选择同一平台的同一账号")
         return self
 
 
@@ -102,7 +103,7 @@ class VariantService:
             raise WorkflowError("平台版本已变化，请刷新后重试。")
         return item
 
-    def _new_variant(self, source: dict, platform: str, *, content: dict | None = None, legacy_task_id: str = "") -> dict:
+    def _new_variant(self, source: dict, platform: str, *, target_id: str = "", content: dict | None = None, legacy_task_id: str = "") -> dict:
         source_content = source["content"]
         body = content or {
             "project_id": source_content.get("project_id", "local"),
@@ -110,7 +111,7 @@ class VariantService:
             "body": source_content.get("body", ""),
             "media": list(source_content.get("media") or []),
             "tags": source_content.get("tags", ""),
-            "target_id": "",
+            "target_id": target_id,
             "delivery": "remote",
             "scheduled_local": None,
             "timezone": "Asia/Shanghai",
@@ -154,7 +155,8 @@ class VariantService:
                 source = state.get("contents", {}).get(source_id)
                 if not source or platform not in PLATFORMS:
                     continue
-                variant = next((row for row in variants.values() if row.get("source_id") == source_id and row.get("platform") == platform), None)
+                legacy_target = "" if content.get("account_id") in {None, "", "local", "unselected"} else str(content.get("account_id") or "")
+                variant = next((row for row in variants.values() if row.get("source_id") == source_id and row.get("platform") == platform and str((row.get("content") or {}).get("target_id") or "") == legacy_target), None)
                 if variant is None:
                     variant_content = {
                         "project_id": content.get("project_id", "local"),
@@ -192,7 +194,7 @@ class VariantService:
             return sorted(rows, key=lambda row: row["created_at"], reverse=True)
 
     def create_many(self, source_id: str, req: VariantBatchInput) -> dict:
-        digest = fingerprint({"source_id": source_id, "expected_source_version": req.expected_source_version, "platforms": [x.platform for x in req.targets]})
+        digest = fingerprint({"source_id": source_id, "expected_source_version": req.expected_source_version, "targets": [{"platform": x.platform, "account_id": x.account_id} for x in req.targets]})
         with self.store.transaction() as state:
             source = state.get("contents", {}).get(source_id)
             if not source or source["version_id"] != req.expected_source_version:
@@ -206,13 +208,14 @@ class VariantService:
                 return {"items": [self._public(variants[item_id]) for item_id in previous["variant_ids"]], "replayed": True}
             if len(variants) + len(req.targets) > MAX_VARIANTS:
                 raise WorkflowError("平台版本数量已达到上限，请先归档。", 422)
-            existing = {row["platform"] for row in variants.values() if row.get("source_id") == source_id}
-            duplicate = [item.platform for item in req.targets if item.platform in existing]
+            existing = {(row["platform"], str((row.get("content") or {}).get("target_id") or "")) for row in variants.values() if row.get("source_id") == source_id}
+            duplicate = [(item.platform, item.account_id or "") for item in req.targets if (item.platform, item.account_id or "") in existing]
             if duplicate:
-                raise WorkflowError("以下平台版本已经存在：" + "、".join(PLATFORMS[key] for key in duplicate), 409)
+                labels = [f"{PLATFORMS[platform]}{(' · ' + account_id[:8]) if account_id else ''}" for platform, account_id in duplicate]
+                raise WorkflowError("以下账号版本已经存在：" + "、".join(labels), 409)
             created = []
             for target in req.targets:
-                row = self._new_variant(source, target.platform)
+                row = self._new_variant(source, target.platform, target_id=target.account_id)
                 variants[row["id"]] = row
                 created.append(row)
             batches[req.idempotency_key] = {"workspace_id": source.get("workspace_id") or DEFAULT_WORKSPACE_ID, "digest": digest, "variant_ids": [row["id"] for row in created], "created_at": utc_now()}
@@ -281,6 +284,23 @@ class VariantService:
                 options=content.get("options") or {},
             )
             snapshot = self.workspace._snapshot(task_input)
+            profile_context = None
+            profile_service = getattr(self.workspace, "content_profiles", None)
+            if profile_service is not None and account_id not in {"", "local", "unselected"}:
+                target_kind = "blog" if variant["platform"] == "blog" else "account"
+                binding = profile_service.binding(target_kind=target_kind, account_id=account_id)
+                if binding:
+                    profile = profile_service.get_profile(binding["profile_id"])
+                    profile_context = {
+                        "profile_id": profile["id"],
+                        "profile_revision": int(profile["current_revision"]),
+                        "profile_name": profile["display_name"],
+                        "legacy_name": profile["legacy_name"],
+                        "binding_revision": int(binding["binding_revision"]),
+                        "target_kind": target_kind,
+                        "account_id": account_id,
+                        "overrides": deepcopy(binding.get("overrides") or {}),
+                    }
             if len(state.get("tasks", {})) >= MAX_TASKS:
                 raise WorkflowError("最多保存 500 个发布任务。", 422)
             task_id = uuid.uuid4().hex
@@ -290,6 +310,7 @@ class VariantService:
                 "id": task_id, "version": 1, "version_id": version_id,
                 "workspace_id": variant.get("workspace_id") or DEFAULT_WORKSPACE_ID,
                 "variant_id": variant_id, "variant_version_id": variant["version_id"],
+                "content_profile_context": profile_context,
                 "content": snapshot, "history": [], "idempotency_key": req.idempotency_key,
                 "initial_digest": version_id, "request_digest": version_id, "approval": None,
                 "attempts": 0, "receipt": None, "created_at": now, "updated_at": now, "events": [],

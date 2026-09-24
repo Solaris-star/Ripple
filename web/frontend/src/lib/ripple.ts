@@ -113,6 +113,7 @@ export interface Task {
   approval: { version_id: string; at: string; real_publish_confirmed?: boolean; auth_revision?: number } | null;
   review_context?: { account_id?: string; auth_revision?: number; label: string; identity?: Account['identity']; adapter?: string; connector_id?: string };
   variant_id?: string; variant_version_id?: string;
+  content_profile_context?: { profile_id: string; profile_revision: number; profile_name: string; legacy_name: string; binding_revision: number; target_kind: 'account' | 'blog'; account_id: string; overrides: Record<string, unknown> } | null;
   receipt: { adapter: string; simulated: boolean; artifact_url?: string; public_url: string | null; result: string; verification?: string; not_submitted?: boolean; flow_id?: string; remote_status?: number; candidate_url?: string; draft_media_id?: string; publish_id?: string; publish_status?: number; draft_only?: boolean } | null;
   events: { at: string; status: string; note: string; version_id?: string }[];
 }

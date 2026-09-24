@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { fetchPersonaFiles, savePersonaFile, deletePersona } from '../lib/api';
-import type { PersonaFile } from '../lib/api';
+import { copyContentProfile, deletePersona, fetchContentProfile, fetchContentProfileContext, fetchPersonaFiles, renameContentProfile, saveContentProfileRevision } from '../lib/api';
+import type { ContentProfileDetail, PersonaFile } from '../lib/api';
 import { renderMarkdown } from '../lib/sanitize';
 
 interface ProfilePageProps {
@@ -20,11 +20,13 @@ const DIM_META: Record<string, { label: string; icon: string }> = {
 
 export default function ProfilePage({ persona, onNewProfile, onDeleted }: ProfilePageProps) {
   const [files, setFiles] = useState<PersonaFile[]>([]);
+  const [contentProfile, setContentProfile] = useState<ContentProfileDetail | null>(null);
+  const [displayName, setDisplayName] = useState('');
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [editing, setEditing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [savingFile, setSavingFile] = useState('');
+  const [saving, setSaving] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [toast, setToast] = useState('');
 
@@ -34,11 +36,21 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
     setLoading(true);
     setError('');
     setEditing(false);
-    fetchPersonaFiles(persona)
-      .then((d) => {
+    Promise.all([fetchPersonaFiles(persona), fetchContentProfileContext({ profile_name: persona })])
+      .then(async ([d, context]) => {
         if (ignore) return;
         setFiles(d.files);
         setDrafts(Object.fromEntries(d.files.map((f) => [f.filename, f.content])));
+        const summary = context.profiles.find((item) => item.legacy_name === persona);
+        if (summary) {
+          const detail = await fetchContentProfile(summary.id);
+          if (ignore) return;
+          setContentProfile(detail);
+          setDisplayName(detail.display_name);
+        } else {
+          setContentProfile(null);
+          setDisplayName(persona);
+        }
       })
       .catch(() => { if (!ignore) setError('加载画像失败'); })
       .finally(() => { if (!ignore) setLoading(false); });
@@ -47,17 +59,76 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
 
   const showToast = (msg: string) => { setToast(msg); setTimeout(() => setToast(''), 2500); };
 
-  const handleSave = async (filename: string) => {
-    setSavingFile(filename);
+  const dirty = files.some((file) => (drafts[file.filename] ?? '') !== file.content);
+  const nameDirty = !!contentProfile && displayName.trim() !== contentProfile.display_name;
+
+  useEffect(() => {
+    if (!dirty && !nameDirty) return;
+    const guard = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', guard);
+    return () => window.removeEventListener('beforeunload', guard);
+  }, [dirty, nameDirty]);
+
+  const handleRename = async () => {
+    if (!contentProfile || !nameDirty || !displayName.trim()) return;
+    setSaving(true);
     try {
-      await savePersonaFile(persona, filename, drafts[filename] ?? '');
-      setFiles((prev) => prev.map((f) => f.filename === filename ? { ...f, content: drafts[filename] ?? '' } : f));
-      showToast(`已保存 ${DIM_META[filename]?.label || filename} ✓`);
+      const next = await renameContentProfile(contentProfile.id, displayName.trim());
+      setContentProfile(next);
+      setDisplayName(next.display_name);
+      window.dispatchEvent(new Event('ripple:profile-context-changed'));
+      showToast('画像名称已更新；稳定 ID 与历史引用保持不变');
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : '改名失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleCopy = async () => {
+    if (!contentProfile || saving) return;
+    const name = window.prompt('复制为新的账号画像名称', `${contentProfile.display_name} 副本`)?.trim();
+    if (!name) return;
+    setSaving(true);
+    try {
+      const created = await copyContentProfile(contentProfile.id, name);
+      window.dispatchEvent(new Event('ripple:profile-context-changed'));
+      showToast(`已创建独立画像「${created.display_name}」`);
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : '复制失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (!contentProfile || !dirty) return;
+    setSaving(true);
+    try {
+      const next = await saveContentProfileRevision(contentProfile.id, {
+        expected_revision: contentProfile.current_revision,
+        files: drafts,
+        note: '用户在画像页面确认修改。',
+        confirm: true,
+      });
+      setContentProfile(next);
+      setFiles(Object.entries(next.files).map(([filename, content]) => ({ filename, content })));
+      setDrafts(next.files);
+      setEditing(false);
+      window.dispatchEvent(new Event('ripple:profile-context-changed'));
+      showToast(`画像已确认生效 · V${next.current_revision}`);
     } catch (e) {
       showToast(e instanceof Error ? e.message : '保存失败');
     } finally {
-      setSavingFile('');
+      setSaving(false);
     }
+  };
+
+  const toggleEditing = () => {
+    if (editing && (dirty || nameDirty) && !window.confirm('还有未保存的画像修改。退出编辑将放弃这些修改，继续吗？')) return;
+    if (editing && dirty) setDrafts(Object.fromEntries(files.map((file) => [file.filename, file.content])));
+    if (editing && nameDirty && contentProfile) setDisplayName(contentProfile.display_name);
+    setEditing((value) => !value);
   };
 
   const handleDelete = async () => {
@@ -77,11 +148,11 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
   if (!persona) {
     return (
       <div className="profile-page">
-        <h1 className="page-title">用户画像 Profile</h1>
+        <h1 className="page-title">账号画像</h1>
         <div className="empty-state" style={{ height: '70%' }}>
           <div className="empty-icon">👤</div>
           <h3>还没有选择画像</h3>
-          <p>画像沉淀你的定位、风格、受众与红线，生成内容会更贴合你的人设。</p>
+          <p>画像沉淀账号定位、受众、表达方式与红线，可以先建画像再绑定平台账号。</p>
           <button className="btn btn-primary" onClick={onNewProfile}>+ 新建画像</button>
         </div>
       </div>
@@ -92,15 +163,17 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
     <div className="profile-page">
       <div className="profile-head">
         <div>
-          <h1 className="page-title">{persona}</h1>
-          <p className="page-subtitle">六个维度构成一个完整人设，可随时编辑保存。</p>
+          {editing ? <div className="profile-name-edit"><input aria-label="画像显示名称" maxLength={120} value={displayName} onChange={(e) => setDisplayName(e.target.value)} /><button className="btn btn-sm" disabled={!nameDirty || saving || !displayName.trim()} onClick={() => void handleRename()}>保存名称</button></div> : <h1 className="page-title">{contentProfile?.display_name || persona}</h1>}
+          <p className="page-subtitle">账号画像 · {contentProfile ? `V${contentProfile.current_revision}` : '读取中'} · {contentProfile?.bindings.length || 0} 个关联账号{dirty || nameDirty ? ' · 有未保存修改' : ''}</p>
         </div>
         <div style={{ display: 'flex', gap: 8 }}>
-          <button className={`btn ${editing ? 'btn-primary' : ''}`} onClick={() => setEditing((v) => !v)}>
-            {editing ? '完成编辑' : '✏️ 编辑资料'}
+          {editing && <button className="btn btn-primary" disabled={!dirty || saving || !contentProfile} onClick={() => void handleSave()}>{saving ? '保存中…' : dirty ? '保存并确认生效' : '没有修改'}</button>}
+          <button className={`btn ${editing ? '' : 'btn-primary'}`} disabled={saving} onClick={toggleEditing}>
+            {editing ? '退出编辑' : '✏️ 编辑画像'}
           </button>
+          <button className="btn" disabled={saving || !contentProfile} onClick={() => void handleCopy()}>复制画像</button>
           <button className="btn" style={{ color: 'var(--red)', borderColor: 'var(--red)' }}
-            disabled={deleting} onClick={handleDelete}>
+            disabled={deleting || saving} onClick={handleDelete}>
             {deleting ? '删除中…' : '🗑 删除画像'}
           </button>
         </div>
@@ -118,12 +191,7 @@ export default function ProfilePage({ persona, onNewProfile, onDeleted }: Profil
             <div key={f.filename} className="profile-dim">
               <div className="profile-dim-head">
                 <div className="profile-dim-title">{meta.icon} {meta.label}</div>
-                {editing && (
-                  <button className="btn btn-sm btn-primary" disabled={!dirty || savingFile === f.filename}
-                    onClick={() => handleSave(f.filename)}>
-                    {savingFile === f.filename ? '保存中…' : dirty ? '保存' : '已保存'}
-                  </button>
-                )}
+                {editing && <span className="r2-muted">{dirty ? '有修改' : '已保存'}</span>}
               </div>
               {editing ? (
                 <textarea

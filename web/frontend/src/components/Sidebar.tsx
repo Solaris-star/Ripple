@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import type { PersonaItem } from '../lib/api';
+import type { ContentProfileContext, PersonaItem } from '../lib/api';
 import type { ComponentType } from 'react';
 import { getTheme, setTheme, type ThemeMode } from '../lib/theme';
+import { platformDisplayName } from '../lib/platforms';
+import '../styles/account-profile.css';
 import {
-  IconSkills, IconOutputs, IconAccounts, IconChevron, IconLayout,
+  IconSkills, IconOutputs, IconChevron, IconLayout,
   IconDashboard, IconPublish, IconCompass, IconFile, IconSun, IconMoon,
 } from './icons';
 
@@ -14,8 +16,11 @@ interface SidebarProps {
   onPageChange: (page: Page) => void;
   personas: PersonaItem[];
   selectedPersona: string;
-  onPersonaChange: (persona: string) => void;
-  onNewProfile: () => void;
+  profileContext: ContentProfileContext | null;
+  selectedTarget: string;
+  onScopeChange: (scope: string) => void;
+  onEditProfile: (name: string) => void;
+  onManageAccounts: () => void;
   agentStatus: string;
   recommendationAiReady: boolean;
 }
@@ -23,11 +28,10 @@ interface SidebarProps {
 const TOPIC_PAGES: Page[] = ['trends', 'campaigns', 'ideas', 'planning', 'breakdown'];
 const PUBLISH_PAGES: Page[] = ['publish', 'interactions', 'calendar', 'analytics'];
 const RESOURCE_NAV: { page: Page; Icon: ComponentType<{ size?: number }>; label: string }[] = [
-  { page: 'outputs', Icon: IconOutputs, label: '素材与成品' },
-  { page: 'channels', Icon: IconAccounts, label: '账号与平台' },
+  { page: 'outputs', Icon: IconOutputs, label: '素材' },
 ];
 const TOOL_NAV: { page: Page; Icon: ComponentType<{ size?: number }>; label: string }[] = [
-  { page: 'skills', Icon: IconSkills, label: '技能库' },
+  { page: 'skills', Icon: IconSkills, label: '技能' },
   { page: 'integrations', Icon: IconLayout, label: '设置' },
 ];
 
@@ -61,7 +65,8 @@ function widthCap(viewport: number): number {
 }
 
 export default function Sidebar({
-  currentPage, onPageChange, personas, selectedPersona, onPersonaChange, onNewProfile,
+  currentPage, onPageChange, personas, selectedPersona,
+  profileContext, selectedTarget, onScopeChange, onEditProfile, onManageAccounts,
   agentStatus, recommendationAiReady,
 }: SidebarProps) {
   const [theme, setThemeState] = useState<ThemeMode>(() => getTheme());
@@ -126,6 +131,10 @@ export default function Sidebar({
   const topicActive = TOPIC_PAGES.includes(currentPage);
   const publishActive = PUBLISH_PAGES.includes(currentPage);
   const compact = collapsed || mobileRail;
+  const targetRows = [...(profileContext?.accounts || []), ...(profileContext?.blogs || [])];
+  const bindingByTarget = new Map((profileContext?.bindings || []).map((item) => [`${item.target_kind}:${item.account_id}`, item]));
+  const currentProfile = (profileContext?.profiles || []).find((item) => item.legacy_name === selectedPersona);
+  const scopeValue = selectedTarget ? `target:${selectedTarget}` : currentProfile ? `profile:${currentProfile.id}` : selectedPersona ? `legacy:${selectedPersona}` : 'generic';
 
   return (
     <div className={`sidebar ${compact ? 'collapsed' : ''} ${resizing ? 'resizing' : ''}`} style={{ width: effectiveWidth, minWidth: effectiveWidth }}>
@@ -137,25 +146,40 @@ export default function Sidebar({
           </div>
           {!mobileRail && <button className="sidebar-collapse-btn" type="button" aria-label={collapsed ? '展开侧边栏' : '折叠侧边栏'} title={collapsed ? '展开侧边栏' : '折叠侧边栏'} onClick={() => setCollapsed((value) => !value)}><IconChevron size={15} /></button>}
         </div>
-        <select className="persona-select" value={selectedPersona} onChange={(e) => {
-          if (e.target.value === '__new__') { onNewProfile(); return; }
-          onPersonaChange(e.target.value);
-        }} title="当前账号画像；也可在首页或选题库切换">
-          <option value="">通用模式</option>
-          {personas.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
+        <select className="persona-select" aria-label="当前工作范围" value={scopeValue} onChange={(e) => onScopeChange(e.target.value)} title="当前工作范围：账号画像或具体平台账号">
+          <option value="generic">通用 / 未绑定规划</option>
+          {!profileContext && personas.map((profile) => <option key={profile.name} value={`legacy:${profile.name}`}>{profile.name}</option>)}
+          {(profileContext?.profiles || []).map((profile) => {
+            const bound = (profileContext?.bindings || []).filter((item) => item.profile_id === profile.id);
+            return <optgroup key={profile.id} label={profile.display_name}>
+              <option value={`profile:${profile.id}`}>{profile.display_name} · 全部关联账号</option>
+              {bound.map((binding) => {
+                const target = targetRows.find((item) => item.target_kind === binding.target_kind && item.id === binding.account_id);
+                return target ? <option key={`${binding.target_kind}:${binding.account_id}`} value={`target:${binding.target_kind}:${binding.account_id}`}>{platformDisplayName(target.platform)} · {target.identity?.name || target.label}</option> : null;
+              })}
+            </optgroup>;
+          })}
+          {selectedPersona && !currentProfile && <option value={`legacy:${selectedPersona}`}>{selectedPersona}</option>}
+          {targetRows.filter((target) => !bindingByTarget.has(`${target.target_kind}:${target.id}`)).length > 0 && <optgroup label="待关联画像">
+            {targetRows.filter((target) => !bindingByTarget.has(`${target.target_kind}:${target.id}`)).map((target) => <option key={`${target.target_kind}:${target.id}`} value={`target:${target.target_kind}:${target.id}`}>{platformDisplayName(target.platform)} · {target.identity?.name || target.label} · 待关联</option>)}
+          </optgroup>}
           <option value="__new__">+ 新建画像…</option>
         </select>
+        {!compact && <div className="sidebar-scope-actions">
+          <button type="button" disabled={!selectedPersona} onClick={() => selectedPersona && onEditProfile(selectedPersona)}>编辑画像</button>
+          <button type="button" onClick={onManageAccounts}>管理账号</button>
+        </div>}
       </div>
 
       <nav className="sidebar-nav" aria-label="主导航">
         <div className="nav-section-label">工作流</div>
         <button aria-label="首页" title="首页" className={`nav-item ${currentPage === 'dashboard' ? 'active' : ''}`} onClick={() => onPageChange('dashboard')}><span className="nav-icon"><IconDashboard size={18} /></span><span className="nav-item-label">首页</span></button>
 
-        <button aria-label="选题中心" title="选题中心" className={`nav-item ${topicActive ? 'active' : ''}`} onClick={() => onPageChange(rememberedPage(TOPIC_TAB_KEY, TOPIC_PAGES, 'trends'))}><span className="nav-icon"><IconCompass size={18} /></span><span className="nav-item-label">选题中心</span></button>
+        <button aria-label="选题" title="选题" className={`nav-item ${topicActive ? 'active' : ''}`} onClick={() => onPageChange(rememberedPage(TOPIC_TAB_KEY, TOPIC_PAGES, 'trends'))}><span className="nav-icon"><IconCompass size={18} /></span><span className="nav-item-label">选题</span></button>
 
-        <button aria-label="内容工作台" title="内容工作台" className={`nav-item ${currentPage === 'contents' ? 'active' : ''}`} onClick={() => onPageChange('contents')}><span className="nav-icon"><IconFile size={18} /></span><span className="nav-item-label">内容工作台</span></button>
+        <button aria-label="内容" title="内容" className={`nav-item ${currentPage === 'contents' ? 'active' : ''}`} onClick={() => onPageChange('contents')}><span className="nav-icon"><IconFile size={18} /></span><span className="nav-item-label">内容</span></button>
 
-        <button aria-label="发布管理" title="发布管理" className={`nav-item ${publishActive ? 'active' : ''}`} onClick={() => onPageChange(rememberedPage(PUBLISH_TAB_KEY, PUBLISH_PAGES, 'publish'))}><span className="nav-icon"><IconPublish size={18} /></span><span className="nav-item-label">发布管理</span></button>
+        <button aria-label="发布" title="发布" className={`nav-item ${publishActive ? 'active' : ''}`} onClick={() => onPageChange(rememberedPage(PUBLISH_TAB_KEY, PUBLISH_PAGES, 'publish'))}><span className="nav-icon"><IconPublish size={18} /></span><span className="nav-item-label">发布</span></button>
 
         <div className="nav-section-label">资源</div>
         {RESOURCE_NAV.map(({ page, Icon, label }) => <button key={page} aria-label={label} title={label} className={`nav-item ${currentPage === page || (page === 'channels' && currentPage === 'accounts') ? 'active' : ''}`} onClick={() => onPageChange(page)}><span className="nav-icon"><Icon size={18} /></span><span className="nav-item-label">{label}</span></button>)}

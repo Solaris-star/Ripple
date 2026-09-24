@@ -23,6 +23,8 @@ import { platformDisplayName } from '../lib/platforms';
 interface CampaignsPageProps {
   persona: string;
   aiReady: boolean;
+  accountIds?: string[];
+  currentAccountId?: string;
   personas: PersonaItem[];
   onPersonaChange: (name: string) => void;
   onNewPersona: () => void;
@@ -269,7 +271,7 @@ function paginationItems(page: number, totalPages: number): Array<number | 'elli
 }
 
 export default function CampaignsPage({
-  persona, aiReady, personas, onPersonaChange, onNewPersona, onOpenSettings, onOpenIdeas,
+  persona, aiReady, accountIds = [], currentAccountId = '', personas, onPersonaChange, onNewPersona, onOpenSettings, onOpenIdeas,
 }: CampaignsPageProps) {
   const [campaigns, setCampaigns] = useState<Campaign[]>([]);
   const [pageData, setPageData] = useState<CampaignPageResponse | null>(null);
@@ -322,6 +324,10 @@ export default function CampaignsPage({
   const [qualificationFilter, setQualificationFilter] = useState('all');
   const [accountFilter, setAccountFilter] = useState('all');
   const [sortMode, setSortMode] = useState<CampaignListSort>('recommend');
+  useEffect(() => {
+    setAccountFilter(currentAccountId || 'all');
+    setPage(1);
+  }, [currentAccountId]);
   const currentSource = sources.find((source) => source.platform === platformFilter);
   const refreshTargets = sources.filter((source) => source.automatic && (platformFilter === 'all' || source.platform === platformFilter)).map((source) => source.platform);
   const refreshing = refreshTargets.some((platform) => refreshingPlatforms.includes(platform));
@@ -829,6 +835,7 @@ export default function CampaignsPage({
     try {
       setRecommendResult(await recommendIdeas({
         persona,
+        account_ids: accountIds,
         campaign_id: campaign.id,
         trend_sources: loadTrendSelection(),
         target_platforms: [campaign.platform],
