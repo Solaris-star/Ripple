@@ -13,6 +13,7 @@ else:
 import hashlib
 import httpx
 import json
+import logging
 import re
 import secrets
 import shutil
@@ -34,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sse_starlette.sse import EventSourceResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+logger = logging.getLogger(__name__)
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -55,6 +57,10 @@ from ripple.media_connections import MediaConnectionStore
 from ripple.library import MotherCreate, MotherRevision
 from ripple.plans import ContentPlanCreate, ContentPlanRevision
 from ripple.ideation import IdeationService, IdeationError
+from ripple.idea_discovery import (
+    IdeaDiscoveryService, DiscoveryError, build_opportunities,
+    source_digest as discovery_source_digest, source_health as discovery_source_health,
+)
 from ripple.ideation_engine import platform_key as idea_platform_key, persona_platforms as idea_persona_platforms, source_ref as idea_source_ref, generation_prompt as idea_generation_prompt, parse_candidates as parse_idea_candidates, brief_prompt as idea_brief_prompt, parse_brief as parse_idea_brief
 from ripple.publishing import CreateInput, WorkflowError
 from ripple.timeouts import TIMEOUT_CHAT, TIMEOUT_DIRECT, TIMEOUT_PRODUCE
@@ -5069,6 +5075,10 @@ IDEA_TARGET_PLATFORMS = {"x", "xiaohongshu", "douyin", "tiktok", "bilibili", "we
                          "weixin-channels", "zhihu", "kuaishou", "weibo", "blog"}
 _IDEATION = IdeationService(OUTPUTS_DIR / "_ideation" / "ideas.sqlite3", legacy_path=IDEAS_FILE)
 app.state.ideation = _IDEATION
+_DISCOVERY = IdeaDiscoveryService(OUTPUTS_DIR / "_ideation" / "ideas.sqlite3")
+app.state.ideation_discovery = _DISCOVERY
+_DISCOVERY_TICK_LOCK = asyncio.Lock()
+_DISCOVERY_OWNER = f"web-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 _IDEA_TASKS: set[asyncio.Task] = set()
 
 
@@ -5121,6 +5131,26 @@ class IdeaRunCreate(BaseModel):
     effort_minutes: int = Field(default=0, ge=0, le=1440)
     limit: int = Field(default=6, ge=1, le=12)
     idempotency_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+
+
+class IdeaDiscoveryPolicyInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    persona: str = Field(min_length=1, max_length=100)
+    enabled: bool = False
+    target_platforms: list[str] = Field(default_factory=list, max_length=12)
+    trend_sources: list[str] = Field(default_factory=list, max_length=12)
+    account_ids: list[str] = Field(default_factory=list, max_length=30)
+    mode: str = Field(default="balanced", pattern=r"^(balanced|combo_only)$")
+    focus_keywords: list[str] = Field(default_factory=list, max_length=30)
+    effort_minutes: int = Field(default=120, ge=30, le=1440)
+    max_daily_runs: int = Field(default=6, ge=1, le=24)
+    max_daily_candidates: int = Field(default=6, ge=1, le=40)
+    max_daily_notices: int = Field(default=2, ge=0, le=12)
+    min_candidate_score: int = Field(default=68, ge=0, le=100)
+    timezone: str = Field(default="UTC", min_length=1, max_length=100)
+    quiet_start: str = Field(default="22:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    quiet_end: str = Field(default="08:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    important_notifications: bool = False
 
 
 class IdeaFeedbackInput(BaseModel):
@@ -5361,9 +5391,15 @@ async def _idea_run_context(request: dict) -> tuple[dict, list[dict], list[str],
         trend_sources = list(TREND_LABELS)
     groups = []
     if request.get("include_trends", True):
-        groups = await asyncio.gather(*[
-            asyncio.to_thread(_TREND_SERVICE.get_group, platform, 8) for platform in trend_sources
-        ])
+        if str(request.get("origin") or "manual") == "automatic":
+            groups = [
+                _TREND_SERVICE.peek_group(platform, 30)
+                for platform in trend_sources
+            ]
+        else:
+            groups = await asyncio.gather(*[
+                asyncio.to_thread(_TREND_SERVICE.get_group, platform, 8) for platform in trend_sources
+            ])
 
     explicit_ids = [str(value)[:64] for value in request.get("campaign_ids", []) if str(value).strip()]
     campaigns = _idea_campaigns(targets, explicit_ids) if request.get("include_campaigns", True) else []
@@ -5446,12 +5482,30 @@ async def _run_idea_job(run_id: str) -> None:
                 source_title_refs={source["title"]: source["id"] for source in sources if source["kind"] == "trend"},
                 campaign_by_ref=campaign_by_ref,
             )
-            if not recommendations:
+            origin = str(request.get("origin") or "manual")
+            if origin == "automatic":
+                threshold = max(0, min(100, int(request.get("min_candidate_score") or 68)))
+                recommendations = [
+                    value for value in recommendations
+                    if value.get("source_refs") and int(value.get("score") or 0) >= threshold
+                ][:1]
+                if not recommendations:
+                    _IDEATION.set_run(run_id, status="succeeded", stage="本次没有通过质量门槛的新机会", result={
+                        "idea_ids": [], "count": 0, "backend": backend,
+                        "target_platforms": targets, "trend_summary": trend_summary,
+                    })
+                    return
+            elif not recommendations:
                 raise WorkflowError("Agent 没有返回通过结构、来源和去重校验的选题。", 502)
-            created = _IDEATION.store_candidates(run_id, request["persona"], [{
-                **value, "source": f"Agent 推荐 · {request['persona']}", "status": "pending",
-                "persona": request["persona"],
-            } for value in recommendations])
+            created = _IDEATION.store_candidates(
+                run_id, request["persona"], [{
+                    **value, "source": f"Agent 推荐 · {request['persona']}", "status": "pending",
+                    "persona": request["persona"],
+                } for value in recommendations],
+                origin=origin,
+                opportunity_key=str(request.get("opportunity_key") or ""),
+                trigger_summary=str(request.get("trigger_summary") or ""),
+            )
             _IDEATION.set_run(run_id, status="succeeded", stage="候选已就绪", result={
                 "idea_ids": [value["id"] for value in created], "count": len(created), "backend": backend,
                 "target_platforms": targets, "trend_summary": trend_summary,
@@ -5507,9 +5561,244 @@ def _spawn_idea_job(run_id: str) -> None:
     task.add_done_callback(_IDEA_TASKS.discard)
 
 
+def _discovery_campaign_rows(policy: dict) -> list[dict]:
+    targets = set(policy.get("target_platforms") or [])
+    accounts = set(policy.get("account_ids") or [])
+    rows = []
+    for item in _read_campaigns():
+        row = {**item, "status": _campaign_effective_status(item)}
+        if targets and str(row.get("platform") or "") not in targets:
+            continue
+        account_id = str(row.get("account_id") or "")
+        if account_id and account_id not in accounts:
+            continue
+        rows.append(row)
+    return rows
+
+
+def _scan_discovery_policy(policy: dict, now: float) -> dict:
+    if not policy.get("enabled"):
+        return {"admitted": 0, "opportunities": 0}
+    if not profile_exists(str(policy.get("persona") or "")):
+        return {"admitted": 0, "opportunities": 0, "error": "profile_missing"}
+    trend_sources = [
+        value for value in (policy.get("trend_sources") or list(TREND_LABELS.keys()))
+        if value in TREND_LABELS
+    ]
+    groups = [_TREND_SERVICE.peek_group(platform, 30) for platform in trend_sources]
+    campaigns = _discovery_campaign_rows(policy)
+    digest = discovery_source_digest(groups, campaigns)
+    health = discovery_source_health(groups, campaigns)
+    changed = digest != str(policy.get("last_source_digest") or "")
+    daily_review = _DISCOVERY.daily_due(policy, now)
+    change_due = _DISCOVERY.source_change_due(policy, digest, now) if changed else False
+    if not change_due and not daily_review:
+        _DISCOVERY.record_health(str(policy["id"]), health, now=now)
+        return {
+            "admitted": 0, "opportunities": 0, "digest": digest, "health": health,
+            "coalescing": bool(changed),
+        }
+
+    opportunities = build_opportunities(
+        profile_text=load_profile_text(str(policy["persona"])),
+        focus_keywords=list(policy.get("focus_keywords") or []),
+        target_platforms=list(policy.get("target_platforms") or []),
+        trend_groups=groups,
+        campaigns=campaigns,
+        mode=str(policy.get("mode") or "balanced"),
+        effort_minutes=int(policy.get("effort_minutes") or 120),
+        now=now,
+        existing_keys=set(),
+        limit=min(8, int(policy.get("max_daily_runs") or 6)),
+    )
+    trigger_type = "bootstrap" if not policy.get("last_source_digest") else "source_change" if change_due else "daily_review"
+    admitted = 0
+    active_keys = {str(value["key"]) for value in opportunities}
+    minimum_score = int(policy.get("min_candidate_score") or 68)
+    for opportunity in opportunities:
+        if int(opportunity.get("score") or 0) < minimum_score:
+            continue
+        request = {
+            "persona": policy["persona"],
+            "target_platforms": list(policy.get("target_platforms") or []),
+            "trend_sources": list(opportunity.get("trend_sources") or []),
+            "trend_titles": list(opportunity.get("trend_titles") or []),
+            "include_trends": bool(opportunity.get("trend_titles")),
+            "include_campaigns": bool(opportunity.get("campaign_ids")),
+            "campaign_ids": list(opportunity.get("campaign_ids") or []),
+            "instruction": (
+                "这是主动发现任务。仅围绕本次触发机会生成一个可制作的核心候选；"
+                "没有足够证据时可以不生成。触发原因：" + str(opportunity.get("trigger_summary") or "")
+            )[:2000],
+            "goal": "主动发现值得及时判断的内容机会",
+            "effort_minutes": int(policy.get("effort_minutes") or 120),
+            "limit": 1,
+            "origin": "automatic",
+            "policy_id": policy["id"],
+            "opportunity_key": opportunity["key"],
+            "trigger_summary": str(opportunity.get("trigger_summary") or "")[:1000],
+            "min_candidate_score": int(policy.get("min_candidate_score") or 68),
+        }
+        payload = {**opportunity, "request": request}
+        job = _DISCOVERY.admit(
+            policy, payload, source_digest_value=digest,
+            trigger_type=trigger_type, now=now,
+        )
+        admitted += int(job is not None)
+
+    if not health.get("degraded"):
+        _DISCOVERY.expire_candidates(str(policy["id"]), active_keys)
+    _DISCOVERY.record_scan(
+        str(policy["id"]), digest=digest, health=health,
+        daily_review=daily_review, now=now,
+    )
+    return {
+        "admitted": admitted, "opportunities": len(opportunities),
+        "digest": digest, "health": health, "trigger_type": trigger_type,
+    }
+
+
+async def _reconcile_discovery_jobs() -> None:
+    for job in await asyncio.to_thread(_DISCOVERY.running_jobs, 30):
+        run_id = str(job.get("run_id") or "")
+        if not run_id:
+            continue
+        try:
+            run = _IDEATION.get_run(run_id)
+        except IdeationError:
+            await asyncio.to_thread(
+                _DISCOVERY.finish, job["id"], status="outcome_unknown",
+                error="关联的选题任务状态丢失，未自动重试。", usage={"status": "unknown"},
+            )
+            continue
+        status = str(run.get("status") or "")
+        usage = {"status": "unknown", "backend": (run.get("result") or {}).get("backend", "")}
+        if status == "succeeded":
+            idea_ids = [str(value) for value in (run.get("result") or {}).get("idea_ids", []) if str(value)]
+            await asyncio.to_thread(
+                _DISCOVERY.finish, job["id"],
+                status="succeeded" if idea_ids else "skipped",
+                idea_ids=idea_ids,
+                error="" if idea_ids else "本次分析没有通过来源与质量门槛的新候选。",
+                usage=usage,
+            )
+        elif status == "failed":
+            await asyncio.to_thread(
+                _DISCOVERY.finish, job["id"], status="failed",
+                error=str(run.get("error") or "主动发现分析失败。"), usage=usage,
+            )
+        elif status == "cancelled":
+            await asyncio.to_thread(
+                _DISCOVERY.finish, job["id"], status="cancelled",
+                error="关联选题任务已取消。", usage=usage,
+            )
+        elif status == "interrupted":
+            await asyncio.to_thread(
+                _DISCOVERY.finish, job["id"], status="outcome_unknown",
+                error="模型调用结果无法确认，未自动重试。", usage=usage,
+            )
+
+
+async def _dispatch_discovery_job(now: float) -> None:
+    if not _recommendation_ai_backend():
+        return
+    job = await asyncio.to_thread(_DISCOVERY.claim_next, owner=_DISCOVERY_OWNER, now=now)
+    if not job:
+        return
+    try:
+        policy = _DISCOVERY.get_policy_by_id(str(job["policy_id"]))
+        if not policy or not policy.get("enabled") or int(policy["revision"]) != int(job["policy_revision"]):
+            await asyncio.to_thread(
+                _DISCOVERY.finish, job["id"], status="cancelled",
+                error="策略已暂停或更新，未执行旧任务。", usage={"status": "not_started"}, now=now,
+            )
+            return
+        request = dict((job.get("trigger") or {}).get("request") or {})
+        run, created = _IDEATION.create_run(
+            "recommend", request, f"auto-discovery-{job['id']}"
+        )
+        if not created and run.get("status") == "interrupted":
+            run = _IDEATION.set_run(run["id"], status="queued", stage="queued", error="")
+        await asyncio.to_thread(_DISCOVERY.attach_run, job["id"], run["id"], now=now)
+        if created or run.get("status") == "queued":
+            _spawn_idea_job(run["id"])
+    except Exception as exc:
+        await asyncio.to_thread(
+            _DISCOVERY.release_claim, job["id"],
+            f"调度准备失败：{type(exc).__name__}", now=now,
+        )
+        logger.exception("Proactive idea discovery dispatch failed before model execution.")
+
+
+async def _idea_discovery_scheduler_tick() -> None:
+    if _DISCOVERY_TICK_LOCK.locked():
+        return
+    async with _DISCOVERY_TICK_LOCK:
+        await _reconcile_discovery_jobs()
+        now = time.time()
+        for policy in _DISCOVERY.list_enabled():
+            try:
+                # Discovery is strictly cache-only. Platform collection retains its
+                # existing independent schedule and paid/free rules.
+                await asyncio.to_thread(_scan_discovery_policy, policy, now)
+            except Exception:
+                logger.exception("Proactive idea discovery scan failed for persona %s", policy.get("persona"))
+        await _dispatch_discovery_job(now)
+
+
+app.state.ideation_discovery_tick = _idea_discovery_scheduler_tick
+
+
+@app.get("/api/idea-discovery")
+async def api_idea_discovery_state(persona: str):
+    if not persona.strip():
+        raise HTTPException(422, "必须选择账号画像。")
+    return _DISCOVERY.state(persona.strip())
+
+
+@app.put("/api/idea-discovery/policy")
+async def api_idea_discovery_policy(req: IdeaDiscoveryPolicyInput):
+    if not profile_exists(req.persona):
+        raise HTTPException(404, "当前账号画像不存在，请先选择或创建画像。")
+    targets = list(dict.fromkeys(filter(None, (idea_platform_key(value) for value in req.target_platforms))))
+    if req.enabled and not targets:
+        raise HTTPException(422, "开启主动发现前，请至少确认一个目标平台。")
+    trend_sources = list(dict.fromkeys(value for value in req.trend_sources if value in TREND_LABELS))
+    accounts = {str(row.get("id") or ""): row for row in _RIPPLE_WORKSPACE.accounts.list()}
+    for account_id in req.account_ids:
+        account = accounts.get(account_id)
+        if not account:
+            raise HTTPException(422, f"主动发现引用了不存在的账号：{account_id}")
+        if str(account.get("status") or "") != "connected":
+            raise HTTPException(409, f"账号「{account.get('label') or account_id}」当前未连接，不能用于主动发现私有活动。")
+        if targets and str(account.get("platform") or "") not in targets:
+            raise HTTPException(422, f"账号「{account.get('label') or account_id}」不属于已选目标平台。")
+    if req.enabled and not _recommendation_ai_backend():
+        raise HTTPException(409, "Agent 模型尚未配置，不能开启主动发现。")
+    value = req.model_dump()
+    value["target_platforms"] = targets
+    value["trend_sources"] = trend_sources
+    try:
+        _DISCOVERY.configure(req.persona, value)
+    except DiscoveryError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    return _DISCOVERY.state(req.persona)
+
+
+@app.post("/api/ideas/{iid}/seen")
+async def api_idea_seen(iid: str):
+    try:
+        idea = _IDEATION.mark_seen(iid)
+    except IdeationError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    _DISCOVERY.mark_idea_read(iid)
+    return idea
+
+
 @app.get("/api/idea-runs")
-async def api_idea_runs(limit: int = 20):
-    return {"items": _IDEATION.list_runs(limit)}
+async def api_idea_runs(limit: int = 20, persona: str = "", origin: str = "manual"):
+    safe_origin = origin if origin in {"", "manual", "automatic"} else "manual"
+    return {"items": _IDEATION.list_runs(limit, persona=persona, origin=safe_origin)}
 
 
 @app.post("/api/idea-runs", status_code=202)
@@ -5546,7 +5835,9 @@ async def api_idea_run_cancel(run_id: str):
 @app.post("/api/ideas/{iid}/feedback")
 async def api_idea_feedback(iid: str, req: IdeaFeedbackInput):
     try:
-        return _IDEATION.feedback(iid, req.action, req.reason)
+        result = _IDEATION.feedback(iid, req.action, req.reason)
+        _DISCOVERY.mark_idea_read(iid)
+        return result
     except IdeationError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
 
@@ -5558,6 +5849,7 @@ async def api_idea_develop(iid: str, req: IdeaDevelopInput):
     try:
         idea = _IDEATION.get_idea(iid)
         _IDEATION.feedback(iid, "select")
+        _DISCOVERY.mark_idea_read(iid)
         run, created = _IDEATION.create_run("develop", {
             "idea_id": iid, "persona": idea.get("persona") or "", "scope": req.scope,
             "instruction": req.instruction, "target_platforms": idea.get("target_platforms") or [],

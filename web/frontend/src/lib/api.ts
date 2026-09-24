@@ -589,6 +589,8 @@ export interface Idea {
   angle?: string; reason?: string; campaign_id?: string; campaign_rule_version?: number;
   trend_refs?: string[]; target_platforms?: string[]; requirements?: string[]; pending_checks?: string[];
   platform_plans?: IdeaPlatformPlan[]; source_refs?: string[]; score?: number;
+  origin?: 'manual' | 'automatic' | string; opportunity_key?: string; discovered_at?: number;
+  validity?: 'active' | 'expired' | string; unread?: boolean; trigger_summary?: string;
   brief_revision?: number; brief_status?: string; content_id?: string; plan_id?: string; brief?: IdeaBrief | null;
 }
 export type IdeaInput = {
@@ -667,6 +669,7 @@ export interface IdeaSourceSnapshot {
 }
 export interface IdeaRun {
   id: string; kind: 'recommend' | 'develop'; persona: string; target_platforms: string[]; trend_sources: string[];
+  origin?: 'manual' | 'automatic' | string; policy_id?: string; opportunity_key?: string;
   status: 'queued' | 'running' | 'waiting_user' | 'partial' | 'succeeded' | 'failed' | 'cancelled' | 'interrupted';
   stage: string; error: string; result: Record<string, unknown>; event_seq: number; cancelled: boolean;
   request: Record<string, unknown>; created_at: string; updated_at: string;
@@ -679,13 +682,21 @@ export function createIdeaRun(input: {
 }): Promise<IdeaRun> {
   return request('/api/idea-runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
 }
-export function fetchIdeaRuns(limit = 20): Promise<{ items: IdeaRun[] }> { return request('/api/idea-runs?limit=' + limit); }
+export function fetchIdeaRuns(limit = 20, persona = '', origin: '' | 'manual' | 'automatic' = 'manual'): Promise<{ items: IdeaRun[] }> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (persona) params.set('persona', persona);
+  if (origin) params.set('origin', origin);
+  return request('/api/idea-runs?' + params.toString());
+}
 export function fetchIdeaRun(id: string): Promise<IdeaRun> { return request('/api/idea-runs/' + encodeURIComponent(id)); }
 export function cancelIdeaRun(id: string): Promise<IdeaRun> { return request('/api/idea-runs/' + encodeURIComponent(id) + '/cancel', { method: 'POST' }); }
 export function feedbackIdea(id: string, action: 'stash' | 'select' | 'reject' | 'reopen', reason = ''): Promise<Idea> {
   return request('/api/ideas/' + encodeURIComponent(id) + '/feedback', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, reason }),
   });
+}
+export function markIdeaSeen(id: string): Promise<Idea> {
+  return request('/api/ideas/' + encodeURIComponent(id) + '/seen', { method: 'POST' });
 }
 export function developIdea(id: string, input: { scope?: string; instruction?: string; idempotency_key: string }): Promise<IdeaRun> {
   return request('/api/ideas/' + encodeURIComponent(id) + '/develop', {
@@ -712,6 +723,50 @@ export function startIdeaContent(id: string, expectedRevision: number, idempoten
 export function planIdea(id: string, input: { scheduled_local: string; timezone: string; fold?: 0 | 1 | null; idempotency_key: string }): Promise<{ idea: Idea; plan: { id: string; version: number; scheduled_local: string; timezone: string } }> {
   return request('/api/ideas/' + encodeURIComponent(id) + '/plan', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
+  });
+}
+
+export interface IdeaDiscoveryAccount {
+  id: string; platform: string; label: string; status: string; live_verified?: boolean;
+}
+export function fetchIdeaDiscoveryAccounts(): Promise<IdeaDiscoveryAccount[]> {
+  return request('/api/ripple/accounts');
+}
+
+export interface IdeaDiscoveryPolicy {
+  id: string; persona: string; enabled: boolean; revision: number;
+  target_platforms: string[]; trend_sources: string[]; account_ids: string[];
+  mode: 'balanced' | 'combo_only'; focus_keywords: string[]; effort_minutes: number;
+  max_daily_runs: number; max_daily_candidates: number; max_daily_notices: number;
+  min_candidate_score: number; timezone: string; quiet_start: string; quiet_end: string;
+  important_notifications: boolean; last_scan_at: number; last_daily_review: string;
+  last_source_digest: string; source_health: Record<string, unknown>; created_at: string; updated_at: string;
+}
+export interface IdeaDiscoveryJob {
+  id: string; policy_id: string; policy_revision: number; trigger_key: string; trigger_type: string;
+  trigger: Record<string, unknown>; opportunity_key: string; source_digest: string;
+  status: string; run_id: string; lease_until: number; provider_started: boolean;
+  budget_date: string; reserved_runs: number; reserved_candidates: number;
+  usage: Record<string, unknown>; error: string; created_at: string; updated_at: string;
+}
+export interface IdeaDiscoveryState {
+  policy: IdeaDiscoveryPolicy | null;
+  today: { runs: number; candidates: number; notices: number };
+  unread: number; waiting: number; jobs: IdeaDiscoveryJob[];
+  source_health: Record<string, unknown>; server_now: number;
+}
+export type IdeaDiscoveryPolicyInput = {
+  persona: string; enabled: boolean; target_platforms: string[]; trend_sources: string[]; account_ids?: string[];
+  mode: 'balanced' | 'combo_only'; focus_keywords: string[]; effort_minutes: number;
+  max_daily_runs: number; max_daily_candidates: number; max_daily_notices: number; min_candidate_score?: number;
+  timezone: string; quiet_start: string; quiet_end: string; important_notifications: boolean;
+};
+export function fetchIdeaDiscovery(persona: string): Promise<IdeaDiscoveryState> {
+  return request('/api/idea-discovery?persona=' + encodeURIComponent(persona));
+}
+export function saveIdeaDiscoveryPolicy(input: IdeaDiscoveryPolicyInput): Promise<IdeaDiscoveryState> {
+  return request('/api/idea-discovery/policy', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input),
   });
 }
 

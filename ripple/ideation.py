@@ -176,6 +176,61 @@ class IdeationService:
                 );
                 """
             )
+            self._migrate_schema(db)
+
+    @staticmethod
+    def _columns(db: sqlite3.Connection, table: str) -> dict[str, sqlite3.Row]:
+        return {str(row["name"]): row for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _migrate_schema(self, db: sqlite3.Connection) -> None:
+        run_columns = self._columns(db, "idea_runs")
+        for name, ddl in {
+            "origin": "TEXT NOT NULL DEFAULT 'manual'",
+            "policy_id": "TEXT NOT NULL DEFAULT ''",
+            "opportunity_key": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if name not in run_columns:
+                db.execute(f"ALTER TABLE idea_runs ADD COLUMN {name} {ddl}")
+
+        idea_columns = self._columns(db, "ideas")
+        for name, ddl in {
+            "origin": "TEXT NOT NULL DEFAULT 'manual'",
+            "opportunity_key": "TEXT NOT NULL DEFAULT ''",
+            "discovered_at": "INTEGER NOT NULL DEFAULT 0",
+            "validity": "TEXT NOT NULL DEFAULT 'active'",
+            "unread": "INTEGER NOT NULL DEFAULT 0",
+            "trigger_summary": "TEXT NOT NULL DEFAULT ''",
+        }.items():
+            if name not in idea_columns:
+                db.execute(f"ALTER TABLE ideas ADD COLUMN {name} {ddl}")
+
+        source_columns = self._columns(db, "source_snapshots")
+        if source_columns and int(source_columns.get("id", {"pk": 0})["pk"]) == 1 and int(source_columns.get("run_id", {"pk": 0})["pk"]) == 0:
+            db.executescript(
+                """
+                ALTER TABLE source_snapshots RENAME TO source_snapshots_legacy_v1;
+                CREATE TABLE source_snapshots (
+                    id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    title TEXT NOT NULL DEFAULT '',
+                    platform TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL DEFAULT '',
+                    fetched_at INTEGER NOT NULL DEFAULT 0,
+                    version TEXT NOT NULL DEFAULT '',
+                    access_scope TEXT NOT NULL DEFAULT '',
+                    data_json TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY (run_id, id)
+                );
+                INSERT OR IGNORE INTO source_snapshots(
+                    id,run_id,kind,source_id,title,platform,url,fetched_at,version,access_scope,data_json
+                ) SELECT id,run_id,kind,source_id,title,platform,url,fetched_at,version,access_scope,data_json
+                  FROM source_snapshots_legacy_v1;
+                DROP TABLE source_snapshots_legacy_v1;
+                CREATE INDEX IF NOT EXISTS source_snapshots_run_idx ON source_snapshots(run_id);
+                """
+            )
 
     def _meta(self, key: str) -> str:
         with self._connect() as db:
@@ -270,6 +325,12 @@ class IdeationService:
             "platform_plans": _loads(value.get("platform_plans_json"), []),
             "source_refs": _loads(value.get("source_refs_json"), []),
             "score": int(value.get("score") or 0),
+            "origin": str(value.get("origin") or "manual"),
+            "opportunity_key": str(value.get("opportunity_key") or ""),
+            "discovered_at": int(value.get("discovered_at") or 0),
+            "validity": str(value.get("validity") or "active"),
+            "unread": bool(value.get("unread")),
+            "trigger_summary": str(value.get("trigger_summary") or ""),
             "brief_revision": int(value.get("brief_revision") or 0),
             "brief_status": value.get("brief_status", ""), "content_id": value.get("content_id", ""),
             "plan_id": value.get("plan_id", ""), "created": int(value.get("created") or 0),
@@ -283,19 +344,28 @@ class IdeationService:
             "id": value["id"], "kind": value["kind"], "persona": value.get("persona", ""),
             "target_platforms": _loads(value.get("target_platforms_json"), []),
             "trend_sources": _loads(value.get("trend_sources_json"), []),
+            "origin": str(value.get("origin") or "manual"),
+            "policy_id": str(value.get("policy_id") or ""),
+            "opportunity_key": str(value.get("opportunity_key") or ""),
             "status": value["status"], "stage": value.get("stage", ""), "error": value.get("error", ""),
             "result": _loads(value.get("result_json"), {}), "event_seq": int(value.get("event_seq") or 0),
             "cancelled": bool(value.get("cancelled")), "request": _loads(value.get("request_json"), {}),
             "created_at": value["created_at"], "updated_at": value["updated_at"],
         }
 
-    def list_ideas(self, *, persona: str = "", include_rejected: bool = False, limit: int = 500) -> list[dict[str, Any]]:
+    def list_ideas(self, *, persona: str = "", include_rejected: bool = False,
+                   origin: str = "", unread_only: bool = False, limit: int = 500) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 1000))
         query = "SELECT * FROM ideas"
         clauses, params = [], []
         if persona:
             clauses.append("(persona='' OR persona=?)")
             params.append(persona)
+        if origin:
+            clauses.append("origin=?")
+            params.append(origin)
+        if unread_only:
+            clauses.append("unread=1")
         if not include_rejected:
             clauses.append("stage NOT IN ('rejected','archived')")
         if clauses:
@@ -328,8 +398,9 @@ class IdeationService:
                     id,run_id,title,note,source,legacy_status,stage,persona,angle,reason,
                     campaign_id,campaign_rule_version,trend_refs_json,target_platforms_json,
                     requirements_json,pending_checks_json,platform_plans_json,source_refs_json,
-                    score,brief_revision,brief_status,content_id,plan_id,created,updated
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    score,origin,opportunity_key,discovered_at,validity,unread,trigger_summary,
+                    brief_revision,brief_status,content_id,plan_id,created,updated
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     idea_id, run_id, str(value.get("title") or "未命名选题")[:240],
@@ -343,7 +414,11 @@ class IdeationService:
                     _json(value.get("pending_checks") if isinstance(value.get("pending_checks"), list) else []),
                     _json(value.get("platform_plans") if isinstance(value.get("platform_plans"), list) else []),
                     _json(value.get("source_refs") if isinstance(value.get("source_refs"), list) else []),
-                    int(value.get("score") or 0), 0, "", "", "", created, created,
+                    int(value.get("score") or 0), str(value.get("origin") or "manual")[:20],
+                    str(value.get("opportunity_key") or "")[:160], int(value.get("discovered_at") or 0),
+                    str(value.get("validity") or "active")[:40], int(bool(value.get("unread"))),
+                    str(value.get("trigger_summary") or "")[:1000],
+                    0, "", "", "", created, created,
                 ),
             )
         return self.get_idea(idea_id)
@@ -363,7 +438,7 @@ class IdeationService:
                     title=?,note=?,source=?,legacy_status=?,stage=?,persona=?,angle=?,reason=?,
                     campaign_id=?,campaign_rule_version=?,trend_refs_json=?,target_platforms_json=?,
                     requirements_json=?,pending_checks_json=?,platform_plans_json=?,source_refs_json=?,
-                    score=?,updated=?
+                    score=?,origin=?,opportunity_key=?,discovered_at=?,validity=?,unread=?,trigger_summary=?,updated=?
                 WHERE id=?
                 """,
                 (
@@ -382,7 +457,14 @@ class IdeationService:
                     _json(value.get("pending_checks", current["pending_checks"])),
                     _json(value.get("platform_plans", current["platform_plans"])),
                     _json(value.get("source_refs", current["source_refs"])),
-                    int(value.get("score", current["score"]) or 0), now, idea_id,
+                    int(value.get("score", current["score"]) or 0),
+                    str(value.get("origin", current["origin"]) or "manual")[:20],
+                    str(value.get("opportunity_key", current["opportunity_key"]) or "")[:160],
+                    int(value.get("discovered_at", current["discovered_at"]) or 0),
+                    str(value.get("validity", current["validity"]) or "active")[:40],
+                    int(bool(value.get("unread", current["unread"]))),
+                    str(value.get("trigger_summary", current["trigger_summary"]) or "")[:1000],
+                    now, idea_id,
                 ),
             )
         return self.get_idea(idea_id)
@@ -400,7 +482,7 @@ class IdeationService:
             raise IdeationError("反馈动作无效。")
         current = self.get_idea(idea_id)
         with self._lock, self._connect() as db:
-            db.execute("UPDATE ideas SET stage=?,updated=? WHERE id=?", (stage_map[action], int(time.time()), idea_id))
+            db.execute("UPDATE ideas SET stage=?,unread=0,updated=? WHERE id=?", (stage_map[action], int(time.time()), idea_id))
             db.execute(
                 "INSERT INTO idea_feedback(id,idea_id,run_id,action,reason,created_at) VALUES(?,?,?,?,?,?)",
                 (uuid.uuid4().hex, idea_id, current.get("run_id", ""), action, reason[:500], _now_iso()),
@@ -424,14 +506,16 @@ class IdeationService:
                 """
                 INSERT INTO idea_runs(
                     id,kind,idempotency_key,request_hash,request_json,persona,
-                    target_platforms_json,trend_sources_json,status,stage,error,result_json,
-                    event_seq,cancelled,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    target_platforms_json,trend_sources_json,origin,policy_id,opportunity_key,
+                    status,stage,error,result_json,event_seq,cancelled,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     run_id, kind, idempotency_key, digest, normalized,
                     str(request.get("persona") or "")[:100],
                     _json(request.get("target_platforms") or []), _json(request.get("trend_sources") or []),
+                    str(request.get("origin") or "manual")[:20], str(request.get("policy_id") or "")[:64],
+                    str(request.get("opportunity_key") or "")[:160],
                     "queued", "queued", "", "{}", 0, 0, now, now,
                 ),
             )
@@ -451,12 +535,18 @@ class IdeationService:
             ]
             return value
 
-    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 20, *, persona: str = "", origin: str = "") -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 100))
+        query, clauses, params = "SELECT * FROM idea_runs", [], []
+        if persona:
+            clauses.append("persona=?"); params.append(persona)
+        if origin:
+            clauses.append("origin=?"); params.append(origin)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC LIMIT ?"; params.append(limit)
         with self._connect() as db:
-            return [self._run_public(row) for row in db.execute(
-                "SELECT * FROM idea_runs ORDER BY created_at DESC LIMIT ?", (limit,)
-            ).fetchall()]
+            return [self._run_public(row) for row in db.execute(query, params).fetchall()]
 
     def set_run(self, run_id: str, *, status: str | None = None, stage: str | None = None,
                 error: str | None = None, result: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -526,17 +616,47 @@ class IdeationService:
                 "data": _loads(row["data_json"], {}),
             } for row in rows]
 
-    def store_candidates(self, run_id: str, persona: str, recommendations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def store_candidates(self, run_id: str, persona: str, recommendations: list[dict[str, Any]], *,
+                         origin: str = "manual", opportunity_key: str = "", trigger_summary: str = "") -> list[dict[str, Any]]:
         created: list[dict[str, Any]] = []
         for recommendation in recommendations:
             value = dict(recommendation)
             value["persona"] = persona
+            value["origin"] = origin
+            value["opportunity_key"] = opportunity_key
+            value["discovered_at"] = int(time.time()) if origin == "automatic" else int(value.get("discovered_at") or 0)
+            value["unread"] = origin == "automatic"
+            value["trigger_summary"] = trigger_summary
             value["source"] = str(value.get("source") or f"Agent 推荐 · {persona}")
+            existing_id = ""
+            if origin == "automatic" and opportunity_key:
+                with self._connect() as db:
+                    row = db.execute(
+                        "SELECT id FROM ideas WHERE persona=? AND origin='automatic' AND opportunity_key=? "
+                        "AND stage='candidate' ORDER BY updated DESC LIMIT 1",
+                        (persona, opportunity_key),
+                    ).fetchone()
+                    existing_id = str(row["id"]) if row else ""
+            if existing_id:
+                value["stage"] = "candidate"
+                value["status"] = "pending"
+                updated = self.update_idea(existing_id, value)
+                with self._lock, self._connect() as db:
+                    db.execute("UPDATE ideas SET run_id=? WHERE id=?", (run_id, existing_id))
+                created.append(self.get_idea(existing_id))
+                continue
             try:
                 created.append(self.create_idea(value, stage="candidate", run_id=run_id))
             except sqlite3.IntegrityError:
                 continue
         return created
+
+    def mark_seen(self, idea_id: str) -> dict[str, Any]:
+        with self._lock, self._connect() as db:
+            cur = db.execute("UPDATE ideas SET unread=0,updated=? WHERE id=?", (int(time.time()), idea_id))
+            if not cur.rowcount:
+                raise IdeationError("选题不存在。", 404)
+        return self.get_idea(idea_id)
 
     def latest_brief(self, idea_id: str) -> dict[str, Any] | None:
         with self._connect() as db:

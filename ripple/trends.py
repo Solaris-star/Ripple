@@ -416,6 +416,34 @@ class TrendService:
         except Timeout as exc:
             raise RuntimeError("account_busy") from exc
 
+    def peek_group(self, platform: str, limit: int = 15, *, xhs_context: XhsContext | None = None) -> dict:
+        """Read the current cache only; never calls a provider or opens a browser."""
+        now = time.time()
+        cache_key = platform + (
+            f":account:{xhs_context.account_id}"
+            if platform == "xiaohongshu" and xhs_context and xhs_context.profile and xhs_context.account_id
+            else ":public"
+        )
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            failed = self._failures.get(cache_key)
+        if not cached:
+            return self._group(
+                platform, [], "error" if failed else "missing", "", 0,
+                list((failed or {}).get("attempts") or []), limit,
+                error=str((failed or {}).get("error") or "当前没有已同步热点缓存。"),
+            )
+        fetched_at = int(cached.get("fetched_at") or 0)
+        age = max(0, now - fetched_at)
+        ttl = XHS_CACHE_TTL if platform == "xiaohongshu" else CACHE_TTL
+        status = "fresh" if age < ttl else "stale" if age <= MAX_STALE else "expired"
+        return self._group(
+            platform, list(cached.get("items") or []), status,
+            str(cached.get("source") or "缓存"), fetched_at,
+            list((failed or {}).get("attempts") or []), limit,
+            error=str((failed or {}).get("error") or ""), cached=True,
+        )
+
     def get_group(self, platform: str, limit: int = 15, *, force: bool = False, xhs_context: XhsContext | None = None) -> dict:
         now = time.time()
         ttl = XHS_CACHE_TTL if platform == "xiaohongshu" else CACHE_TTL

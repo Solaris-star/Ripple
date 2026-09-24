@@ -810,6 +810,9 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
                             campaign_tick = getattr(instance.state, "campaign_scheduler_tick", None)
                             if callable(campaign_tick):
                                 await asyncio.to_thread(campaign_tick)
+                            discovery_tick = getattr(instance.state, "ideation_discovery_tick", None)
+                            if callable(discovery_tick):
+                                await discovery_tick()
                     except Exception:
                         logger.exception("Ripple scheduler paused this tick; inspect local state integrity.")
                     try:
