@@ -349,8 +349,29 @@ def _publish_env() -> dict[str, str]:
     return env
 
 
+def _confirmed_profile_detail(name: str) -> dict | None:
+    if not name:
+        return None
+    profile = _CONTENT_PROFILES.profile_for_legacy_name(name)
+    return _CONTENT_PROFILES.get_profile(profile["id"]) if profile else None
+
+
+def _confirmed_profile_text(name: str) -> str:
+    detail = _confirmed_profile_detail(name)
+    if not detail:
+        # Compatibility fallback for callers/tests that provide a legacy-only profile.
+        # Registered profiles always resolve through ContentProfileService first.
+        return load_profile_text(name) if name and profile_exists(name) else ""
+    files = dict(detail.get("files") or {})
+    ordered = list(_FILE_ORDER) + sorted(key for key in files if key not in _FILE_ORDER)
+    parts = [str(files.get(filename) or "").strip() for filename in ordered]
+    return "\n\n---\n\n".join(part for part in parts if part)
+
+
 def _persona_prefix(persona: str | None) -> str:
-    """把画像作为消息前缀内联，复用 Ripple 的 Profile 读取逻辑。"""
+    """把画像作为消息前缀内联，并先校准 legacy mirror 到 confirmed revision。"""
+    if persona:
+        _confirmed_profile_detail(persona)
     return persona_prefix(persona)
 
 
@@ -693,7 +714,7 @@ def _operation_model_runner(prompt: str) -> str:
 app.state.ripple.operations.configure_model(
     _operation_model_runner,
     lambda: _direct_llm_config() is not None,
-    lambda name: load_profile_text(name) if name and profile_exists(name) else "",
+    lambda name: _confirmed_profile_text(name) if name else "",
 )
 
 
@@ -1021,7 +1042,7 @@ def _agent_tool_base() -> str:
 
 
 def _ripple_agent_system(persona: str | None) -> str:
-    profile = load_profile_text(persona).strip()[:18000] if persona and profile_exists(persona) else ""
+    profile = _confirmed_profile_text(persona).strip()[:18000] if persona else ""
     selected = persona or "通用模式"
     return (
         "你是 Ripple Agent，是 Ripple 内容工作台的自然语言控制层。"
@@ -1788,7 +1809,7 @@ async def api_personas():
 
 @app.get("/api/persona/{name}")
 async def api_persona(name: str):
-    text = load_profile_text(name)
+    text = _confirmed_profile_text(name)
     if not text:
         raise HTTPException(404, "画像不存在")
     return {"name": name, "content": text}
@@ -1813,16 +1834,16 @@ def _persona_file_path(name: str, filename: str) -> Path:
 
 @app.get("/api/persona/{name}/files")
 async def api_persona_files(name: str):
-    """返回画像六维文件原文（按固定顺序 + 其余 .md），供在线编辑。"""
-    if not profile_exists(name):
+    """返回已确认画像六维文件；外部 Markdown draft 不进入正式编辑基线。"""
+    detail = _confirmed_profile_detail(name)
+    if not detail:
         raise HTTPException(404, "画像不存在")
-    pd = PROFILES_DIR / name
-    ordered = list(_FILE_ORDER) + sorted(f.name for f in pd.glob("*.md") if f.name not in _FILE_ORDER)
-    files = []
-    for fn in ordered:
-        fp = pd / fn
-        files.append({"filename": fn, "content": fp.read_text(encoding="utf-8") if fp.is_file() else ""})
-    return {"name": name, "files": files}
+    raw_files = dict(detail.get("files") or {})
+    ordered = list(_FILE_ORDER) + sorted(filename for filename in raw_files if filename not in _FILE_ORDER)
+    return {
+        "name": name,
+        "files": [{"filename": filename, "content": str(raw_files.get(filename) or "")} for filename in ordered],
+    }
 
 
 class PersonaFileRequest(BaseModel):
@@ -1832,15 +1853,21 @@ class PersonaFileRequest(BaseModel):
 
 @app.put("/api/persona/{name}/file")
 async def api_persona_file_save(name: str, req: PersonaFileRequest):
-    """保存画像单个维度文件（原子写）。"""
-    if not profile_exists(name):
+    """兼容旧编辑接口：合并到当前 confirmed revision 后走统一事务保存。"""
+    _persona_file_path(name, req.filename)
+    detail = _confirmed_profile_detail(name)
+    if not detail:
         raise HTTPException(404, "画像不存在")
-    fp = _persona_file_path(name, req.filename)
-    tmp = fp.with_suffix(".md.tmp")
-    tmp.write_text(req.content, encoding="utf-8")
-    tmp.replace(fp)
-    _CONTENT_PROFILES.sync_legacy_profiles()
-    return {"ok": True, "filename": req.filename}
+    files = dict(detail.get("files") or {})
+    files[req.filename] = req.content
+    try:
+        saved = _CONTENT_PROFILES.save_revision(
+            detail["id"], files, source="legacy_editor",
+            expected_revision=int(detail["current_revision"]), note="兼容旧画像文件编辑接口。", confirm=True,
+        )
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+    return {"ok": True, "filename": req.filename, "revision": saved["current_revision"]}
 
 
 @app.delete("/api/persona/{name}")
@@ -2092,6 +2119,15 @@ async def api_profile_analysis_create(req: ProfileAnalysisCreateRequest):
             request_digest = hashlib.sha256(
                 f"{req.target_kind}|{req.account_id}|{req.idempotency_key}".encode("utf-8")
             ).hexdigest()
+        request_fingerprint = hashlib.sha256(json.dumps({
+            "target_kind": req.target_kind,
+            "account_id": req.account_id,
+            "profile_id": req.profile_id,
+            "display_name": req.display_name,
+            "samples": samples,
+            "use_account_history": req.use_account_history,
+            "history_limit": req.history_limit,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
         model = {
             "mode": "agent_proposal",
             "display_name": req.display_name,
@@ -2101,12 +2137,25 @@ async def api_profile_analysis_create(req: ProfileAnalysisCreateRequest):
             "base_binding_revision": int((current_binding or {}).get("binding_revision") or 0),
             "base_binding_profile_id": str((current_binding or {}).get("profile_id") or ""),
             "base_overrides": dict((current_binding or {}).get("overrides") or {}),
+            "request_key": req.idempotency_key,
+            "request_fingerprint": request_fingerprint,
         }
         run = _CONTENT_PROFILES.create_analysis(
             target_kind=req.target_kind, account_id=req.account_id, profile_id=req.profile_id,
             capability=capability, samples=samples, model=model, request_digest=request_digest,
         )
         if run.get("reused"):
+            stored_fingerprint = str((run.get("model") or {}).get("request_fingerprint") or "")
+            if stored_fingerprint and stored_fingerprint != request_fingerprint:
+                raise WorkflowError("同一分析请求键对应的样本或目标已变化，请使用“重新分析”创建新任务。", 409)
+            if run["status"] == "waiting_user" and run.get("samples") and _recommendation_ai_backend():
+                running = _CONTENT_PROFILES.set_analysis_status(run["id"], "running", error="")
+                threading.Thread(
+                    target=_profile_analysis_worker,
+                    args=(run["id"], target, list(run.get("samples") or []), str(run.get("profile_id") or "")),
+                    daemon=True,
+                ).start()
+                return running
             return run
         if not samples:
             return _CONTENT_PROFILES.set_analysis_status(
@@ -2115,7 +2164,7 @@ async def api_profile_analysis_create(req: ProfileAnalysisCreateRequest):
             )
         if not _recommendation_ai_backend():
             return _CONTENT_PROFILES.set_analysis_status(
-                run["id"], "waiting_user", error="Agent 模型尚未配置；样本已保存，可稍后重新分析。"
+                run["id"], "waiting_user", error="Agent 模型尚未配置；样本已保存，可稍后继续分析。"
             )
         running = _CONTENT_PROFILES.set_analysis_status(run["id"], "running")
         threading.Thread(
@@ -2136,10 +2185,21 @@ async def api_profile_analysis(run_id: str):
         raise HTTPException(exc.status, str(exc)) from exc
 
 
+@app.get("/api/profile-analysis/latest/{target_kind}/{account_id}")
+async def api_profile_analysis_latest(target_kind: str, account_id: str):
+    try:
+        _profile_target(target_kind, account_id)
+        return _CONTENT_PROFILES.latest_analysis(target_kind=target_kind, account_id=account_id)
+    except WorkflowError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
+
+
 @app.post("/api/profile-analysis/{run_id}/apply")
 async def api_profile_analysis_apply(run_id: str, req: ProfileAnalysisApplyRequest):
     try:
         run = _CONTENT_PROFILES.get_analysis(run_id)
+        if run.get("apply_result"):
+            return run["apply_result"]
         if run["status"] != "succeeded" or not run.get("proposal"):
             raise WorkflowError("画像分析尚未形成可应用提案。", 409)
         model = dict(run.get("model") or {})
@@ -2147,51 +2207,35 @@ async def api_profile_analysis_apply(run_id: str, req: ProfileAnalysisApplyReque
         base_profile_revision = int(model.get("base_profile_revision") or 0)
         base_binding_revision = int(model.get("base_binding_revision") or 0)
         base_binding_profile_id = str(model.get("base_binding_profile_id") or "")
-        current_binding = _CONTENT_PROFILES.binding(
-            target_kind=run["target_kind"], account_id=run["account_id"]
-        )
-        current_binding_revision = int((current_binding or {}).get("binding_revision") or 0)
-        current_binding_profile_id = str((current_binding or {}).get("profile_id") or "")
-        if current_binding_revision != base_binding_revision or current_binding_profile_id != base_binding_profile_id:
-            raise WorkflowError("账号画像关联已在分析期间变化，请重新分析后再应用。", 409)
 
-        files = dict(run["proposal"].get("files") or {})
         if base_profile_id:
             if req.profile_id and req.profile_id != base_profile_id:
                 raise WorkflowError("该提案只能应用到分析时选定的画像。", 409)
-            profile_before = _CONTENT_PROFILES.get_profile(base_profile_id)
-            if int(profile_before["current_revision"]) != base_profile_revision:
-                raise WorkflowError("画像已在分析期间更新，请重新分析后再应用。", 409)
             if req.expected_revision not in {0, base_profile_revision}:
                 raise WorkflowError("画像版本与分析基线不一致，请刷新后重试。", 409)
-            if profile_before.get("files", {}).get("preferences.md"):
-                files["preferences.md"] = profile_before["files"]["preferences.md"]
-            profile = _CONTENT_PROFILES.save_revision(
-                base_profile_id, files, source="agent_analysis",
-                expected_revision=base_profile_revision, note="用户确认账号样本分析提案。", confirm=True,
-            )
+            target_profile_id = base_profile_id
+            display_name = ""
         else:
             if req.profile_id:
                 raise WorkflowError("新画像提案不能直接覆盖已有画像。", 409)
-            name = req.display_name or str(model.get("display_name") or "").strip()
-            if not name:
+            target_profile_id = ""
+            display_name = req.display_name or str(model.get("display_name") or "").strip()
+            if not display_name:
                 raise WorkflowError("请为新画像填写名称。", 422)
-            profile = _CONTENT_PROFILES.create_profile(name, files, source="agent_analysis")
 
-        binding = None
         if req.bind_target:
             _profile_target(run["target_kind"], run["account_id"])
-            if current_binding and current_binding["profile_id"] == profile["id"]:
-                binding = _CONTENT_PROFILES.binding(
-                    target_kind=run["target_kind"], account_id=run["account_id"]
-                )
-            else:
-                binding = _CONTENT_PROFILES.bind(
-                    target_kind=run["target_kind"], account_id=run["account_id"], profile_id=profile["id"],
-                    overrides=dict((current_binding or {}).get("overrides") or model.get("base_overrides") or {}),
-                    expected_binding_revision=current_binding_revision if current_binding else None,
-                )
-        return {"profile": profile, "binding": binding}
+
+        return _CONTENT_PROFILES.apply_analysis_result(
+            run_id,
+            profile_id=target_profile_id,
+            display_name=display_name,
+            expected_profile_revision=base_profile_revision,
+            expected_binding_revision=base_binding_revision,
+            expected_binding_profile_id=base_binding_profile_id,
+            overrides=dict(model.get("base_overrides") or {}),
+            bind_target=req.bind_target,
+        )
     except WorkflowError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
 
@@ -4024,7 +4068,7 @@ async def agent_tool_persona(req: AgentPersonaRequest, request: Request):
     _require_agent_tool(request)
     if not profile_exists(req.name):
         raise HTTPException(404, "画像不存在")
-    return {"kind": "persona", "name": req.name, "content": load_profile_text(req.name)[:24000]}
+    return {"kind": "persona", "name": req.name, "content": _confirmed_profile_text(req.name)[:24000]}
 
 
 @app.post("/api/ripple-agent/tools/media/capabilities")
@@ -5852,7 +5896,7 @@ async def _idea_run_context(request: dict) -> tuple[dict, list[dict], list[str],
     persona = str(request.get("persona") or "")
     if not profile_exists(persona):
         raise WorkflowError("当前账号画像不存在，请先选择或创建画像。", 404)
-    profile = load_profile_text(persona).strip()
+    profile = _confirmed_profile_text(persona).strip()
     if not profile:
         raise WorkflowError("当前账号画像为空，请先补充定位、受众或内容偏好。", 422)
     targets = list(dict.fromkeys(filter(None, (idea_platform_key(value) for value in request.get("target_platforms", [])))))
@@ -6100,7 +6144,7 @@ def _scan_discovery_policy(policy: dict, now: float) -> dict:
         }
 
     opportunities = build_opportunities(
-        profile_text=load_profile_text(str(policy["persona"])),
+        profile_text=_confirmed_profile_text(str(policy["persona"])),
         focus_keywords=list(policy.get("focus_keywords") or []),
         target_platforms=list(policy.get("target_platforms") or []),
         trend_groups=groups,

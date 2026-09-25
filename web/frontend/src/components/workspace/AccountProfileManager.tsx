@@ -5,6 +5,7 @@ import {
   fetchContentProfile,
   fetchContentProfileContext,
   fetchProfileAnalysis,
+  fetchLatestProfileAnalysis,
   fetchProfileAnalysisCapability,
   startProfileAnalysis,
   unbindContentProfile,
@@ -38,6 +39,7 @@ type AnalysisState = {
   profileId: string;
   displayName: string;
   baseFiles: Record<string, string>;
+  baseReady: boolean;
   requestKey: string;
   sampleText: string;
   useAccountHistory: boolean;
@@ -80,6 +82,14 @@ function sampleRows(raw: string): Array<Record<string, unknown>> {
         kind: 'user_import',
       };
     });
+}
+
+function analysisSamplesText(rows: Array<Record<string, unknown>>): string {
+  return rows.map((row) => {
+    const title = String(row.title || '').trim();
+    const body = String(row.body || '').trim();
+    return [title, body && body !== title ? body : ''].filter(Boolean).join('\n');
+  }).filter(Boolean).join('\n\n---\n\n');
 }
 
 function plainMarkdown(value: string, limit = 180): string {
@@ -211,6 +221,7 @@ export default function AccountProfileManager({
   const unassignedTargets = targets.filter((target) => !bindingFor(target));
 
   const selectProfile = (profileId: string) => {
+    if (profileId === activeProfileId) return;
     setActiveDetail(null);
     setActiveProfileId(profileId);
     onSelectProfile(profileId);
@@ -276,16 +287,18 @@ export default function AccountProfileManager({
   const openAnalysis = async (target: Target, mode: 'current' | 'new' = 'current') => {
     setError(''); setNotice('');
     const binding = bindingFor(target);
-    const profileId = mode === 'current' ? (binding?.profile_id || activeProfileId) : '';
-    const initialFiles = profileId === activeDetail?.id ? { ...(activeDetail.files || {}) } : {};
+    const defaultProfileId = mode === 'current' ? (binding?.profile_id || activeProfileId) : '';
+    const defaultDisplayName = mode === 'new'
+      ? `${target.identityName || target.label}画像`
+      : (binding ? profileFor(binding.profile_id)?.display_name || '' : activeProfile?.display_name || '');
+    const initialFiles = defaultProfileId === activeDetail?.id ? { ...(activeDetail.files || {}) } : {};
     setAnalysis({
       target,
       capability: null,
-      profileId,
-      displayName: mode === 'new'
-        ? `${target.identityName || target.label}画像`
-        : (binding ? profileFor(binding.profile_id)?.display_name || '' : activeProfile?.display_name || ''),
+      profileId: defaultProfileId,
+      displayName: defaultDisplayName,
       baseFiles: initialFiles,
+      baseReady: !defaultProfileId || Object.keys(initialFiles).length > 0,
       requestKey: analysisRequestKey(),
       sampleText: '',
       useAccountHistory: false,
@@ -293,20 +306,74 @@ export default function AccountProfileManager({
       run: null,
     });
     try {
-      const [capability, detail] = await Promise.all([
+      const [capability, latest] = await Promise.all([
         fetchProfileAnalysisCapability(target.kind, target.id),
-        profileId && !Object.keys(initialFiles).length ? fetchContentProfile(profileId) : Promise.resolve(null),
+        fetchLatestProfileAnalysis(target.kind, target.id),
       ]);
+      const latestModel = (latest?.model || {}) as Record<string, unknown>;
+      const latestMatchesBinding = !!latest
+        && Number(latestModel.base_binding_revision || 0) === Number(binding?.binding_revision || 0)
+        && String(latestModel.base_binding_profile_id || '') === String(binding?.profile_id || '');
+      const restoredRun = latestMatchesBinding ? latest : null;
+      const lockedProfileId = restoredRun?.profile_id || defaultProfileId;
+      let baseFiles = lockedProfileId === activeDetail?.id ? { ...(activeDetail.files || {}) } : {};
+      if (lockedProfileId && !Object.keys(baseFiles).length) {
+        const detail = await fetchContentProfile(lockedProfileId);
+        baseFiles = { ...(detail.files || {}) };
+      }
+      const restoredModel = (restoredRun?.model || {}) as Record<string, unknown>;
+      const restoredKey = typeof restoredModel.request_key === 'string' && restoredModel.request_key
+        ? restoredModel.request_key : analysisRequestKey();
       setAnalysis((current) => current && current.target.id === target.id ? {
         ...current,
         capability,
-        ...(detail ? { baseFiles: { ...(detail.files || {}) } } : {}),
+        profileId: lockedProfileId,
+        displayName: restoredRun ? String(restoredModel.display_name || defaultDisplayName) : defaultDisplayName,
+        baseFiles,
+        baseReady: !lockedProfileId || Object.keys(baseFiles).length > 0,
+        requestKey: restoredKey,
+        sampleText: restoredRun ? analysisSamplesText(restoredRun.samples || []) : current.sampleText,
+        useAccountHistory: restoredRun ? Boolean(restoredModel.history_used) : current.useAccountHistory,
+        historyLimit: restoredRun ? Number(restoredModel.history_limit || 30) : current.historyLimit,
+        run: restoredRun,
       } : current);
     } catch (e) { setError(errorText(e)); }
   };
 
+  const changeAnalysisProfile = async (profileId: string) => {
+    if (!analysis || analysis.run) return;
+    const nextProfile = profileFor(profileId);
+    setAnalysis((current) => current ? {
+      ...current,
+      profileId,
+      displayName: profileId ? nextProfile?.display_name || '' : `${current.target.identityName || current.target.label}画像`,
+      baseFiles: {},
+      baseReady: !profileId,
+    } : current);
+    if (!profileId) return;
+    setBusy(true); setError('');
+    try {
+      const detail = await fetchContentProfile(profileId);
+      setAnalysis((current) => current && !current.run && current.profileId === profileId
+        ? { ...current, baseFiles: { ...(detail.files || {}) }, baseReady: true }
+        : current);
+    } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
+  };
+
+  const resetAnalysis = () => {
+    setError('');
+    setAnalysis((current) => current ? {
+      ...current,
+      run: null,
+      requestKey: analysisRequestKey(),
+      baseReady: !current.profileId || Object.keys(current.baseFiles).length > 0,
+    } : current);
+  };
+
   const startAnalysis = async () => {
     if (!analysis) return;
+    if (analysis.run && analysis.run.status !== 'waiting_user') return;
+    if (!analysis.baseReady) { setError('正在读取目标画像基线，请稍后再开始分析。'); return; }
     const samples = sampleRows(analysis.sampleText);
     if (!samples.length && !analysis.useAccountHistory) { setError('请粘贴代表作品，或选择读取当前账号已发布作品。'); return; }
     setBusy(true); setError(''); setNotice('');
@@ -431,14 +498,14 @@ export default function AccountProfileManager({
       {analysis.capability && !analysis.capability.automatic_history_supported && <div className="r2-inline-warning">
         当前不会因为账号已登录就自动读取全部历史。请粘贴你确认可以用于分析的代表作品；后续接入平台只读历史能力时仍会在运行前确认样本范围。
       </div>}
-      <label className="r2-field"><span>应用到</span><select disabled={!!analysis.run} value={analysis.profileId} onChange={(e) => setAnalysis((current) => current ? { ...current, profileId: e.target.value } : current)}>
+      <label className="r2-field"><span>应用到</span><select disabled={!!analysis.run || busy} value={analysis.profileId} onChange={(e) => void changeAnalysisProfile(e.target.value)}>
         <option value="">新建画像</option>
         {(context?.profiles || []).map((item) => <option key={item.id} value={item.id}>{item.display_name} · V{item.current_revision}</option>)}
       </select></label>
-      {!analysis.profileId && <label className="r2-field"><span>新画像名称</span><input value={analysis.displayName} maxLength={120} onChange={(e) => setAnalysis((current) => current ? { ...current, displayName: e.target.value } : current)} /></label>}
-      {analysis.capability?.automatic_history_supported && <label className="r2-checkbox profile-history-option"><input type="checkbox" checked={analysis.useAccountHistory} onChange={(e) => setAnalysis((current) => current ? { ...current, useAccountHistory: e.target.checked } : current)} />读取当前账号已发布作品（只读）</label>}
-      {analysis.capability?.automatic_history_supported && analysis.useAccountHistory && <label className="r2-field"><span>读取数量</span><select value={analysis.historyLimit} onChange={(e) => setAnalysis((current) => current ? { ...current, historyLimit: Number(e.target.value) } : current)}><option value={10}>最近 10 条</option><option value={20}>最近 20 条</option><option value={30}>最近 30 条</option></select></label>}
-      <label className="r2-field"><span>代表作品</span><textarea rows={10} value={analysis.sampleText} onChange={(e) => setAnalysis((current) => current ? { ...current, sampleText: e.target.value } : current)} placeholder={'标题或第一行\n作品正文……\n\n---\n\n另一条作品标题\n作品正文……'} /></label>
+      {!analysis.profileId && <label className="r2-field"><span>新画像名称</span><input disabled={!!analysis.run || busy} value={analysis.displayName} maxLength={120} onChange={(e) => setAnalysis((current) => current ? { ...current, displayName: e.target.value } : current)} /></label>}
+      {analysis.capability?.automatic_history_supported && <label className="r2-checkbox profile-history-option"><input type="checkbox" disabled={!!analysis.run || busy} checked={analysis.useAccountHistory} onChange={(e) => setAnalysis((current) => current ? { ...current, useAccountHistory: e.target.checked } : current)} />读取当前账号已发布作品（只读）</label>}
+      {analysis.capability?.automatic_history_supported && analysis.useAccountHistory && <label className="r2-field"><span>读取数量</span><select disabled={!!analysis.run || busy} value={analysis.historyLimit} onChange={(e) => setAnalysis((current) => current ? { ...current, historyLimit: Number(e.target.value) } : current)}><option value={10}>最近 10 条</option><option value={20}>最近 20 条</option><option value={30}>最近 30 条</option></select></label>}
+      <label className="r2-field"><span>代表作品</span><textarea disabled={!!analysis.run || busy} rows={10} value={analysis.sampleText} onChange={(e) => setAnalysis((current) => current ? { ...current, sampleText: e.target.value } : current)} placeholder={'标题或第一行\n作品正文……\n\n---\n\n另一条作品标题\n作品正文……'} /></label>
       <p className="r2-muted">样本只作为资料。Agent 会把“历史观察 / 推测 / 待确认”分开，生成提案后仍需你确认。</p>
       {analysis.run?.error && <div className="r2-inline-warning">{analysis.run.error}</div>}
       {analysis.run?.proposal && Object.keys(analysis.run.proposal).length > 0 && <div className="profile-analysis-proposal">
@@ -458,9 +525,16 @@ export default function AccountProfileManager({
       <Feedback error={error} />
       <footer>
         <button className="r2-button" type="button" disabled={busy} onClick={() => setAnalysis(null)}>取消</button>
+        {analysis.run && ['failed', 'interrupted', 'cancelled'].includes(analysis.run.status) && <button className="r2-button" type="button" disabled={busy} onClick={resetAnalysis}>重新分析</button>}
+        {analysis.run?.status === 'waiting_user' && <button className="r2-button" type="button" disabled={busy} onClick={resetAnalysis}>修改样本并重新分析</button>}
+        {analysis.run?.status === 'succeeded' && <button className="r2-button" type="button" disabled={busy} onClick={resetAnalysis}>重新分析</button>}
         {analysis.run?.status === 'succeeded'
           ? <button className="r2-button primary" type="button" disabled={busy || (!analysis.run.profile_id && !analysis.displayName.trim())} onClick={() => void applyAnalysis()}>确认并应用提案</button>
-          : <button className="r2-button primary" type="button" disabled={busy || (!analysis.sampleText.trim() && !analysis.useAccountHistory) || (!analysis.profileId && !analysis.displayName.trim())} onClick={() => void startAnalysis()}>{busy ? '分析中…' : '开始分析'}</button>}
+          : analysis.run && ['running', 'queued'].includes(analysis.run.status)
+            ? <button className="r2-button primary" type="button" disabled>分析中…</button>
+            : analysis.run && ['failed', 'interrupted', 'cancelled'].includes(analysis.run.status)
+              ? null
+              : <button className="r2-button primary" type="button" disabled={busy || !analysis.baseReady || (!analysis.sampleText.trim() && !analysis.useAccountHistory) || (!analysis.profileId && !analysis.displayName.trim())} onClick={() => void startAnalysis()}>{busy ? '分析中…' : analysis.run?.status === 'waiting_user' ? '继续分析' : '开始分析'}</button>}
       </footer>
     </Modal>}
   </section>;

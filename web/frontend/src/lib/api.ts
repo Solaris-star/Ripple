@@ -102,7 +102,7 @@ export interface ProfileAnalysisRun {
   samples: Array<Record<string, unknown>>; proposal: {
     files?: Record<string, string>; observations?: string[]; assumptions?: string[];
     open_questions?: string[]; sample_summary?: string;
-  }; model: Record<string, unknown>; request_digest?: string; reused?: boolean; error: string; created_at: string; updated_at: string;
+  }; model: Record<string, unknown>; request_digest?: string; reused?: boolean; apply_result?: { profile: ContentProfileDetail; binding: ContentProfileBinding | null } | null; error: string; created_at: string; updated_at: string;
 }
 
 export function fetchContentProfileContext(params: { profile_name?: string; profile_id?: string; account_id?: string; target_kind?: string } = {}): Promise<ContentProfileContext> {
@@ -152,6 +152,9 @@ export function startProfileAnalysis(payload: {
 }
 export function fetchProfileAnalysis(runId: string): Promise<ProfileAnalysisRun> {
   return request(`/api/profile-analysis/${encodeURIComponent(runId)}`);
+}
+export function fetchLatestProfileAnalysis(targetKind: 'account' | 'blog', accountId: string): Promise<ProfileAnalysisRun | null> {
+  return request(`/api/profile-analysis/latest/${targetKind}/${encodeURIComponent(accountId)}`);
 }
 export function applyProfileAnalysis(runId: string, payload: {
   profile_id?: string; display_name?: string; expected_revision?: number; bind_target?: boolean;

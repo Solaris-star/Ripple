@@ -2,6 +2,7 @@ from pathlib import Path
 import shutil
 import json
 import sqlite3
+import threading
 
 import pytest
 
@@ -44,6 +45,7 @@ def test_legacy_external_change_is_draft_not_auto_confirmed(monkeypatch, tmp_pat
     assert row[0] == 2
     assert row[2:] == ("legacy_sync", "draft")
     assert "开发者工具实测" in json.loads(row[1])["identity.md"]
+    assert "科技工具实测" in (directory / "identity.md").read_text(encoding="utf-8")
 
 
 def test_confirmed_save_rolls_back_database_when_legacy_write_fails(monkeypatch, tmp_path):
@@ -75,6 +77,75 @@ def test_profile_create_rolls_back_database_when_legacy_write_fails(monkeypatch,
 
     assert service.list_profiles() == []
     assert not (profiles / "事务画像").exists()
+
+
+def test_concurrent_confirmed_save_keeps_db_and_legacy_mirror_consistent(monkeypatch, tmp_path):
+    profiles = tmp_path / "profiles"
+    monkeypatch.setattr(content_profiles, "PROFILES_DIR", profiles)
+    _legacy_profile(profiles)
+    service = ContentProfileService(tmp_path / "profiles.sqlite3")
+    profile = service.get_profile(service.list_profiles()[0]["id"])
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def save(marker: str):
+        changed = dict(profile["files"])
+        changed["identity.md"] = f"# 身份定位\n\n{marker}\n"
+        barrier.wait(timeout=5)
+        try:
+            outcomes[marker] = service.save_revision(
+                profile["id"], changed, source="concurrent-test", expected_revision=1, confirm=True,
+            )["current_revision"]
+        except WorkflowError as exc:
+            outcomes[marker] = exc.status
+
+    threads = [threading.Thread(target=save, args=(marker,), daemon=True) for marker in ("并发A", "并发B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(8)
+        assert not thread.is_alive()
+
+    winners = [marker for marker, result in outcomes.items() if result == 2]
+    losers = [marker for marker, result in outcomes.items() if result == 409]
+    assert len(winners) == 1 and len(losers) == 1
+    winner = winners[0]
+    current = service.get_profile(profile["id"])
+    disk = (profiles / "科技工具" / "identity.md").read_text(encoding="utf-8")
+    assert winner in current["files"]["identity.md"]
+    assert winner in disk
+
+
+def test_concurrent_create_does_not_delete_winner_directory(monkeypatch, tmp_path):
+    profiles = tmp_path / "profiles"
+    monkeypatch.setattr(content_profiles, "PROFILES_DIR", profiles)
+    service = ContentProfileService(tmp_path / "profiles.sqlite3")
+    barrier = threading.Barrier(2)
+    outcomes = {}
+
+    def create(marker: str):
+        barrier.wait(timeout=5)
+        try:
+            outcomes[marker] = service.create_profile(
+                "并发画像", {"identity.md": f"# 身份定位\n\n{marker}\n"}, source="concurrent-test",
+            )["id"]
+        except WorkflowError as exc:
+            outcomes[marker] = exc.status
+
+    threads = [threading.Thread(target=create, args=(marker,), daemon=True) for marker in ("创建A", "创建B")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(8)
+        assert not thread.is_alive()
+
+    winners = [marker for marker, result in outcomes.items() if isinstance(result, str) and result.startswith("cp_")]
+    losers = [marker for marker, result in outcomes.items() if result == 409]
+    assert len(winners) == 1 and len(losers) == 1
+    directory = profiles / "并发画像"
+    assert directory.is_dir()
+    assert winners[0] in (directory / "identity.md").read_text(encoding="utf-8")
+    assert len(service.list_profiles()) == 1
 
 
 def test_profile_storage_name_rejects_windows_path_forms(monkeypatch, tmp_path):
