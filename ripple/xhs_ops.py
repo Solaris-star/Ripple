@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime, timezone
+import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -57,14 +59,22 @@ def _compact_snapshot_data(kind: str, data: dict[str, Any]) -> dict[str, Any]:
     public.pop('_locators', None)
     if kind != 'events':
         return public
-    items = public.pop('items', [])
-    public['item_count'] = len(items) if isinstance(items, list) else int(public.get('listed_count') or 0)
-    # Event rows can approach 1 MB per read. The authoritative activities live in
-    # campaign storage; workspace snapshots retain only bounded read diagnostics.
+    items = public.pop('items', None)
+    if isinstance(items, list):
+        item_count = len(items)
+    else:
+        try:
+            item_count = int(public.get('item_count') if public.get('item_count') is not None else public.get('listed_count') or 0)
+        except (TypeError, ValueError):
+            item_count = 0
+    public['item_count'] = max(0, item_count)
+    public['snapshot_schema'] = 2
     diagnostics = public.get('diagnostics')
     if isinstance(diagnostics, dict):
         public['diagnostics'] = {
             'code': str(diagnostics.get('code') or '')[:80],
+            'stage': str(diagnostics.get('stage') or '')[:40],
+            'error_type': str(diagnostics.get('error_type') or '')[:80],
             'final_page': _public_url(str(diagnostics.get('final_page') or '')),
             'body_state': str(diagnostics.get('body_state') or '')[:20],
             'api_list_responses_seen': max(0, int(diagnostics.get('api_list_responses_seen') or 0)),
@@ -98,6 +108,71 @@ class XhsOpsService:
 
     def _locator_path(self, account_id: str) -> Path:
         return self.accounts.directory(account_id) / "xhs-note-locators.json"
+
+    def _event_archive_dir(self, account_id: str) -> Path:
+        return self.accounts.directory(account_id) / "xhs-event-snapshots"
+
+    @staticmethod
+    def _event_archive_name(snapshot_id: str) -> str:
+        return hashlib.sha256(str(snapshot_id or "").encode("utf-8")).hexdigest()[:32] + ".json.gz"
+
+    def _write_event_archive(self, account_id: str, snapshot_id: str, data: dict[str, Any]) -> str:
+        archive_dir = self._event_archive_dir(account_id)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        name = self._event_archive_name(snapshot_id)
+        path = archive_dir / name
+        if path.is_file() and path.stat().st_size > 0:
+            return name
+        public = deepcopy(data)
+        public.pop('_locators', None)
+        for item in public.get('items', []) if isinstance(public.get('items'), list) else []:
+            if not isinstance(item, dict):
+                continue
+            for field in ('url', 'publish_url'):
+                if item.get(field):
+                    item[field] = _public_url(str(item.get(field) or ''))
+            for topic in item.get('topics', []) if isinstance(item.get('topics'), list) else []:
+                if isinstance(topic, dict) and topic.get('link'):
+                    topic['link'] = _public_url(str(topic.get('link') or ''))
+        if public.get('page_url'):
+            public['page_url'] = _public_url(str(public.get('page_url') or ''))
+        compact = _compact_snapshot_data('events', public)
+        if isinstance(compact.get('diagnostics'), dict):
+            public['diagnostics'] = compact['diagnostics']
+        if public.get('page_url'):
+            public['page_url'] = _public_url(str(public.get('page_url') or ''))
+        temp = path.with_suffix(path.suffix + ".tmp")
+        with gzip.open(temp, "wt", encoding="utf-8") as handle:
+            json.dump(public, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temp, path)
+        return name
+
+    def _read_event_archive(self, account_id: str, archive_ref: str) -> dict[str, Any] | None:
+        ref = str(archive_ref or "")
+        if not re.fullmatch(r"[0-9a-f]{32}\.json\.gz", ref):
+            return None
+        path = self._event_archive_dir(account_id) / ref
+        try:
+            if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
+                return None
+            with gzip.open(path, "rt", encoding="utf-8") as handle:
+                raw = handle.read(16 * 1024 * 1024 + 1)
+            if len(raw) > 16 * 1024 * 1024:
+                return None
+            value = json.loads(raw)
+            return value if isinstance(value, dict) else None
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def _hydrate_event_snapshot(self, row: dict[str, Any]) -> dict[str, Any]:
+        current = deepcopy(row)
+        data = current.get('data')
+        if current.get('kind') != 'events' or not isinstance(data, dict):
+            return current
+        archive = self._read_event_archive(str(current.get('account_id') or ''), str(data.get('archive_ref') or ''))
+        if archive is not None:
+            current['data'] = archive
+        return current
 
     def _read_locators(self, account_id: str) -> dict[str, dict[str, Any]]:
         path = self._locator_path(account_id)
@@ -146,22 +221,32 @@ class XhsOpsService:
         return note_id, locator
 
     def _record_snapshot(self, account_id: str, kind: str, data: dict[str, Any]) -> None:
+        snapshot_id = uuid.uuid4().hex
         public = _compact_snapshot_data(kind, data)
-        entry = {'id': uuid.uuid4().hex, 'account_id': account_id, 'kind': kind, 'at': _now(), 'data': public}
+        if kind == 'events':
+            public['archive_ref'] = self._write_event_archive(account_id, snapshot_id, data)
+        entry = {'id': snapshot_id, 'account_id': account_id, 'kind': kind, 'at': _now(), 'data': public}
         with self.store.transaction() as state:
             rows = state.setdefault('xhs_snapshots', [])
             if not isinstance(rows, list):
                 rows = state['xhs_snapshots'] = []
-            compacted = []
+            updated = []
             for row in rows:
                 if not isinstance(row, dict):
                     continue
                 current = deepcopy(row)
-                if current.get('kind') == 'events' and isinstance(current.get('data'), dict):
-                    current['data'] = _compact_snapshot_data('events', current['data'])
-                compacted.append(current)
-            compacted.append(entry)
-            state['xhs_snapshots'] = compacted[-MAX_SNAPSHOTS:]
+                if kind == 'events' and current.get('account_id') == account_id and current.get('kind') == 'events' and isinstance(current.get('data'), dict):
+                    current_data = current['data']
+                    if isinstance(current_data.get('items'), list):
+                        current_data['archive_ref'] = self._write_event_archive(
+                            account_id, str(current.get('id') or uuid.uuid4().hex), current_data,
+                        )
+                    current['data'] = _compact_snapshot_data('events', current_data)
+                    if current_data.get('archive_ref'):
+                        current['data']['archive_ref'] = str(current_data.get('archive_ref'))
+                updated.append(current)
+            updated.append(entry)
+            state['xhs_snapshots'] = updated[-MAX_SNAPSHOTS:]
 
     def _worker(self, account_id: str, action: str, params: dict[str, Any], *, interaction: bool = False, operation_id: str | None = None) -> dict[str, Any]:
         account = self._account(account_id)
@@ -261,7 +346,8 @@ class XhsOpsService:
         with self.store.transaction(write=False) as state:
             rows = state.get('xhs_snapshots', []) if isinstance(state.get('xhs_snapshots', []), list) else []
             selected = [deepcopy(row) for row in rows if row.get('account_id') == account_id and (not kind or row.get('kind') == kind)]
-        return {'items': selected[-max(1, min(limit, 100)):][::-1]}
+        hydrated = [self._hydrate_event_snapshot(row) for row in selected[-max(1, min(limit, 100)):][::-1]]
+        return {'items': hydrated}
 
     def draft_interaction(self, *, account_id: str, note_id: str = '', url: str = '', kind: str,
                           items: list[dict[str, Any]] | None = None, text: str = '', idempotency_key: str) -> dict[str, Any]:

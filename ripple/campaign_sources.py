@@ -486,6 +486,8 @@ def _xhs_empty_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
     sort_errors = raw.get("sort_errors") if isinstance(raw.get("sort_errors"), dict) else {}
     return {
         "code": str(raw.get("code") or "")[:80],
+        "stage": str(raw.get("stage") or "")[:40],
+        "error_type": str(raw.get("error_type") or "")[:80],
         "final_page": str(raw.get("final_page") or "")[:512],
         "body_state": str(raw.get("body_state") or "")[:20],
         "api_list_responses_seen": max(0, int(raw.get("api_list_responses_seen") or 0)),
@@ -514,6 +516,17 @@ def _xhs_empty_failure(payload: dict[str, Any], *, attempts: int) -> tuple[str, 
     if 403 in statuses or 429 in statuses:
         status_text = "403" if 403 in statuses else "429"
         return (f"小红书创作者活动接口返回 HTTP {status_text}，平台可能要求人工验证或限制了当前访问；已保留上次成功活动。", 409)
+    server_status = next((status for status in statuses if 500 <= status <= 599), 0)
+    if server_status:
+        return (f"小红书创作者活动接口返回 HTTP {server_status}，属于平台服务端响应异常；已保留上次成功活动，请稍后重试。", 502)
+    other_status = next((status for status in statuses if status >= 400), 0)
+    if other_status:
+        return (f"小红书创作者活动接口返回 HTTP {other_status}；已保留上次成功活动，请稍后重试。", 502)
+    if diag["code"] == "navigation_timeout":
+        return ("小红书创作者活动页加载超时，尚未完成官方活动列表读取；已保留上次成功活动，请稍后重试。", 502)
+    if diag["code"] == "navigation_error":
+        error_type = f"（{diag['error_type']}）" if diag["error_type"] else ""
+        return (f"小红书创作者活动页导航失败{error_type}；已保留上次成功活动，请稍后重试。", 502)
     if diag["non_json_count"]:
         return ("小红书创作者活动接口本次返回了非 JSON 内容；已保留上次成功活动，请稍后重试。", 502)
     if diag["invalid_payload_count"]:

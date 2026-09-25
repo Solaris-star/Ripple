@@ -883,7 +883,7 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
     response_diag = {
         'list_seen': 0, 'query_mismatch': 0, 'accepted': 0,
         'non_json': 0, 'invalid_payload': 0, 'parse_errors': 0,
-        'http_statuses': [],
+        'http_statuses': [], 'blocking_status': 0,
     }
     try:
         def on_response(response):
@@ -892,20 +892,22 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
                 if parsed.hostname != 'creator.xiaohongshu.com' or parsed.path != '/api/galaxy/v2/creator/activity_center/list':
                     return
                 response_diag['list_seen'] += 1
+                status = int(response.status or 0)
                 query = parse_qs(parsed.query)
                 sort_value = (query.get('sort') or [''])[0]
                 sort_name = 'default' if sort_value == '1' else 'latest' if sort_value == '2' else ''
-                if any(query.get(key) != [value] for key, value in (
-                    ('type', '1'), ('source', '3'), ('topic_activity', '0'),
-                )) or not sort_name:
-                    response_diag['query_mismatch'] += 1
-                    return
-                status = int(response.status or 0)
                 if status != 200:
                     statuses = response_diag['http_statuses']
                     if status not in statuses and len(statuses) < 6:
                         statuses.append(status)
-                    sort_errors[sort_name] = f'http_{status}'
+                    if status in {401, 403, 429}:
+                        response_diag['blocking_status'] = status
+                    sort_errors[sort_name or 'endpoint'] = f'http_{status}'
+                    return
+                if any(query.get(key) != [value] for key, value in (
+                    ('type', '1'), ('source', '3'), ('topic_activity', '0'),
+                )) or not sort_name:
+                    response_diag['query_mismatch'] += 1
                     return
                 if 'json' not in (response.headers.get('content-type') or '').lower():
                     response_diag['non_json'] += 1
@@ -928,8 +930,35 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
 
         def wait_activity_payload(sort_name: str, wait_ms: int) -> None:
             deadline = time.monotonic() + max(0, wait_ms) / 1000
-            while sort_name not in activity_payloads and time.monotonic() < deadline:
+            while (
+                sort_name not in activity_payloads
+                and not response_diag['blocking_status']
+                and time.monotonic() < deadline
+            ):
                 page.wait_for_timeout(250)
+
+        def navigation_failure(stage: str, exc: Exception) -> dict[str, Any]:
+            error_type = type(exc).__name__[:80]
+            code = 'navigation_timeout' if 'timeout' in error_type.lower() else 'navigation_error'
+            return {
+                'items': [], 'source': 'creator_events_dom',
+                'page_url': 'https://creator.xiaohongshu.com/new/events',
+                'api_observed': False, 'raw_count': 0, 'listed_count': 0,
+                'orders': {}, 'detail_count': 0, 'detail_fetched': 0,
+                'diagnostics': {
+                    'code': code, 'stage': stage, 'error_type': error_type,
+                    'final_page': _safe_creator_page(getattr(page, 'url', '')),
+                    'body_state': 'unknown',
+                    'api_list_responses_seen': int(response_diag['list_seen']),
+                    'api_responses_accepted': int(response_diag['accepted']),
+                    'query_mismatch_count': int(response_diag['query_mismatch']),
+                    'non_json_count': int(response_diag['non_json']),
+                    'invalid_payload_count': int(response_diag['invalid_payload']),
+                    'parse_error_count': int(response_diag['parse_errors']),
+                    'http_statuses': [int(v) for v in response_diag['http_statuses'][:6]],
+                    'sort_errors': {key: str(value)[:80] for key, value in sort_errors.items()},
+                },
+            }
 
         def click_visible_text(label: str) -> bool:
             try:
@@ -944,14 +973,24 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
             return False
 
         page.on('response', on_response)
-        _goto(page, 'https://creator.xiaohongshu.com/new/events', wait=1600)
+        try:
+            _goto(page, 'https://creator.xiaohongshu.com/new/events', wait=1600)
+        except XhsBrowserError:
+            raise
+        except Exception as exc:
+            return navigation_failure('initial_navigation', exc)
         wait_activity_payload('default', 6000)
-        if 'default' not in activity_payloads:
-            page.reload(wait_until='domcontentloaded', timeout=30000)
-            page.wait_for_timeout(1800)
-            _risk(page)
+        if 'default' not in activity_payloads and response_diag['list_seen'] == 0:
+            try:
+                page.reload(wait_until='domcontentloaded', timeout=30000)
+                page.wait_for_timeout(1800)
+                _risk(page)
+            except XhsBrowserError:
+                raise
+            except Exception as exc:
+                return navigation_failure('reload', exc)
             wait_activity_payload('default', 6000)
-        if 'default' not in activity_payloads:
+        if 'default' not in activity_payloads and response_diag['list_seen'] == 0:
             page.wait_for_timeout(2500)
 
         body = ''
@@ -1068,8 +1107,25 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
                 detail_cache = dict(sorted(detail_cache.items(), key=lambda pair: int((pair[1] or {}).get('at') or 0), reverse=True)[:CREATOR_DETAIL_CACHE_MAX])
             _write_creator_detail_cache(directory, detail_cache)
         listed = items[:max(1, min(limit, CREATOR_ACTIVITY_MAX))]
+        statuses = [int(v) for v in response_diag['http_statuses'][:6]]
+        if response_diag['blocking_status']:
+            diagnostic_code = f"http_{int(response_diag['blocking_status'])}"
+        elif statuses:
+            diagnostic_code = f"http_{statuses[0]}"
+        elif response_diag['non_json']:
+            diagnostic_code = 'non_json_response'
+        elif response_diag['invalid_payload']:
+            diagnostic_code = 'invalid_activity_payload'
+        elif response_diag['list_seen'] and response_diag['query_mismatch'] >= response_diag['list_seen']:
+            diagnostic_code = 'query_mismatch'
+        elif not api_observed and not listed:
+            diagnostic_code = 'api_not_observed_dom_empty'
+        else:
+            diagnostic_code = ''
         diagnostics = {
-            'code': 'api_not_observed_dom_empty' if not api_observed and not listed else '',
+            'code': diagnostic_code,
+            'stage': 'activity_list',
+            'error_type': '',
             'final_page': _safe_creator_page(page.url),
             'body_state': 'nonempty' if body.strip() else 'blank',
             'api_list_responses_seen': int(response_diag['list_seen']),
@@ -1078,7 +1134,7 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
             'non_json_count': int(response_diag['non_json']),
             'invalid_payload_count': int(response_diag['invalid_payload']),
             'parse_error_count': int(response_diag['parse_errors']),
-            'http_statuses': [int(v) for v in response_diag['http_statuses'][:6]],
+            'http_statuses': statuses,
             'sort_errors': {key: str(value)[:80] for key, value in sort_errors.items()},
         }
         return {'items': listed, 'source': source,
