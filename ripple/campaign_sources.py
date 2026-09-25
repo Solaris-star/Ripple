@@ -471,6 +471,60 @@ def _bilibili_detail_from_html(html: str) -> dict[str, Any]:
     }
 
 
+def _xhs_empty_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
+    raw = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+    statuses = []
+    for value in raw.get("http_statuses", []) if isinstance(raw.get("http_statuses"), list) else []:
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= status <= 599 and status not in statuses:
+            statuses.append(status)
+        if len(statuses) >= 6:
+            break
+    sort_errors = raw.get("sort_errors") if isinstance(raw.get("sort_errors"), dict) else {}
+    return {
+        "code": str(raw.get("code") or "")[:80],
+        "final_page": str(raw.get("final_page") or "")[:512],
+        "body_state": str(raw.get("body_state") or "")[:20],
+        "api_list_responses_seen": max(0, int(raw.get("api_list_responses_seen") or 0)),
+        "api_responses_accepted": max(0, int(raw.get("api_responses_accepted") or 0)),
+        "query_mismatch_count": max(0, int(raw.get("query_mismatch_count") or 0)),
+        "non_json_count": max(0, int(raw.get("non_json_count") or 0)),
+        "invalid_payload_count": max(0, int(raw.get("invalid_payload_count") or 0)),
+        "parse_error_count": max(0, int(raw.get("parse_error_count") or 0)),
+        "http_statuses": statuses,
+        "sort_errors": {str(k)[:24]: str(v)[:80] for k, v in sort_errors.items()},
+    }
+
+
+def _xhs_transient_empty(payload: dict[str, Any]) -> bool:
+    if payload.get("items") or payload.get("api_observed") or payload.get("source") != "creator_events_dom":
+        return False
+    diag = _xhs_empty_diagnostics(payload)
+    return not any(status in {401, 403, 429} for status in diag["http_statuses"])
+
+
+def _xhs_empty_failure(payload: dict[str, Any], *, attempts: int) -> tuple[str, int]:
+    diag = _xhs_empty_diagnostics(payload)
+    statuses = diag["http_statuses"]
+    if 401 in statuses:
+        return ("小红书创作者活动接口返回 HTTP 401，登录态可能已失效；已保留上次成功活动，请检查账号登录状态。", 409)
+    if 403 in statuses or 429 in statuses:
+        status_text = "403" if 403 in statuses else "429"
+        return (f"小红书创作者活动接口返回 HTTP {status_text}，平台可能要求人工验证或限制了当前访问；已保留上次成功活动。", 409)
+    if diag["non_json_count"]:
+        return ("小红书创作者活动接口本次返回了非 JSON 内容；已保留上次成功活动，请稍后重试。", 502)
+    if diag["invalid_payload_count"]:
+        return ("小红书创作者活动接口响应结构发生变化；已保留上次成功活动，请稍后重试。", 502)
+    if diag["api_list_responses_seen"] and diag["query_mismatch_count"] >= diag["api_list_responses_seen"]:
+        return ("小红书创作者活动接口已响应，但请求参数结构与当前适配不一致；已保留上次成功活动。", 502)
+    prefix = "连续两次" if attempts >= 2 else "本次"
+    page = "活动页已打开" if diag["body_state"] == "nonempty" else "活动页内容未就绪"
+    return (f"小红书{page}，但{prefix}未观察到官方活动列表响应，页面备用列表也为空；已保留上次成功活动，请稍后重试。", 502)
+
+
 class CampaignSourceService:
     def __init__(self, workspace, ai_providers: AIProviderService):
         self.workspace = workspace
@@ -1584,10 +1638,19 @@ class CampaignSourceService:
         account, status = self._effective_account("xiaohongshu", str(state["xiaohongshu"].get("account_id") or ""))
         if status != "ready" or not account:
             raise WorkflowError("小红书活动源需要已连接的创作者账号。", 409)
+
+        attempts = 1
         payload = self.workspace.xhs_ops.events(str(account["id"]), 500, detail_limit=12)
         self._record_xhs_official_snapshots(str(account["id"]), payload)
+        if _xhs_transient_empty(payload):
+            attempts = 2
+            payload = self.workspace.xhs_ops.events(str(account["id"]), 500, detail_limit=12)
+            self._record_xhs_official_snapshots(str(account["id"]), payload)
+
         if not payload.get("items") and payload.get("source") == "creator_events_dom" and not payload.get("api_observed"):
-            raise WorkflowError("小红书创作者活动列表接口本次未返回数据，请稍后重试。", 502)
+            message, error_status = _xhs_empty_failure(payload, attempts=attempts)
+            raise WorkflowError(message, error_status)
+
         rows = []
         for item in payload.get("items", []):
             if not isinstance(item, dict) or not str(item.get("title") or "").strip():
@@ -1815,9 +1878,16 @@ class CampaignSourceService:
                                     "fallback_used": fallback_used})
                 except (WorkflowError, OSError, ValueError) as exc:
                     previous = self._state()["last_sync"].get(platform, {})
-                    status = "stale" if previous.get("last_success_at") or previous.get("count") else (
-                        "needs_login" if isinstance(exc, WorkflowError) and exc.status == 409 else "error")
-                    self._record_sync(platform, status=status, count=int(previous.get("count") or 0),
+                    has_previous = bool(previous.get("last_success_at") or previous.get("last_success_count") or previous.get("count"))
+                    if has_previous:
+                        status = "stale"
+                    elif isinstance(exc, WorkflowError) and exc.status == 409:
+                        message = str(exc)
+                        status = "needs_verification" if ("人工验证" in message or "限制了当前访问" in message) else "needs_login"
+                    else:
+                        status = "error"
+                    preserved_count = int(previous.get("count") or previous.get("last_success_count") or 0)
+                    self._record_sync(platform, status=status, count=preserved_count,
                                       error=str(exc), provider=str(previous.get("provider") or ""))
                     results.append({"platform": platform, "status": status, "items": [], "count": 0,
                                     "error": str(exc)[:300]})

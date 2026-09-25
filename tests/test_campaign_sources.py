@@ -646,20 +646,86 @@ def test_xiaohongshu_official_snapshot_keeps_last_good_sort_when_one_sort_fails(
 
 
 
-def test_xiaohongshu_source_treats_missing_api_and_empty_dom_as_transient_failure(source_service, monkeypatch):
+def test_xiaohongshu_source_retries_transient_empty_once_and_recovers(source_service, monkeypatch):
+    workspace, service = source_service
+    account = workspace.accounts.create(AccountInput(
+        platform="xiaohongshu", label="创作者号", idempotency_key="xhs-retry-fixture",
+    ))
+    with workspace.store.transaction() as state:
+        state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u2"})
+    calls = []
+    payloads = [
+        {"source": "creator_events_dom", "api_observed": False, "raw_count": 0, "items": [],
+         "diagnostics": {"code": "api_not_observed_dom_empty", "body_state": "nonempty", "http_statuses": []}},
+        {"source": "creator_activity_center_api", "api_observed": True, "raw_count": 1, "items": [
+            {"external_id": "1", "title": "恢复成功活动", "url": "https://fe.xiaohongshu.com/ditto/vincent/page1"}
+        ]},
+    ]
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda *args, **kwargs: (calls.append(1), payloads.pop(0))[1])
+    rows = service._xiaohongshu(service._state())
+    assert len(calls) == 2
+    assert [row["title"] for row in rows] == ["恢复成功活动"]
+
+
+def test_xiaohongshu_source_two_transient_empties_fail_closed_and_api_empty_is_valid(source_service, monkeypatch):
     workspace, service = source_service
     account = workspace.accounts.create(AccountInput(
         platform="xiaohongshu", label="创作者号", idempotency_key="xhs-empty-fixture",
     ))
     with workspace.store.transaction() as state:
         state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u2"})
-    monkeypatch.setattr(workspace.xhs_ops, "events", lambda account_id, limit, detail_limit=8: {
+    calls = []
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda *args, **kwargs: (calls.append(1), {
         "source": "creator_events_dom", "api_observed": False, "raw_count": 0, "items": [],
-    })
-    with pytest.raises(WorkflowError, match="活动列表接口本次未返回数据"):
+        "diagnostics": {"code": "api_not_observed_dom_empty", "body_state": "nonempty", "http_statuses": []},
+    })[1])
+    with pytest.raises(WorkflowError, match="连续两次未观察到官方活动列表响应"):
         service._xiaohongshu(service._state())
+    assert len(calls) == 2
 
-    monkeypatch.setattr(workspace.xhs_ops, "events", lambda account_id, limit, detail_limit=8: {
+    calls.clear()
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda *args, **kwargs: (calls.append(1), {
         "source": "creator_activity_center_api", "api_observed": True, "raw_count": 0, "items": [],
-    })
+    })[1])
     assert service._xiaohongshu(service._state()) == []
+    assert len(calls) == 1
+
+
+def test_xiaohongshu_http_verification_error_does_not_retry(source_service, monkeypatch):
+    workspace, service = source_service
+    account = workspace.accounts.create(AccountInput(
+        platform="xiaohongshu", label="创作者号", idempotency_key="xhs-403-fixture",
+    ))
+    with workspace.store.transaction() as state:
+        state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u403"})
+    calls = []
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda *args, **kwargs: (calls.append(1), {
+        "source": "creator_events_dom", "api_observed": False, "items": [],
+        "diagnostics": {"code": "api_not_observed_dom_empty", "body_state": "nonempty", "http_statuses": [403]},
+    })[1])
+    with pytest.raises(WorkflowError, match="HTTP 403") as exc:
+        service._xiaohongshu(service._state())
+    assert exc.value.status == 409
+    assert "人工验证" in str(exc.value)
+    assert len(calls) == 1
+
+
+def test_xiaohongshu_refresh_failure_preserves_last_success_count(source_service, monkeypatch):
+    workspace, service = source_service
+    account = workspace.accounts.create(AccountInput(
+        platform="xiaohongshu", label="创作者号", idempotency_key="xhs-stale-fixture",
+    ))
+    with workspace.store.transaction() as state:
+        state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "creator", "remote_id": "u250"})
+    service.configure("xiaohongshu", {"account_id": account["id"]})
+    service._record_sync("xiaohongshu", status="fresh", count=250, provider="xiaohongshu_creator_events")
+    monkeypatch.setattr(workspace.xhs_ops, "events", lambda *args, **kwargs: {
+        "source": "creator_events_dom", "api_observed": False, "raw_count": 0, "items": [],
+        "diagnostics": {"code": "api_not_observed_dom_empty", "body_state": "nonempty", "http_statuses": []},
+    })
+    result = service.refresh(["xiaohongshu"], force=True)
+    assert result["results"][0]["status"] == "stale"
+    source = next(row for row in result["sources"]["items"] if row["platform"] == "xiaohongshu")
+    assert source["last_sync"]["count"] == 250
+    assert source["last_sync"]["last_success_count"] == 250
+    assert "连续两次未观察到官方活动列表响应" in source["last_sync"]["error"]

@@ -11,7 +11,7 @@ from ripple.accounts import AccountInput
 from ripple.api import install
 from ripple.publishing import WorkflowError
 from ripple.workspace import WorkspaceService
-from ripple.xhs_browser import CREATOR_DETAIL_CACHE_VERSION, _creator_activity_order, _creator_activity_rows, _creator_detail_from_sources, _creator_task_detail, _metrics, _read_creator_detail_cache, parse_note_url, public_note_url
+from ripple.xhs_browser import CREATOR_DETAIL_CACHE_VERSION, _creator_activity_order, _creator_activity_rows, _creator_detail_from_sources, _creator_task_detail, _metrics, _read_creator_detail_cache, _safe_creator_page, parse_note_url, public_note_url
 
 
 def connected_service(tmp_path: Path) -> tuple[WorkspaceService, str]:
@@ -206,6 +206,8 @@ def test_old_creator_detail_cache_version_is_invalidated(tmp_path):
 
 
 def test_note_url_and_metrics_are_public_safe():
+    assert _safe_creator_page("https://creator.xiaohongshu.com/new/events?xsec_token=SECRET&foo=bar#frag") == "https://creator.xiaohongshu.com/new/events"
+    assert "SECRET" not in _safe_creator_page("https://creator.xiaohongshu.com/new/events?xsec_token=SECRET")
     note_id, token, original = parse_note_url(
         "https://www.xiaohongshu.com/explore/abc123?xsec_token=SECRET&xsec_source=pc"
     )

@@ -711,6 +711,16 @@ def public_note_url(value: str) -> str:
         return ''
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', ''))[:2048]
 
+def _safe_creator_page(value: str) -> str:
+    """Return only origin + path for diagnostics; never keep query/fragment."""
+    try:
+        parsed = urlsplit(str(value or ''))
+    except ValueError:
+        return ''
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        return ''
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', ''))[:512]
+
 
 def _risk(page) -> None:
     url = page.url or ''
@@ -870,39 +880,51 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
     p, context, page = _launch(directory)
     activity_payloads: dict[str, dict[str, Any]] = {}
     sort_errors: dict[str, str] = {}
+    response_diag = {
+        'list_seen': 0, 'query_mismatch': 0, 'accepted': 0,
+        'non_json': 0, 'invalid_payload': 0, 'parse_errors': 0,
+        'http_statuses': [],
+    }
     try:
         def on_response(response):
             try:
                 parsed = urlsplit(response.url)
                 if parsed.hostname != 'creator.xiaohongshu.com' or parsed.path != '/api/galaxy/v2/creator/activity_center/list':
                     return
+                response_diag['list_seen'] += 1
                 query = parse_qs(parsed.query)
-                if any(query.get(key) != [value] for key, value in (
-                    ('type', '1'), ('source', '3'), ('topic_activity', '0'),
-                )):
-                    return
                 sort_value = (query.get('sort') or [''])[0]
                 sort_name = 'default' if sort_value == '1' else 'latest' if sort_value == '2' else ''
-                if not sort_name:
+                if any(query.get(key) != [value] for key, value in (
+                    ('type', '1'), ('source', '3'), ('topic_activity', '0'),
+                )) or not sort_name:
+                    response_diag['query_mismatch'] += 1
                     return
-                if int(response.status or 0) != 200:
-                    sort_errors[sort_name] = f'http_{int(response.status or 0)}'
+                status = int(response.status or 0)
+                if status != 200:
+                    statuses = response_diag['http_statuses']
+                    if status not in statuses and len(statuses) < 6:
+                        statuses.append(status)
+                    sort_errors[sort_name] = f'http_{status}'
                     return
                 if 'json' not in (response.headers.get('content-type') or '').lower():
+                    response_diag['non_json'] += 1
                     sort_errors[sort_name] = 'non_json_response'
                     return
                 value = response.json()
                 data = value.get('data') if isinstance(value, dict) else None
                 if not isinstance(data, dict) or not isinstance(data.get('activity_list'), list):
+                    response_diag['invalid_payload'] += 1
                     sort_errors[sort_name] = 'invalid_activity_payload'
                     return
                 if value.get('success') is False:
                     sort_errors[sort_name] = 'api_unsuccessful'
                     return
                 activity_payloads[sort_name] = value
+                response_diag['accepted'] += 1
                 sort_errors.pop(sort_name, None)
             except Exception:
-                pass
+                response_diag['parse_errors'] += 1
 
         def wait_activity_payload(sort_name: str, wait_ms: int) -> None:
             deadline = time.monotonic() + max(0, wait_ms) / 1000
@@ -923,12 +945,14 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
 
         page.on('response', on_response)
         _goto(page, 'https://creator.xiaohongshu.com/new/events', wait=1600)
-        wait_activity_payload('default', 4500)
+        wait_activity_payload('default', 6000)
         if 'default' not in activity_payloads:
             page.reload(wait_until='domcontentloaded', timeout=30000)
-            page.wait_for_timeout(1600)
+            page.wait_for_timeout(1800)
             _risk(page)
-            wait_activity_payload('default', 4500)
+            wait_activity_payload('default', 6000)
+        if 'default' not in activity_payloads:
+            page.wait_for_timeout(2500)
 
         body = ''
         try:
@@ -1044,10 +1068,24 @@ def creator_events(directory: Path, limit: int = CREATOR_ACTIVITY_MAX, detail_li
                 detail_cache = dict(sorted(detail_cache.items(), key=lambda pair: int((pair[1] or {}).get('at') or 0), reverse=True)[:CREATOR_DETAIL_CACHE_MAX])
             _write_creator_detail_cache(directory, detail_cache)
         listed = items[:max(1, min(limit, CREATOR_ACTIVITY_MAX))]
+        diagnostics = {
+            'code': 'api_not_observed_dom_empty' if not api_observed and not listed else '',
+            'final_page': _safe_creator_page(page.url),
+            'body_state': 'nonempty' if body.strip() else 'blank',
+            'api_list_responses_seen': int(response_diag['list_seen']),
+            'api_responses_accepted': int(response_diag['accepted']),
+            'query_mismatch_count': int(response_diag['query_mismatch']),
+            'non_json_count': int(response_diag['non_json']),
+            'invalid_payload_count': int(response_diag['invalid_payload']),
+            'parse_error_count': int(response_diag['parse_errors']),
+            'http_statuses': [int(v) for v in response_diag['http_statuses'][:6]],
+            'sort_errors': {key: str(value)[:80] for key, value in sort_errors.items()},
+        }
         return {'items': listed, 'source': source,
                 'page_url': 'https://creator.xiaohongshu.com/new/events',
                 'api_observed': api_observed, 'raw_count': raw_count, 'listed_count': len(listed),
-                'orders': orders, 'detail_count': detail_count, 'detail_fetched': detail_fetched}
+                'orders': orders, 'detail_count': detail_count, 'detail_fetched': detail_fetched,
+                'diagnostics': diagnostics}
     finally:
         _close(p, context)
 
