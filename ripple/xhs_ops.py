@@ -52,6 +52,36 @@ def _note_id_from_url(value: str) -> str:
     return match.group(1) if match else ''
 
 
+def _compact_snapshot_data(kind: str, data: dict[str, Any]) -> dict[str, Any]:
+    public = deepcopy(data)
+    public.pop('_locators', None)
+    if kind != 'events':
+        return public
+    items = public.pop('items', [])
+    public['item_count'] = len(items) if isinstance(items, list) else int(public.get('listed_count') or 0)
+    # Event rows can approach 1 MB per read. The authoritative activities live in
+    # campaign storage; workspace snapshots retain only bounded read diagnostics.
+    diagnostics = public.get('diagnostics')
+    if isinstance(diagnostics, dict):
+        public['diagnostics'] = {
+            'code': str(diagnostics.get('code') or '')[:80],
+            'final_page': _public_url(str(diagnostics.get('final_page') or '')),
+            'body_state': str(diagnostics.get('body_state') or '')[:20],
+            'api_list_responses_seen': max(0, int(diagnostics.get('api_list_responses_seen') or 0)),
+            'api_responses_accepted': max(0, int(diagnostics.get('api_responses_accepted') or 0)),
+            'query_mismatch_count': max(0, int(diagnostics.get('query_mismatch_count') or 0)),
+            'non_json_count': max(0, int(diagnostics.get('non_json_count') or 0)),
+            'invalid_payload_count': max(0, int(diagnostics.get('invalid_payload_count') or 0)),
+            'parse_error_count': max(0, int(diagnostics.get('parse_error_count') or 0)),
+            'http_statuses': [int(v) for v in diagnostics.get('http_statuses', []) if isinstance(v, int)][:6],
+            'sort_errors': {
+                str(k)[:24]: str(v)[:80]
+                for k, v in (diagnostics.get('sort_errors') or {}).items()
+            } if isinstance(diagnostics.get('sort_errors'), dict) else {},
+        }
+    return public
+
+
 class XhsOpsService:
     def __init__(self, workspace):
         self.workspace = workspace
@@ -116,15 +146,22 @@ class XhsOpsService:
         return note_id, locator
 
     def _record_snapshot(self, account_id: str, kind: str, data: dict[str, Any]) -> None:
-        public = deepcopy(data)
-        public.pop('_locators', None)
+        public = _compact_snapshot_data(kind, data)
         entry = {'id': uuid.uuid4().hex, 'account_id': account_id, 'kind': kind, 'at': _now(), 'data': public}
         with self.store.transaction() as state:
             rows = state.setdefault('xhs_snapshots', [])
             if not isinstance(rows, list):
                 rows = state['xhs_snapshots'] = []
-            rows.append(entry)
-            state['xhs_snapshots'] = rows[-MAX_SNAPSHOTS:]
+            compacted = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                current = deepcopy(row)
+                if current.get('kind') == 'events' and isinstance(current.get('data'), dict):
+                    current['data'] = _compact_snapshot_data('events', current['data'])
+                compacted.append(current)
+            compacted.append(entry)
+            state['xhs_snapshots'] = compacted[-MAX_SNAPSHOTS:]
 
     def _worker(self, account_id: str, action: str, params: dict[str, Any], *, interaction: bool = False, operation_id: str | None = None) -> dict[str, Any]:
         account = self._account(account_id)

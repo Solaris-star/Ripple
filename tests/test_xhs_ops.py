@@ -271,6 +271,43 @@ def test_creator_events_use_same_connected_xhs_profile_boundary(tmp_path, monkey
     assert result["items"][0]["external_id"] == "event1"
     assert calls == [("xhs_read", "events", {"limit": 250, "detail_limit": 12})]
 
+
+def test_creator_events_snapshots_compact_full_event_rows_and_legacy_entries(tmp_path, monkeypatch):
+    service, account_id = connected_service(tmp_path)
+    full_items = [
+        {"external_id": str(index), "title": f"活动{index}", "description": "详情" * 300}
+        for index in range(250)
+    ]
+    with service.store.transaction() as state:
+        state["xhs_snapshots"] = [{
+            "id": "legacy-events", "account_id": account_id, "kind": "events", "at": "fixture",
+            "data": {"source": "creator_activity_center_api", "items": full_items, "listed_count": 250, "orders": {}},
+        }]
+    before_size = service.store.path.stat().st_size
+
+    monkeypatch.setattr(service.accounts, "run", lambda account, operation, operation_id, **extra: {
+        "state": "success",
+        "data": {
+            "source": "creator_activity_center_api", "items": full_items, "api_observed": True,
+            "raw_count": 250, "listed_count": 250, "orders": {},
+            "diagnostics": {
+                "final_page": "https://creator.xiaohongshu.com/new/events?token=PRIVATE",
+                "api_list_responses_seen": 2, "api_responses_accepted": 2, "http_statuses": [],
+            },
+        },
+    })
+    result = service.xhs_ops.events(account_id, 250, detail_limit=0)
+    assert len(result["items"]) == 250
+
+    with service.store.transaction(write=False) as state:
+        snapshots = [row for row in state["xhs_snapshots"] if row.get("kind") == "events"]
+    assert len(snapshots) == 2
+    assert all("items" not in row["data"] for row in snapshots)
+    assert [row["data"]["item_count"] for row in snapshots] == [250, 250]
+    assert snapshots[-1]["data"]["diagnostics"]["final_page"] == "https://creator.xiaohongshu.com/new/events"
+    assert "PRIVATE" not in json.dumps(snapshots, ensure_ascii=False)
+    assert service.store.path.stat().st_size < before_size
+
 def test_creator_events_zero_detail_limit_is_forwarded_without_defaulting(tmp_path, monkeypatch):
     service, account_id = connected_service(tmp_path)
     calls = []
