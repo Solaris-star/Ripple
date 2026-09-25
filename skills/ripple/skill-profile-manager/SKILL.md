@@ -85,27 +85,34 @@ layer: general
    - "有哪些画像" / "画像列表" → `list`
    - "切换画像" / "用另一个画像" → `switch`
 
+### 数据源约束
+
+- **正式画像唯一真相源**：Ripple `ContentProfileService` / `/api/content-profiles*` 中的 confirmed revision。
+- `profiles/<画像名>/` 只是兼容镜像，可能暂时存在外部待确认文件；**不得直接把目录内容当成正式画像**。
+- create / edit / memory-update 必须通过画像服务/API提交版本；export / diff / list 必须读取 confirmed revision。
+- 发现外部 Markdown 变化时，只能把它作为待确认 draft 展示；未确认前不得进入 Agent、导出、对比或记忆。
+
 ### create 流程
 
-2. **检查画像是否已存在**：读取 `profiles/` 目录，确认同名画像不存在
-3. **复制模板**：将 `profiles/_template/` 复制为 `profiles/{profile_name}/`
+2. **检查画像是否已存在**：通过 Ripple 画像服务/API 查询正式画像，确认同名画像不存在
+3. **创建画像**：通过 Ripple 画像服务/API 创建 confirmed 初始版本；不要直接复制或创建 `profiles/` 目录
 4. **引导填写核心信息**：依次向用户提问，收集以下信息
    - **identity.md**：你是谁？做什么内容？和别人有什么不同？
    - **style.md**：你的语言风格是什么？正式/轻松/搞笑？常用口头禅？
    - **audience.md**：你的目标受众是谁？年龄、兴趣、痛点？
-5. **写入文件**：将收集到的信息按模板格式写入对应文件
+5. **提交版本**：将收集到的六维内容作为一次画像 revision 通过 Ripple 画像服务/API 提交
 6. **提示后续**：告知用户可后续补充 platforms.md 和 preferences.md
 
 ### edit 流程
 
-7. **定位文件**：根据 field 参数确定要编辑的文件路径 `profiles/{profile_name}/{field}.md`
-8. **读取当前内容**：展示该文件的当前内容给用户确认
-9. **应用修改**：根据用户指示修改指定字段，保持文件其他部分不变
+7. **定位维度**：根据 field 参数确定六维字段
+8. **读取当前内容**：通过 Ripple 画像服务/API 读取当前 confirmed revision，并展示对应维度给用户确认
+9. **应用修改**：基于当前 revision 修改指定维度，通过版本接口提交；保持其他维度不变并携带 expected revision
 10. **确认变更**：输出修改前后的 diff 摘要
 
 ### memory-update 流程
 
-11. **读取现有记忆**：读取 `profiles/{profile_name}/memory.md`
+11. **读取现有记忆**：从当前 confirmed revision 读取 `memory.md`，不要直接读取兼容目录
 12. **格式化新记忆条目**：按以下格式追加
     ```
     ### {日期} — {来源标签}
@@ -113,23 +120,23 @@ layer: general
     - 行动建议：{可执行的建议}
     ```
 13. **去重检查**：与已有记忆条目比对，避免重复记录
-14. **追加写入**：将新条目追加到 memory.md 末尾
+14. **追加写入**：把新条目追加到 revision 中的 `memory.md`，再通过画像服务/API提交新版本
 
 ### export 流程
 
-15. **汇总画像**：读取画像目录下所有 .md 文件
+15. **汇总画像**：读取画像当前 confirmed revision 的全部字段；忽略未确认 external draft
 16. **生成摘要卡片**：合并为一份结构化的画像摘要（Markdown 格式）
 17. **输出到 outputs/**：保存为 `outputs/<画像名-导出日期>/profile-export.md`
 
 ### diff 流程
 
-18. **读取两个画像**：分别读取 `profiles/{profile_a}/` 和 `profiles/{profile_b}/` 下所有文件
+18. **读取两个画像**：通过画像服务/API分别读取两个画像的当前 confirmed revision
 19. **逐维度对比**：按 identity / style / audience / platforms / preferences 五个维度对比
 20. **生成差异表**：输出结构化对比表，高亮关键差异点
 
 ### list 流程
 
-21. **扫描 profiles/ 目录**：列出所有子目录（排除 `_template`）
+21. **查询画像列表**：通过 Ripple 画像服务/API列出未归档画像
 22. **计算完整度**：检查每个画像的 6 个文件是否有实质内容（非空非模板）
 23. **输出列表**：按完整度排序输出
 

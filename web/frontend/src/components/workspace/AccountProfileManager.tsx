@@ -3,10 +3,12 @@ import {
   applyProfileAnalysis,
   bindContentProfile,
   fetchContentProfile,
+  fetchContentProfileRevision,
   fetchContentProfileContext,
   fetchProfileAnalysis,
   fetchLatestProfileAnalysis,
   fetchProfileAnalysisCapability,
+  resumeProfileAnalysis,
   startProfileAnalysis,
   unbindContentProfile,
 } from '../../lib/api';
@@ -39,6 +41,9 @@ type AnalysisState = {
   profileId: string;
   displayName: string;
   baseFiles: Record<string, string>;
+  baseRevision: number;
+  bindingRevision: number;
+  bindingProfileId: string;
   baseReady: boolean;
   requestKey: string;
   sampleText: string;
@@ -85,7 +90,7 @@ function sampleRows(raw: string): Array<Record<string, unknown>> {
 }
 
 function analysisSamplesText(rows: Array<Record<string, unknown>>): string {
-  return rows.map((row) => {
+  return rows.filter((row) => String(row.kind || '') !== 'account_history_title_only').map((row) => {
     const title = String(row.title || '').trim();
     const body = String(row.body || '').trim();
     return [title, body && body !== title ? body : ''].filter(Boolean).join('\n');
@@ -286,19 +291,21 @@ export default function AccountProfileManager({
 
   const openAnalysis = async (target: Target, mode: 'current' | 'new' = 'current') => {
     setError(''); setNotice('');
-    const binding = bindingFor(target);
-    const defaultProfileId = mode === 'current' ? (binding?.profile_id || activeProfileId) : '';
-    const defaultDisplayName = mode === 'new'
-      ? `${target.identityName || target.label}画像`
-      : (binding ? profileFor(binding.profile_id)?.display_name || '' : activeProfile?.display_name || '');
-    const initialFiles = defaultProfileId === activeDetail?.id ? { ...(activeDetail.files || {}) } : {};
+    const existingBinding = bindingFor(target);
+    const initialProfileId = mode === 'current' ? (existingBinding?.profile_id || activeProfileId) : '';
+    const initialDisplayName = mode === 'new'
+      ? (target.identityName || target.label) + '画像'
+      : (existingBinding ? profileFor(existingBinding.profile_id)?.display_name || '' : activeProfile?.display_name || '');
     setAnalysis({
       target,
       capability: null,
-      profileId: defaultProfileId,
-      displayName: defaultDisplayName,
-      baseFiles: initialFiles,
-      baseReady: !defaultProfileId || Object.keys(initialFiles).length > 0,
+      profileId: initialProfileId,
+      displayName: initialDisplayName,
+      baseFiles: {},
+      baseRevision: 0,
+      bindingRevision: Number(existingBinding?.binding_revision || 0),
+      bindingProfileId: String(existingBinding?.profile_id || ''),
+      baseReady: !initialProfileId,
       requestKey: analysisRequestKey(),
       sampleText: '',
       useAccountHistory: false,
@@ -306,31 +313,52 @@ export default function AccountProfileManager({
       run: null,
     });
     try {
-      const [capability, latest] = await Promise.all([
+      const [capability, latest, freshContext] = await Promise.all([
         fetchProfileAnalysisCapability(target.kind, target.id),
         fetchLatestProfileAnalysis(target.kind, target.id),
+        fetchContentProfileContext(),
       ]);
+      setContext(freshContext);
+      const liveBinding = freshContext.bindings.find((item) => item.target_kind === target.kind && item.account_id === target.id);
       const latestModel = (latest?.model || {}) as Record<string, unknown>;
       const latestMatchesBinding = !!latest
-        && Number(latestModel.base_binding_revision || 0) === Number(binding?.binding_revision || 0)
-        && String(latestModel.base_binding_profile_id || '') === String(binding?.profile_id || '');
-      const restoredRun = latestMatchesBinding ? latest : null;
-      const lockedProfileId = restoredRun?.profile_id || defaultProfileId;
-      let baseFiles = lockedProfileId === activeDetail?.id ? { ...(activeDetail.files || {}) } : {};
-      if (lockedProfileId && !Object.keys(baseFiles).length) {
-        const detail = await fetchContentProfile(lockedProfileId);
-        baseFiles = { ...(detail.files || {}) };
-      }
+        && Number(latestModel.base_binding_revision || 0) === Number(liveBinding?.binding_revision || 0)
+        && String(latestModel.base_binding_profile_id || '') === String(liveBinding?.profile_id || '');
+      const latestApplied = Boolean(latest?.apply_result && Object.keys(latest.apply_result).length > 0);
+      const restoredRun = latestMatchesBinding && !latestApplied ? latest : null;
+      const freshProfileId = mode === 'current' ? (liveBinding?.profile_id || activeProfileId) : '';
+      const lockedProfileId = restoredRun?.profile_id || freshProfileId;
       const restoredModel = (restoredRun?.model || {}) as Record<string, unknown>;
+      let baseRevision = restoredRun ? Number(restoredModel.base_profile_revision || 0) : 0;
+      let baseFiles = restoredRun && restoredModel.base_files && typeof restoredModel.base_files === 'object'
+        ? { ...(restoredModel.base_files as Record<string, string>) }
+        : {};
+      if (lockedProfileId && (!baseRevision || !Object.keys(baseFiles).length)) {
+        if (restoredRun && baseRevision) {
+          const snapshot = await fetchContentProfileRevision(lockedProfileId, baseRevision);
+          if (snapshot.status !== 'confirmed') throw new Error('分析基线不是已确认画像版本。');
+          baseFiles = { ...(snapshot.files || {}) };
+        } else {
+          const detail = await fetchContentProfile(lockedProfileId);
+          baseRevision = Number(detail.current_revision || 0);
+          baseFiles = { ...(detail.files || {}) };
+        }
+      }
       const restoredKey = typeof restoredModel.request_key === 'string' && restoredModel.request_key
         ? restoredModel.request_key : analysisRequestKey();
+      const profileSummary = freshContext.profiles.find((item) => item.id === lockedProfileId);
       setAnalysis((current) => current && current.target.id === target.id ? {
         ...current,
         capability,
         profileId: lockedProfileId,
-        displayName: restoredRun ? String(restoredModel.display_name || defaultDisplayName) : defaultDisplayName,
+        displayName: restoredRun
+          ? String(restoredModel.display_name || initialDisplayName)
+          : (lockedProfileId ? profileSummary?.display_name || initialDisplayName : initialDisplayName),
         baseFiles,
-        baseReady: !lockedProfileId || Object.keys(baseFiles).length > 0,
+        baseRevision,
+        bindingRevision: restoredRun ? Number(restoredModel.base_binding_revision || 0) : Number(liveBinding?.binding_revision || 0),
+        bindingProfileId: restoredRun ? String(restoredModel.base_binding_profile_id || '') : String(liveBinding?.profile_id || ''),
+        baseReady: !lockedProfileId || (baseRevision > 0 && Object.keys(baseFiles).length > 0),
         requestKey: restoredKey,
         sampleText: restoredRun ? analysisSamplesText(restoredRun.samples || []) : current.sampleText,
         useAccountHistory: restoredRun ? Boolean(restoredModel.history_used) : current.useAccountHistory,
@@ -346,8 +374,9 @@ export default function AccountProfileManager({
     setAnalysis((current) => current ? {
       ...current,
       profileId,
-      displayName: profileId ? nextProfile?.display_name || '' : `${current.target.identityName || current.target.label}画像`,
+      displayName: profileId ? nextProfile?.display_name || '' : (current.target.identityName || current.target.label) + '画像',
       baseFiles: {},
+      baseRevision: 0,
       baseReady: !profileId,
     } : current);
     if (!profileId) return;
@@ -355,34 +384,67 @@ export default function AccountProfileManager({
     try {
       const detail = await fetchContentProfile(profileId);
       setAnalysis((current) => current && !current.run && current.profileId === profileId
-        ? { ...current, baseFiles: { ...(detail.files || {}) }, baseReady: true }
+        ? { ...current, baseFiles: { ...(detail.files || {}) }, baseRevision: Number(detail.current_revision || 0), baseReady: true }
         : current);
     } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   };
 
-  const resetAnalysis = () => {
-    setError('');
+  const resetAnalysis = async () => {
+    if (!analysis) return;
+    const target = analysis.target;
+    const profileId = analysis.profileId;
+    setError(''); setNotice(''); setBusy(true);
     setAnalysis((current) => current ? {
       ...current,
       run: null,
       requestKey: analysisRequestKey(),
-      baseReady: !current.profileId || Object.keys(current.baseFiles).length > 0,
+      baseFiles: {},
+      baseRevision: 0,
+      baseReady: !profileId,
     } : current);
+    try {
+      const freshContext = await fetchContentProfileContext();
+      const liveBinding = freshContext.bindings.find((item) => item.target_kind === target.kind && item.account_id === target.id);
+      let baseFiles: Record<string, string> = {};
+      let baseRevision = 0;
+      if (profileId) {
+        const detail = await fetchContentProfile(profileId);
+        baseFiles = { ...(detail.files || {}) };
+        baseRevision = Number(detail.current_revision || 0);
+      }
+      setContext(freshContext);
+      setAnalysis((current) => current && current.target.id === target.id && !current.run ? {
+        ...current,
+        baseFiles,
+        baseRevision,
+        bindingRevision: Number(liveBinding?.binding_revision || 0),
+        bindingProfileId: String(liveBinding?.profile_id || ''),
+        baseReady: !profileId || (baseRevision > 0 && Object.keys(baseFiles).length > 0),
+      } : current);
+    } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   };
 
   const startAnalysis = async () => {
     if (!analysis) return;
     if (analysis.run && analysis.run.status !== 'waiting_user') return;
-    if (!analysis.baseReady) { setError('正在读取目标画像基线，请稍后再开始分析。'); return; }
-    const samples = sampleRows(analysis.sampleText);
-    if (!samples.length && !analysis.useAccountHistory) { setError('请粘贴代表作品，或选择读取当前账号已发布作品。'); return; }
     setBusy(true); setError(''); setNotice('');
     try {
-      let run = await startProfileAnalysis({
+      if (analysis.run?.status === 'waiting_user') {
+        const resumed = await resumeProfileAnalysis(analysis.run.id);
+        setAnalysis((current) => current && current.run?.id === resumed.id ? { ...current, run: resumed } : current);
+        return;
+      }
+      if (!analysis.baseReady) throw new Error('正在读取目标画像基线，请稍后再开始分析。');
+      const samples = sampleRows(analysis.sampleText);
+      if (!samples.length && !analysis.useAccountHistory) throw new Error('请粘贴代表作品，或选择读取当前账号已发布作品。');
+      const run = await startProfileAnalysis({
         target_kind: analysis.target.kind,
         account_id: analysis.target.id,
         profile_id: analysis.profileId,
         display_name: analysis.displayName.trim(),
+        expected_profile_revision: analysis.profileId ? analysis.baseRevision : 0,
+        expected_binding_revision: analysis.bindingRevision,
+        expected_binding_profile_id: analysis.bindingProfileId,
         samples,
         use_account_history: analysis.useAccountHistory,
         history_limit: analysis.historyLimit,
@@ -390,16 +452,33 @@ export default function AccountProfileManager({
         confirmed: true,
       });
       setAnalysis((current) => current ? { ...current, run } : current);
-      if (run.status === 'running') {
-        for (let i = 0; i < 45; i += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 1500));
-          run = await fetchProfileAnalysis(run.id);
-          setAnalysis((current) => current ? { ...current, run } : current);
-          if (!['running', 'queued'].includes(run.status)) break;
-        }
-      }
     } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   };
+
+  useEffect(() => {
+    const runId = analysis?.run?.id;
+    const status = analysis?.run?.status;
+    if (!runId || !status || !['running', 'queued'].includes(status)) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const poll = async () => {
+      try {
+        const next = await fetchProfileAnalysis(runId);
+        if (cancelled) return;
+        setAnalysis((current) => current?.run?.id === runId ? { ...current, run: next } : current);
+        if (['running', 'queued'].includes(next.status)) timer = setTimeout(poll, 1500);
+      } catch (e) {
+        if (cancelled) return;
+        setError(errorText(e));
+        timer = setTimeout(poll, 3000);
+      }
+    };
+    timer = setTimeout(poll, 1200);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [analysis?.run?.id, analysis?.run?.status]);
 
   const applyAnalysis = async () => {
     if (!analysis?.run || analysis.run.status !== 'succeeded') return;
@@ -414,7 +493,11 @@ export default function AccountProfileManager({
         bind_target: true,
       });
       await load();
-      if (result.profile?.id) selectProfile(result.profile.id);
+      if (result.profile?.id === activeProfileId) {
+        setActiveDetail(result.profile);
+      } else if (result.profile?.id) {
+        selectProfile(result.profile.id);
+      }
       window.dispatchEvent(new Event('ripple:profile-context-changed'));
       setNotice('画像提案已确认并关联到该账号。');
       setAnalysis(null);

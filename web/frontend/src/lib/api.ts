@@ -116,6 +116,9 @@ export function fetchContentProfiles(): Promise<{ items: ContentProfileSummary[]
 export function fetchContentProfile(profileId: string): Promise<ContentProfileDetail> {
   return request(`/api/content-profiles/${encodeURIComponent(profileId)}`);
 }
+export function fetchContentProfileRevision(profileId: string, revision: number): Promise<{ profile: ContentProfileSummary; revision: number; status: string; source: string; files: Record<string, string>; created_at: string }> {
+  return request(`/api/content-profiles/${encodeURIComponent(profileId)}/revision/${revision}`);
+}
 export function renameContentProfile(profileId: string, displayName: string): Promise<ContentProfileDetail> {
   return request(`/api/content-profiles/${encodeURIComponent(profileId)}`, {
     method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ display_name: displayName }),
@@ -144,6 +147,7 @@ export function fetchProfileAnalysisCapability(targetKind: 'account' | 'blog', a
 }
 export function startProfileAnalysis(payload: {
   target_kind: 'account' | 'blog'; account_id: string; profile_id?: string; display_name?: string;
+  expected_profile_revision?: number; expected_binding_revision?: number; expected_binding_profile_id?: string;
   samples: Array<Record<string, unknown>>; use_account_history?: boolean; history_limit?: number; idempotency_key?: string; confirmed: boolean;
 }): Promise<ProfileAnalysisRun> {
   return request('/api/profile-analysis', {
@@ -152,6 +156,9 @@ export function startProfileAnalysis(payload: {
 }
 export function fetchProfileAnalysis(runId: string): Promise<ProfileAnalysisRun> {
   return request(`/api/profile-analysis/${encodeURIComponent(runId)}`);
+}
+export function resumeProfileAnalysis(runId: string): Promise<ProfileAnalysisRun> {
+  return request(`/api/profile-analysis/${encodeURIComponent(runId)}/resume`, { method: 'POST' });
 }
 export function fetchLatestProfileAnalysis(targetKind: 'account' | 'blog', accountId: string): Promise<ProfileAnalysisRun | null> {
   return request(`/api/profile-analysis/latest/${targetKind}/${encodeURIComponent(accountId)}`);

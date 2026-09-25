@@ -55,6 +55,11 @@ def test_analysis_waiting_task_resumes_and_same_key_rejects_changed_input(monkey
     ready["value"] = True
     second = asyncio.run(webapp.api_profile_analysis_create(webapp.ProfileAnalysisCreateRequest(**payload)))
     assert second["id"] == first["id"]
+    assert second["status"] == "waiting_user"
+    assert len(calls) == 0
+
+    resumed = asyncio.run(webapp.api_profile_analysis_resume(first["id"]))
+    assert resumed["id"] == first["id"]
     assert len(calls) == 1
     assert service.get_analysis(first["id"])["status"] == "succeeded"
 

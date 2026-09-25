@@ -144,6 +144,27 @@ def _write_legacy_files(name: str, files: dict[str, str]) -> None:
                 pass
 
 
+def _restore_confirmed_mirror(name: str, files: dict[str, str]) -> None:
+    """Restore profiles/<name>/ to the exact confirmed Markdown set.
+
+    Callers must durably capture any external differences before invoking this helper.
+    """
+    name = validate_profile_storage_name(name)
+    _write_legacy_files(name, files)
+    directory = PROFILES_DIR / name
+    confirmed_names = {
+        str(filename)
+        for filename in files
+        if str(filename).endswith(".md") and "/" not in str(filename)
+        and "\\" not in str(filename) and not str(filename).startswith(".")
+    }
+    for path in sorted(directory.glob("*.md")):
+        if path.name not in confirmed_names:
+            path.unlink()
+
+
+
+
 class ContentProfileService:
     def __init__(self, db_path: Path, *, workspace_id: str = DEFAULT_WORKSPACE_ID):
         self.db_path = db_path.resolve()
@@ -280,63 +301,77 @@ class ContentProfileService:
             path.name for path in PROFILES_DIR.iterdir()
             if path.is_dir() and not path.name.startswith("_")
         ) if PROFILES_DIR.is_dir() else []
-        with self._lock, self._connect() as db:
-            for name in names:
-                try:
-                    validate_profile_storage_name(name)
-                except WorkflowError:
-                    continue
-                pid = _profile_id(self.workspace_id, name)
-                current = db.execute(
-                    "SELECT * FROM content_profiles WHERE workspace_id=? AND legacy_name=?",
-                    (self.workspace_id, name),
-                ).fetchone()
-                files = _read_legacy_files(name)
-                if current:
-                    if current["state"] == "archived":
-                        continue
-                    current_revision = int(current["current_revision"])
-                    stored = db.execute(
-                        "SELECT files_json FROM profile_revisions WHERE profile_id=? AND revision=?",
-                        (current["id"], current_revision),
+
+        for name in names:
+            try:
+                validate_profile_storage_name(name)
+            except WorkflowError:
+                continue
+            files = _read_legacy_files(name)
+            confirmed_to_restore: dict[str, str] | None = None
+
+            with self._lock:
+                with self._connect() as db:
+                    # Serialize legacy import/draft registration across service instances.
+                    db.execute("BEGIN IMMEDIATE")
+                    pid = _profile_id(self.workspace_id, name)
+                    current = db.execute(
+                        "SELECT * FROM content_profiles WHERE workspace_id=? AND legacy_name=?",
+                        (self.workspace_id, name),
                     ).fetchone()
-                    confirmed_files = _loads(stored["files_json"], {}) if stored else {}
-                    if stored and confirmed_files == files:
-                        continue
-                    encoded = _json(files)
-                    duplicate = db.execute(
-                        "SELECT revision FROM profile_revisions WHERE profile_id=? AND files_json=? ORDER BY revision DESC LIMIT 1",
-                        (current["id"], encoded),
-                    ).fetchone()
-                    if not duplicate:
-                        max_revision = int(db.execute(
-                            "SELECT COALESCE(MAX(revision),0) AS n FROM profile_revisions WHERE profile_id=?",
-                            (current["id"],),
-                        ).fetchone()["n"])
-                        revision = max(current_revision, max_revision) + 1
+                    if current:
+                        if current["state"] == "archived":
+                            continue
+                        current_revision = int(current["current_revision"])
+                        stored = db.execute(
+                            "SELECT files_json FROM profile_revisions WHERE profile_id=? AND revision=?",
+                            (current["id"], current_revision),
+                        ).fetchone()
+                        confirmed_files = _loads(stored["files_json"], {}) if stored else {}
+                        if stored and confirmed_files == files:
+                            continue
+                        encoded = _json(files)
+                        duplicate = db.execute(
+                            "SELECT revision FROM profile_revisions WHERE profile_id=? AND files_json=? "
+                            "ORDER BY revision DESC LIMIT 1",
+                            (current["id"], encoded),
+                        ).fetchone()
+                        if not duplicate:
+                            max_revision = int(db.execute(
+                                "SELECT COALESCE(MAX(revision),0) AS n FROM profile_revisions WHERE profile_id=?",
+                                (current["id"],),
+                            ).fetchone()["n"])
+                            revision = max(current_revision, max_revision) + 1
+                            db.execute(
+                                "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
+                                "VALUES(?,?,?,?,?,?,?)",
+                                (
+                                    current["id"], revision, encoded, "legacy_sync", "draft",
+                                    "检测到外部 Markdown 变化；未自动生效，等待人工确认。", _now_iso(),
+                                ),
+                            )
+                        # The draft row is committed when this connection context exits.
+                        confirmed_to_restore = dict(confirmed_files)
+                    else:
+                        now = _now_iso()
+                        db.execute(
+                            "INSERT INTO content_profiles(id,workspace_id,display_name,legacy_name,current_revision,state,created_at,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?,?)",
+                            (pid, self.workspace_id, name, name, 1, "confirmed", now, now),
+                        )
                         db.execute(
                             "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
                             "VALUES(?,?,?,?,?,?,?)",
-                            (current["id"], revision, encoded, "legacy_sync", "draft",
-                             "检测到外部 Markdown 变化；未自动生效，等待人工确认。", _now_iso()),
+                            (pid, 1, _json(files), "legacy_import", "confirmed", "从现有 profiles 目录登记。", now),
                         )
-                    # profiles/<name> is a compatibility mirror, not the source of truth.
-                    # Restore it before returning so legacy Agent/skill readers stay on
-                    # the confirmed revision while the external edit remains reviewable
-                    # in profile_revisions as a draft.
-                    _write_legacy_files(name, confirmed_files)
+
+            # Restore only after the external content is durably captured as a draft.
+            # A filesystem failure leaves the draft intact for a later retry/review.
+            if confirmed_to_restore is not None:
+                try:
+                    _restore_confirmed_mirror(name, confirmed_to_restore)
+                except OSError:
                     continue
-                now = _now_iso()
-                db.execute(
-                    "INSERT INTO content_profiles(id,workspace_id,display_name,legacy_name,current_revision,state,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?,?)",
-                    (pid, self.workspace_id, name, name, 1, "confirmed", now, now),
-                )
-                db.execute(
-                    "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (pid, 1, _json(files), "legacy_import", "confirmed", "从现有 profiles 目录登记。", now),
-                )
 
     def list_profiles(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         self.sync_legacy_profiles()
@@ -432,19 +467,28 @@ class ContentProfileService:
         }
         if not normalized:
             raise WorkflowError("画像内容不能为空。", 422)
-        owned_directory = False
+
+        directory = PROFILES_DIR / name
+        owned_directory: Path | None = None
         with self._lock:
             try:
                 with self._connect() as db:
+                    # Cross-instance serialization: the existence check, exclusive directory
+                    # claim, DB insert and mirror write belong to one write transaction.
+                    db.execute("BEGIN IMMEDIATE")
                     existing = db.execute(
                         "SELECT * FROM content_profiles WHERE workspace_id=? AND (display_name=? OR legacy_name=?)",
                         (self.workspace_id, name, name),
                     ).fetchone()
-                    directory = PROFILES_DIR / name
-                    directory_exists = directory.exists()
-                    if (existing and existing["state"] != "archived") or directory_exists:
+                    if existing and existing["state"] != "archived":
                         raise WorkflowError(f"画像「{name}」已存在。", 409)
-                    owned_directory = not directory_exists
+                    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+                    try:
+                        directory.mkdir(exist_ok=False)
+                    except FileExistsError as exc:
+                        raise WorkflowError(f"画像「{name}」已存在。", 409) from exc
+                    owned_directory = directory
+
                     now = _now_iso()
                     if existing:
                         pid = str(existing["id"])
@@ -466,13 +510,14 @@ class ContentProfileService:
                             (pid, self.workspace_id, name, name, revision, "confirmed", now, now),
                         )
                     db.execute(
-                        "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) VALUES(?,?,?,?,?,?,?)",
+                        "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
                         (pid, revision, _json(normalized), source[:40], "confirmed", "新建账号画像。", now),
                     )
                     _write_legacy_files(name, normalized)
             except Exception:
-                if owned_directory:
-                    shutil.rmtree(PROFILES_DIR / name, ignore_errors=True)
+                if owned_directory is not None and owned_directory.parent.resolve() == PROFILES_DIR.resolve():
+                    shutil.rmtree(owned_directory, ignore_errors=True)
                 raise
         return self.get_profile(pid)
 
@@ -529,6 +574,7 @@ class ContentProfileService:
             legacy_written = False
             try:
                 with self._connect() as db:
+                    db.execute("BEGIN IMMEDIATE")
                     current = db.execute(
                         "SELECT current_revision FROM content_profiles WHERE id=? AND workspace_id=?",
                         (profile_id, self.workspace_id),
@@ -720,6 +766,17 @@ class ContentProfileService:
             ),
         }
 
+    def analysis_by_request_digest(self, request_digest: str) -> dict[str, Any] | None:
+        digest = str(request_digest or "")[:128]
+        if not digest:
+            return None
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT id FROM profile_analysis_runs WHERE workspace_id=? AND request_digest=?",
+                (self.workspace_id, digest),
+            ).fetchone()
+        return self.get_analysis(str(row["id"])) if row else None
+
     def create_analysis(
         self,
         *,
@@ -739,6 +796,7 @@ class ContentProfileService:
         existing_id = ""
         reused = False
         with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             if request_digest:
                 existing = db.execute(
                     "SELECT id FROM profile_analysis_runs WHERE workspace_id=? AND request_digest=?",
@@ -835,10 +893,12 @@ class ContentProfileService:
 
             previous_files: dict[str, str] | None = None
             legacy_name = ""
-            owned_directory = False
+            owned_directory: Path | None = None
             legacy_written = False
             try:
                 with self._connect() as db:
+                    # Serialize apply/replay/create against every other profile writer.
+                    db.execute("BEGIN IMMEDIATE")
                     persisted_run = db.execute(
                         "SELECT * FROM profile_analysis_runs WHERE id=? AND workspace_id=?",
                         (run_id, self.workspace_id),
@@ -888,8 +948,10 @@ class ContentProfileService:
                         db.execute(
                             "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
                             "VALUES(?,?,?,?,?,?,?)",
-                            (target_profile_id, revision, _json(files), "agent_analysis", "confirmed",
-                             "用户确认账号样本分析提案。", now),
+                            (
+                                target_profile_id, revision, _json(files), "agent_analysis", "confirmed",
+                                "用户确认账号样本分析提案。", now,
+                            ),
                         )
                         db.execute(
                             "UPDATE content_profiles SET current_revision=?,updated_at=? WHERE id=?",
@@ -902,15 +964,23 @@ class ContentProfileService:
                         legacy_name = str(row["legacy_name"])
                     else:
                         name = validate_profile_storage_name(display_name)
+                        legacy_name = name
                         existing = db.execute(
                             "SELECT * FROM content_profiles WHERE workspace_id=? AND (display_name=? OR legacy_name=?)",
                             (self.workspace_id, name, name),
                         ).fetchone()
-                        directory = PROFILES_DIR / name
-                        if (existing and existing["state"] != "archived") or directory.exists():
+                        if existing and existing["state"] != "archived":
                             raise WorkflowError(f"画像「{name}」已存在。", 409)
-                        owned_directory = not directory.exists()
+
+                        directory = PROFILES_DIR / name
+                        PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+                        try:
+                            directory.mkdir(exist_ok=False)
+                        except FileExistsError as exc:
+                            raise WorkflowError(f"画像「{name}」已存在。", 409) from exc
+                        owned_directory = directory
                         files = dict(proposal_files)
+
                         if existing:
                             target_profile_id = str(existing["id"])
                             max_revision = int(db.execute(
@@ -933,10 +1003,11 @@ class ContentProfileService:
                         db.execute(
                             "INSERT INTO profile_revisions(profile_id,revision,files_json,source,status,note,created_at) "
                             "VALUES(?,?,?,?,?,?,?)",
-                            (target_profile_id, revision, _json(files), "agent_analysis", "confirmed",
-                             "用户确认账号样本分析提案。", now),
+                            (
+                                target_profile_id, revision, _json(files), "agent_analysis", "confirmed",
+                                "用户确认账号样本分析提案。", now,
+                            ),
                         )
-                        legacy_name = name
 
                     binding_public = None
                     if bind_target:
@@ -982,26 +1053,25 @@ class ContentProfileService:
                     profile_public["revision_source"] = "agent_analysis"
                     profile_public["bindings"] = [
                         self._binding_public(value) for value in db.execute(
-                            "SELECT * FROM account_profile_bindings WHERE workspace_id=? AND profile_id=? ORDER BY target_kind,account_id",
+                            "SELECT * FROM account_profile_bindings WHERE workspace_id=? AND profile_id=? "
+                            "ORDER BY target_kind,account_id",
                             (self.workspace_id, target_profile_id),
                         ).fetchall()
                     ]
                     result = {"profile": profile_public, "binding": binding_public}
                     db.execute(
-                        "UPDATE profile_analysis_runs SET apply_result_json=?,updated_at=? WHERE id=? AND workspace_id=?",
+                        "UPDATE profile_analysis_runs SET apply_result_json=?,updated_at=? "
+                        "WHERE id=? AND workspace_id=?",
                         (_json(result), now, run_id, self.workspace_id),
                     )
             except Exception:
-                if legacy_written:
+                if legacy_written and previous_files is not None:
                     try:
-                        if previous_files is not None:
-                            _write_legacy_files(legacy_name, previous_files)
-                        elif owned_directory:
-                            shutil.rmtree(PROFILES_DIR / legacy_name, ignore_errors=True)
+                        _write_legacy_files(legacy_name, previous_files)
                     except Exception:
                         pass
-                elif owned_directory:
-                    shutil.rmtree(PROFILES_DIR / legacy_name, ignore_errors=True)
+                if owned_directory is not None and owned_directory.parent.resolve() == PROFILES_DIR.resolve():
+                    shutil.rmtree(owned_directory, ignore_errors=True)
                 raise
             return result
 

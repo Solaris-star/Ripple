@@ -9,9 +9,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
+import sqlite3
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PROFILES_DIR = PROJECT_ROOT / "profiles"
+PROFILE_DB_PATH = PROJECT_ROOT / "outputs" / "_profiles" / "profiles.sqlite3"
 
 # 六维画像文件的固定顺序（identity/style/... 先，其余 .md 追加在后）
 _FILE_ORDER = [
@@ -30,13 +33,46 @@ def list_personas() -> list[str]:
     )
 
 
+def _confirmed_profile_files(name: str) -> dict[str, str] | None:
+    """Read the current confirmed revision directly from SQLite when registered."""
+    if not name or not PROFILE_DB_PATH.is_file():
+        return None
+    try:
+        uri = PROFILE_DB_PATH.resolve().as_uri() + "?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1) as db:
+            db.row_factory = sqlite3.Row
+            profile = db.execute(
+                "SELECT id,current_revision FROM content_profiles "
+                "WHERE legacy_name=? AND state!='archived' ORDER BY workspace_id LIMIT 1",
+                (name,),
+            ).fetchone()
+            if not profile:
+                return None
+            revision = db.execute(
+                "SELECT files_json FROM profile_revisions WHERE profile_id=? AND revision=?",
+                (profile["id"], int(profile["current_revision"])),
+            ).fetchone()
+        if not revision:
+            return {}
+        value = json.loads(str(revision["files_json"]) or "{}")
+        return {str(k): str(v) for k, v in value.items()} if isinstance(value, dict) else {}
+    except (OSError, sqlite3.Error, json.JSONDecodeError, ValueError):
+        return None
+
+
 def profile_exists(name: str) -> bool:
-    """检查画像目录是否存在。"""
-    return bool(name) and (PROFILES_DIR / name).is_dir()
+    """检查已登记画像或兼容目录是否存在。"""
+    return bool(name) and (_confirmed_profile_files(name) is not None or (PROFILES_DIR / name).is_dir())
 
 
 def load_profile_text(name: str) -> str:
-    """读取画像文件夹，按固定顺序拼接所有非空 .md。画像不存在返回空串。"""
+    """读取已确认画像；未登记的 legacy 画像才回退到目录读取。"""
+    confirmed = _confirmed_profile_files(name)
+    if confirmed is not None:
+        ordered = list(_FILE_ORDER) + sorted(filename for filename in confirmed if filename not in _FILE_ORDER)
+        parts = [str(confirmed.get(filename) or "").strip() for filename in ordered]
+        return "\n\n---\n\n".join(part for part in parts if part)
+
     profile_dir = PROFILES_DIR / name
     if not profile_dir.is_dir():
         return ""
@@ -44,14 +80,14 @@ def load_profile_text(name: str) -> str:
     for filename in _FILE_ORDER:
         filepath = profile_dir / filename
         if filepath.is_file():
-            text = filepath.read_text(encoding="utf-8").strip()
-            if text:
-                parts.append(text)
+            value = filepath.read_text(encoding="utf-8").strip()
+            if value:
+                parts.append(value)
     for filepath in sorted(profile_dir.glob("*.md")):
         if filepath.name not in _FILE_ORDER:
-            text = filepath.read_text(encoding="utf-8").strip()
-            if text:
-                parts.append(text)
+            value = filepath.read_text(encoding="utf-8").strip()
+            if value:
+                parts.append(value)
     return "\n\n---\n\n".join(parts)
 
 
