@@ -1,0 +1,16 @@
+[
+  {"text":"a","repeat":280,"length":280,"valid":true},
+  {"text":"a","repeat":281,"length":281,"valid":false},
+  {"text":"中","repeat":140,"length":280,"valid":true},
+  {"text":"中","repeat":141,"length":282,"valid":false},
+  {"text":"👨‍👩‍👧‍👦","repeat":140,"length":280,"valid":true},
+  {"text":"🙋🏽","repeat":141,"length":282,"valid":false},
+  {"text":"🇨🇳","repeat":140,"length":280,"valid":true},
+  {"text":"1️⃣","repeat":140,"length":280,"valid":true},
+  {"text":"a","repeat":256,"suffix":" https://example.com/a/very/long/path?q=%E4%B8%AD%E6%96%87","length":280,"valid":true},
+  {"text":"a","repeat":257,"suffix":" https://example.com/a/very/long/path?q=%E4%B8%AD%E6%96%87","length":281,"valid":false},
+  {"text":"https://example.com/?q=中文","length":27,"valid":true},
+  {"text":"café","length":4,"valid":true},
+  {"text":"看看 https://example.com。","length":30,"valid":true},
+  {"text":"","length":0,"valid":false}
+]

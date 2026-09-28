@@ -32,6 +32,7 @@ import uuid
 from typing import Any, Callable
 
 from .agent_runtime import AgentRuntimeError, AgentToolBridgeConfig
+from .media_events import MediaTaskTracker
 from .acp_client import AcpProcessClient
 
 
@@ -610,7 +611,11 @@ class CodexAgentAdapter:
             if isinstance(value, dict) and value.get("kind") == "content_draft":
                 cid, vid = str(value.get("id") or ""), str(value.get("version_id") or "")
                 if re.fullmatch(r"[a-f0-9]{32}", cid) and re.fullmatch(r"[a-f0-9]{64}", vid):
-                    return {"kind": "content_draft", "id": cid, "version_id": vid, "title": str(value.get("title") or "")[:200], "status": "draft"}
+                    proposal_id = str(value.get("proposal_id") or "")
+                    if proposal_id and not re.fullmatch(r"[a-f0-9]{32}", proposal_id):
+                        return None
+                    return {"kind": "content_draft", "id": cid, "version_id": vid, "title": str(value.get("title") or "")[:200],
+                            "status": "proposal" if proposal_id else "draft", **({"proposal_id": proposal_id} if proposal_id else {})}
         return None
 
     def run_turn(self, web_id: str, user_text: str, system_text: str, files: list[dict], tool_base: str,
@@ -659,6 +664,7 @@ class CodexAgentAdapter:
                         if text: stderr_tail.append(text[:600])
             err_thread = threading.Thread(target=read_err, daemon=True, name="ripple-codex-err"); err_thread.start()
             deadline = time.monotonic() + max(10, timeout)
+            media_tasks = MediaTaskTracker()
             if process.stdout is not None:
                 for line in process.stdout:
                     if time.monotonic() > deadline:
@@ -681,7 +687,9 @@ class CodexAgentAdapter:
                             if text: emit("thinking", text[:8000])
                         elif kind == "mcp_tool_call":
                             name = str(item.get("tool") or "Ripple MCP")[:120]
-                            emit("activity", f"调用 {name} · {'完成' if etype == 'item.completed' else '运行中'}")
+                            tool_status = str(item.get("status") or ("completed" if etype == "item.completed" else "running"))
+                            media_tasks.update(str(item.get("id") or name), name, tool_status, item.get("result"), emit, error=item.get("error"))
+                            emit("activity", f"调用 {name} · {tool_status}")
                             artifact = self._artifact_from_mcp(item) if etype == "item.completed" else None
                             if artifact: emit("artifact", json.dumps(artifact, ensure_ascii=False, sort_keys=True))
                         elif kind in {"command_execution", "file_change", "web_search"}:

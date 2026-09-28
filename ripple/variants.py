@@ -76,6 +76,7 @@ class VariantTaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: str = Field(pattern=r"^[a-f0-9]{64}$")
     idempotency_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    plan_id: str = Field(default="", max_length=32)
 
 
 class VariantService:
@@ -254,6 +255,9 @@ class VariantService:
             source = state.get("contents", {}).get(variant["source_id"])
             if not source:
                 raise WorkflowError("来源母稿不存在。", 404)
+            plan = state.get("content_plans", {}).get(req.plan_id) if req.plan_id else None
+            if req.plan_id and (not plan or plan["variant_id"] != variant_id or plan["variant_version_id"] != variant["version_id"]):
+                raise WorkflowError("计划关联的平台版本已变化，请重新检查。", 409)
             for task in state.get("tasks", {}).values():
                 if task.get("idempotency_key") == req.idempotency_key:
                     if task.get("variant_id") != variant_id or task.get("variant_version_id") != variant["version_id"]:
@@ -261,7 +265,23 @@ class VariantService:
                     return deepcopy(task)
             existing = [task for task in state.get("tasks", {}).values() if task.get("variant_id") == variant_id and task.get("variant_version_id") == variant["version_id"] and task.get("status") not in {"cancelled", "failed_terminal"}]
             if existing:
-                return deepcopy(sorted(existing, key=lambda row: row["created_at"], reverse=True)[0])
+                previous = sorted(existing, key=lambda row: row["created_at"], reverse=True)[0]
+                if plan:
+                    if previous.get("plan_id") not in {"", req.plan_id} or previous["status"] not in {"draft", "review_ready"}:
+                        raise WorkflowError("该版本已有独立的发布任务，请先查看任务状态。", 409)
+                    previous["plan_id"] = req.plan_id
+                    plan["task_id"] = previous["id"]
+                return deepcopy(previous)
+            # 已提交的旧版本必须先核对，编辑内容不能绕过防重复发布检查。
+            unresolved = next((task for task in state.get("tasks", {}).values()
+                               if task.get("variant_id") == variant_id
+                               and (task.get("status") in {"dispatching", "scheduled"}
+                                    or (task.get("status") in {"accepted", "unknown_result", "verification_required"}
+                                        and not (task.get("receipt") or {}).get("not_submitted")))), None)
+            if unresolved:
+                if unresolved.get("status") == "scheduled":
+                    raise WorkflowError("这个平台版本已有定时发布任务，请先取消原定时，再准备新的发布。", 409)
+                raise WorkflowError("这个平台版本还有发布结果待核对，请先在发布管理中核对原任务，再准备新的发布。", 409)
             content = variant["content"]
             if content["delivery"] == "export":
                 if variant["platform"] != "blog":
@@ -301,6 +321,8 @@ class VariantService:
                         "account_id": account_id,
                         "overrides": deepcopy(binding.get("overrides") or {}),
                     }
+            if plan and plan["scheduled_at"] != snapshot.get("scheduled_at"):
+                raise WorkflowError("计划时间与平台版本时间不同，请先确认时间。", 409)
             if len(state.get("tasks", {})) >= MAX_TASKS:
                 raise WorkflowError("最多保存 500 个发布任务。", 422)
             task_id = uuid.uuid4().hex
@@ -310,6 +332,7 @@ class VariantService:
                 "id": task_id, "version": 1, "version_id": version_id,
                 "workspace_id": variant.get("workspace_id") or DEFAULT_WORKSPACE_ID,
                 "variant_id": variant_id, "variant_version_id": variant["version_id"],
+                "plan_id": req.plan_id,
                 "content_profile_context": profile_context,
                 "content": snapshot, "history": [], "idempotency_key": req.idempotency_key,
                 "initial_digest": version_id, "request_digest": version_id, "approval": None,
@@ -317,4 +340,7 @@ class VariantService:
             }
             self.workspace._event(task, "draft", "已从平台版本创建发布任务快照；尚未审核或执行。")
             state.setdefault("tasks", {})[task_id] = task
+            if plan:
+                plan["task_id"] = task_id
+                plan["updated_at"] = now
             return deepcopy(task)

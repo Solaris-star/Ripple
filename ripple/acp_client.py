@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable
 
 from .agent_runtime import AgentRuntimeError
+from .media_events import MediaTaskTracker
 
 _CONTENT_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 _VERSION_ID_RE = re.compile(r"^[a-f0-9]{64}$")
@@ -34,6 +35,7 @@ class AcpProcessClient:
         self._session_id = ""
         self._stderr: deque[str] = deque(maxlen=100)
         self._closed = threading.Event()
+        self._media_tasks = MediaTaskTracker()
 
     def start(self) -> None:
         if self.process and self.process.poll() is None:
@@ -160,8 +162,12 @@ class AcpProcessClient:
             content_id = str(row.get("id") or "")
             version_id = str(row.get("version_id") or "")
             if _CONTENT_ID_RE.fullmatch(content_id) and _VERSION_ID_RE.fullmatch(version_id):
+                proposal_id = str(row.get("proposal_id") or "")
+                if proposal_id and not _CONTENT_ID_RE.fullmatch(proposal_id):
+                    return None
                 return {"kind": "content_draft", "id": content_id, "version_id": version_id,
-                        "title": str(row.get("title") or "")[:200], "status": "draft"}
+                        "title": str(row.get("title") or "")[:200], "status": "proposal" if proposal_id else "draft",
+                        **({"proposal_id": proposal_id} if proposal_id else {})}
         return None
 
     def _handle_session_update(self, params: dict) -> None:
@@ -182,6 +188,8 @@ class AcpProcessClient:
             title = str(update.get("title") or update.get("kind") or "Ripple MCP")[:160]
             status = str(update.get("status") or ("running" if kind == "tool_call" else "updated"))
             emit("activity", f"调用 {title} · {status}")
+            self._media_tasks.update(str(update.get("toolCallId") or title), title, status,
+                                     update.get("rawOutput", update.get("content")), emit)
             artifact = self._content_draft(update.get("rawOutput"))
             if artifact:
                 emit("artifact", json.dumps(artifact, ensure_ascii=False, sort_keys=True))
@@ -217,6 +225,7 @@ class AcpProcessClient:
 
     def prompt(self, session_id: str, prompt: list[dict], emit: Callable[[str, str], None], *, timeout: float) -> dict:
         self._session_id = session_id
+        self._media_tasks = MediaTaskTracker()
         self._emit = emit
         try:
             result = self.request("session/prompt", {"sessionId": session_id, "prompt": prompt}, timeout=timeout)

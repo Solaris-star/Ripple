@@ -26,6 +26,7 @@ from .x_adapter import XConfigInput, XConnectInput
 from .wechat_adapter import WeChatConnectInput, WeChatReconnectInput
 from .batches import BatchInput, derive_batch
 from .library import MotherCreate, MotherRevision
+from .plans import ContentPlanCreate, ContentPlanRevision
 from .variants import VariantRevision, VariantTaskCreate
 from .blog_connector import BlogConnectorInput, BlogConnectorDelete
 from .execution_nodes import PairingRequest, NodeRegisterInput, NodeAuthInput, NodeClaimInput, NodeResultInput
@@ -38,6 +39,7 @@ from .catalog import environment_capabilities, install_environment_component
 from .publishing import ApprovalInput, CreateInput, RevisionInput, VersionAction, WorkflowError, EXTENSIONS
 from .store import StoreError
 from .workspace import WorkspaceService, ReceiptInput, MAX_VIDEO_BYTES, MAX_IMAGE_BYTES
+from .remote_posts import RemoteSyncInput, RemoteActionInput, RemoteActionExecuteInput
 
 logger = logging.getLogger("ripple")
 
@@ -95,6 +97,7 @@ class XhsInteractionDraftInput(XhsLocatorInput):
 class XhsInteractionExecuteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     confirmed: bool = False
+    expected_updated_at: str = Field(default="", max_length=80)
 
 
 class InteractionRemoteCommentsInput(BaseModel):
@@ -110,7 +113,7 @@ class InteractionItemInput(BaseModel):
     id: str = Field(default="", max_length=100)
     nickname: str = Field(default="", max_length=80)
     content: str = Field(default="", max_length=500)
-    reply: str = Field(default="", max_length=1000)
+    reply: str = Field(default="", max_length=50000)
 
 
 class InteractionDraftInput(BaseModel):
@@ -141,6 +144,7 @@ class InteractionVersionAction(BaseModel):
 class InteractionExecuteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     confirmed: bool = False
+    expected_updated_at: str = Field(default="", max_length=80)
 
 
 class InteractionResolveInput(BaseModel):
@@ -148,6 +152,12 @@ class InteractionResolveInput(BaseModel):
     result: str = Field(pattern=r"^(verified|not_submitted)$")
     confirmed: bool = False
     note: str = Field(default="", max_length=500)
+    item_id: str = Field(min_length=1, max_length=100)
+    expected_updated_at: str = Field(min_length=10, max_length=80)
+
+
+class InteractionRetryInput(InteractionVersionAction):
+    item_ids: list[str] = Field(min_length=1, max_length=20)
 
 
 class _OAuthCallbackAccessFilter(logging.Filter):
@@ -396,6 +406,39 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
             raise HTTPException(404, "二维码尚未就绪。")
         return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
+    @router.get('/remote-posts')
+    def remote_posts(account_id: str = Query('', max_length=32), limit: int = Query(30, ge=1, le=100),
+                     offset: int = Query(0, ge=0)):
+        return service.remote_posts.list(account_id, limit, offset)
+
+    @router.get('/remote-posts/{post_id}')
+    def remote_post(post_id: str):
+        return service.remote_posts.get(post_id)
+
+    @router.post('/remote-posts/sync')
+    def remote_post_sync(req: RemoteSyncInput):
+        return service.remote_posts.sync(req)
+
+    @router.post('/remote-posts/{post_id}/refresh')
+    def remote_post_refresh(post_id: str):
+        return service.remote_posts.refresh(post_id)
+
+    @router.post('/remote-posts/{post_id}/actions')
+    def remote_post_action_preview(post_id: str, req: RemoteActionInput):
+        return service.remote_posts.preview(post_id, req)
+
+    @router.get('/remote-post-actions/{action_id}')
+    def remote_post_action(action_id: str):
+        return service.remote_posts.get_action(action_id)
+
+    @router.post('/remote-post-actions/{action_id}/execute')
+    def remote_post_action_execute(action_id: str, req: RemoteActionExecuteInput):
+        return service.remote_posts.execute(action_id, req)
+
+    @router.post('/remote-post-actions/{action_id}/query')
+    def remote_post_action_query(action_id: str):
+        return service.remote_posts.query(action_id)
+
     @router.get("/interactions/capabilities")
     def interaction_capabilities():
         return service.interactions.capabilities()
@@ -450,7 +493,11 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
 
     @router.post("/interactions/{interaction_id}/execute")
     def interaction_execute(interaction_id: str, req: InteractionExecuteInput):
-        return service.interactions.execute(interaction_id, req.confirmed)
+        return service.interactions.execute(interaction_id, req.confirmed, req.expected_updated_at)
+
+    @router.post("/interactions/{interaction_id}/retry-draft", status_code=201)
+    def interaction_retry(interaction_id: str, req: InteractionRetryInput):
+        return service.interactions.retry_draft(interaction_id, **req.model_dump())
 
     @router.post("/interactions/{interaction_id}/refresh-result")
     def interaction_refresh(interaction_id: str):
@@ -459,7 +506,7 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
     @router.post("/interactions/{interaction_id}/resolve-unknown")
     def interaction_resolve_unknown(interaction_id: str, req: InteractionResolveInput):
         return service.interactions.resolve_unknown(
-            interaction_id, result=req.result, confirmed=req.confirmed, note=req.note,
+            interaction_id, **req.model_dump(),
         )
 
     @router.post("/interactions/{interaction_id}/verify-platform")
@@ -503,7 +550,7 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
 
     @router.post("/xiaohongshu/interactions/{interaction_id}/execute")
     def xhs_interaction_execute(interaction_id: str, req: XhsInteractionExecuteInput):
-        return service.xhs_ops.execute_interaction(interaction_id, req.confirmed)
+        return service.xhs_ops.execute_interaction(interaction_id, req.confirmed, req.expected_updated_at)
 
     @router.post("/xiaohongshu/interactions/{interaction_id}/query")
     def xhs_interaction_query(interaction_id: str):
@@ -600,6 +647,26 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
     def content(source_id: str):
         return service.library.get(source_id)
 
+    @router.get("/contents/{source_id}/proposals")
+    def content_proposals(source_id: str):
+        return service.library.list_proposals(source_id)
+
+    @router.get("/content-proposals/{proposal_id}")
+    def content_proposal(proposal_id: str):
+        return service.library.get_proposal(proposal_id)
+
+    @router.post("/content-proposals/{proposal_id}/apply")
+    def apply_content_proposal(proposal_id: str, req: VersionAction):
+        return service.library.apply_proposal(proposal_id, req.expected_version)
+
+    @router.post("/content-proposals/{proposal_id}/dismiss")
+    def dismiss_content_proposal(proposal_id: str):
+        return service.library.dismiss_proposal(proposal_id)
+
+    @router.post("/content-proposals/{proposal_id}/undo")
+    def undo_content_proposal(proposal_id: str, req: VersionAction):
+        return service.library.undo_proposal(proposal_id, req.expected_version)
+
     @router.put("/contents/{source_id}")
     def revise_content(source_id: str, req: MotherRevision):
         return service.library.revise(source_id, req)
@@ -610,7 +677,12 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
         if suffix not in EXTENSIONS:
             raise HTTPException(422, "请选择 PNG/JPEG/WebP/GIF 或 MP4/MOV/WebM 文件。")
         maximum = MAX_VIDEO_BYTES if suffix in {".mp4", ".mov", ".webm"} else MAX_IMAGE_BYTES
-        relative = "ripple-media/" + uuid.uuid4().hex + suffix
+        # 独立目录避免同名覆盖；文件名只保留安全字符，便于编辑时辨认。
+        original = (file.filename or "media").replace("\\", "/").rsplit("/", 1)[-1]
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(original).stem).strip(" .")[:100] or "media"
+        if stem.startswith("_") or stem.upper().split(".")[0] in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(10)), *(f"LPT{i}" for i in range(10))}:
+            stem = "media-" + stem
+        relative = "ripple-media/" + uuid.uuid4().hex + "/" + stem + suffix
         target = service.outputs / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         total = 0
@@ -644,6 +716,26 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
     def calendar():
         return service.calendar()
 
+    @router.get("/calendar/entries")
+    def calendar_entries():
+        return service.plans.calendar_entries()
+
+    @router.get("/plans")
+    def content_plans():
+        return service.plans.list()
+
+    @router.post("/plans", status_code=201)
+    def create_content_plan(req: ContentPlanCreate):
+        return service.plans.create(req)
+
+    @router.get("/plans/{plan_id}")
+    def content_plan(plan_id: str):
+        return service.plans.get(plan_id)
+
+    @router.put("/plans/{plan_id}")
+    def revise_content_plan(plan_id: str, req: ContentPlanRevision):
+        return service.plans.revise(plan_id, req)
+
     @router.get("/tasks")
     def tasks(limit: int = Query(200, ge=1, le=200), offset: int = Query(0, ge=0, le=500)):
         return service.list(limit, offset)
@@ -655,6 +747,10 @@ def install(app: FastAPI, outputs: Path, *, private: Path | None = None) -> Work
     @router.get("/tasks/{task_id}")
     def task(task_id: str):
         return service.get(task_id)
+
+    @router.post("/tasks/{task_id}/return-to-plan")
+    def return_task_to_plan(task_id: str, req: VersionAction):
+        return service.plans.return_to_plan(task_id, req.expected_version)
 
     @router.put("/tasks/{task_id}")
     def revise(task_id: str, req: RevisionInput):

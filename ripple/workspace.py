@@ -24,7 +24,7 @@ from .bridge import BridgeService
 from .rest_bridge import RestBridgeService, ADAPTER as REST_ADAPTER
 from .x_adapter import XService, ADAPTER as X_ADAPTER
 from .wechat_adapter import WeChatService, ADAPTER as WECHAT_ADAPTER
-from .catalog import CONNECTION_METHODS, NATIVE, NAMES, RECEIPT_HOSTS, X_BROWSER_ADAPTER
+from .catalog import CONNECTION_METHODS, NATIVE, NAMES, RECEIPT_HOSTS, X_BROWSER_ADAPTER, native_publish_available
 from .library import ContentLibrary, add_mother, mother_snapshot
 from .plans import ContentPlanService
 from .variants import VariantService
@@ -39,6 +39,9 @@ from .watermarks import SUPPORTED_IMAGE_EXTENSIONS, WatermarkService
 from .xhs_ops import XhsOpsService
 from .interactions import InteractionService
 from .operations import OperationService
+from .x_text import count_reply
+from .remote_posts import RemotePostService
+from .bilibili_options import upload_options
 
 MAX_VIDEO_BYTES = 512 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -74,6 +77,7 @@ class WorkspaceService(PublishingService):
         self.xhs_ops = XhsOpsService(self)
         self.interactions = InteractionService(self)
         self.operations = OperationService(self)
+        self.remote_posts = RemotePostService(self)
         self._workers: dict[str, threading.Thread] = {}
         self._guard = threading.Lock()
         self._closed = False
@@ -120,6 +124,7 @@ class WorkspaceService(PublishingService):
                     "scope_note": "AppSecret 加密保存在 Ripple 私有目录；服务器出口 IP 需加入公众号 IP 白名单。"})
                 continue
             native = NATIVE.get(key)
+            publish_available = native_publish_available(key)
             linked = [a for a in accounts if a["platform"] == key]
             connected = [a for a in linked if a["status"] == "connected"]
             is_x = key == "x"
@@ -144,18 +149,22 @@ class WorkspaceService(PublishingService):
                     "scope_note": "浏览器模式使用独立 Edge/Chromium Profile，不复制 auth_token/ct0；非官方网页自动化存在账号限制风险。官方 API 模式的权限和费用取决于 X Developer 计划。"})
                 continue
             rows.append({"id": key, "name": name, "connected": bool(connected),
-                "direct_publish": bool(native and connected and ready), "adapter_available": bool(native),
+                "direct_publish": bool(publish_available and connected and ready), "adapter_available": bool(native),
+                "publish_available": publish_available,
                 "adapter": "biliup" if key == "bilibili" else "browser" if native else "export" if key == "blog" else "unavailable",
                 "status": "connected" if connected else "not_connected" if native else "export_only" if key == "blog" else "not_available",
                 "formats": native["formats"] if native else ["markdown", "media"] if key == "blog" else [],
-                "native_schedule": False, "local_schedule": bool(native or key == "blog"), "remote_status": False,
+                "native_schedule": False, "local_schedule": publish_available, "remote_status": False,
                 "local_export": key == "blog", "local_simulation": True, "account_count": len(linked),
                 "environment_ready": ready if native else True, "live_verified": any(a.get("live_verified") for a in linked),
                 "reason": "可创建独立账号并扫码登录；发布前需审核具体内容。" if native else "通用 Markdown 与素材导出；没有连接 CMS。" if key == "blog" else "该渠道的 Ripple 本地适配器尚未接入。",
                 "scope_note": "能力范围来自本地适配器；账号权限与网页兼容性需实际登录后核验。"})
             rows[-1]["connection_methods"] = [item["id"] for item in method_options]
             rows[-1]["connection_options"] = method_options
+            if native and not publish_available:
+                rows[-1]["reason"] = "当前安装未包含该平台的发布模块；账号连接与读取仍可使用，暂不支持直接发布。"
         for row in rows:
+            row.setdefault("publish_available", row["adapter_available"])
             remote = [a for a in accounts if a['platform'] == row['id'] and a.get('adapter') == REST_ADAPTER]
             if remote:
                 row['legacy_remote_accounts'] = len(remote)
@@ -385,6 +394,15 @@ class WorkspaceService(PublishingService):
         c = task["content"]
         if c["mode"] == "real":
             problems = []
+            if c.get("platform") == "x":
+                count = count_reply(c.get("body") or "")
+                if not count["valid"]:
+                    problems.append(f"X 正文须为有效文字，最多 280 加权字符；当前为 {count['weighted_length']}。")
+            if c.get("platform") == "bilibili":
+                try:
+                    upload_options(c.get("options") or {})
+                except WorkflowError as exc:
+                    problems.append(str(exc))
             if c.get("platform") == "blog":
                 try:
                     connector = self.blogs.get(c.get("account_id") or "")
@@ -414,15 +432,15 @@ class WorkspaceService(PublishingService):
                 return problems
             candidate = state.get('accounts', {}).get(c.get('account_id'), {})
             if candidate.get('adapter') == X_ADAPTER:
-                problems = self.x.problems(task, state)
+                problems.extend(problem for problem in self.x.problems(task, state) if problem not in problems)
                 problems.extend(self._lineage_problems(task, state))
                 return problems
             if candidate.get('adapter') == WECHAT_ADAPTER:
-                problems = self.wechat.problems(task, state)
+                problems.extend(self.wechat.problems(task, state))
                 problems.extend(self._lineage_problems(task, state))
                 return problems
             if candidate.get('adapter') == REST_ADAPTER:
-                problems = self.rest.problems(task, state)
+                problems.extend(self.rest.problems(task, state))
                 problems.extend(self._lineage_problems(task, state))
                 return problems
             if candidate.get('adapter') == X_BROWSER_ADAPTER:
@@ -442,6 +460,8 @@ class WorkspaceService(PublishingService):
             a = state.get("accounts", {}).get(c["account_id"])
             if not native:
                 problems.append("该渠道的真实发布适配器尚未接入。")
+            elif not native_publish_available(c["platform"]):
+                problems.append("当前安装未包含该平台的发布模块，暂不支持直接发布。")
             if not a or a["platform"] != c["platform"]:
                 problems.append("请绑定并选择属于该平台的具体账号。")
             elif a["status"] != "connected":
@@ -458,7 +478,7 @@ class WorkspaceService(PublishingService):
                 if c["platform"] == "xiaohongshu":
                     units = c["title"].encode("utf-16-le")
                     length = (sum(2 if int.from_bytes(units[i:i+2], "little") > 127 else 1 for i in range(0, len(units), 2)) + 1) // 2
-                if length > native["title_limit"] or len(c["body"]) > native["body_limit"]:
+                if length > native["title_limit"] or (c["platform"] != "x" and len(c["body"]) > native["body_limit"]):
                     problems.append(f'当前适配器限制：标题 {native["title_limit"]}、正文 {native["body_limit"]} 字符。')
                 video = [p for p in c["media"] if PurePosixPath(p).suffix.lower() in {".mp4", ".mov", ".webm"}]
                 images = [p for p in c["media"] if p not in video]
@@ -485,6 +505,8 @@ class WorkspaceService(PublishingService):
         with self.store.transaction() as state:
             task = self._task(state, task_id, version)
             problems = self._problems(task, state)
+            task["preflight_problems"] = list(problems)
+            task["preflight_checked_at"] = self.clock().isoformat()
             if not problems and task["content"]["mode"] == "real":
                 if task["content"].get("platform") == "blog":
                     connector = self.blogs.get(task["content"]["account_id"])
@@ -693,6 +715,15 @@ class WorkspaceService(PublishingService):
             task["receipt"] = {"adapter": remote_account.get('adapter', 'native'), "simulated": False, "public_url": None,
                 "result": status, "operation_id": operation_id, "not_submitted": result.get("not_submitted") is True,
                 "evidence": result.get("evidence", "unconfirmed")}
+            if task['content']['platform'] in {'x', 'xiaohongshu'}:
+                for key in ('remote_id', 'account_remote_id', 'candidate_url', 'remote_status', 'visibility', 'checked_at'):
+                    if result.get(key) is not None:
+                        task['receipt'][key] = result[key]
+                if result.get('remote_id') and result.get('account_remote_id') != (remote_account.get('identity') or {}).get('remote_id'):
+                    task['receipt'].pop('remote_id', None)
+                    task['receipt']['evidence'] = 'account_mismatch'
+                    status = 'unknown_result'
+                    task['receipt']['result'] = status
             if remote_account.get('adapter') == REST_ADAPTER:
                 for key in ('flow_id', 'bridge_revision', 'remote_task_id', 'remote_status', 'candidate_url'):
                     if key in result:
@@ -748,6 +779,36 @@ class WorkspaceService(PublishingService):
                 return task
             result = self.rest.query(task, account)
             return self._record_result(task_id, task['operation_id'], result) if result else task
+        if task['content'].get('platform') in {'x', 'xiaohongshu'} and account.get('adapter') != X_ADAPTER:
+            op = task.get('operation_id')
+            if op and task['status'] in {'unknown_result', 'dispatching'}:
+                result = self.accounts.read_result(task['content']['account_id'], op)
+                if result and result.get('task_id') == task_id and result.get('version_id') == version:
+                    task = self._record_result(task_id, op, result)
+            try:
+                remote = self.remote_posts.read_task(task)
+            except WorkflowError:
+                return task
+            if remote:
+                with self.store.transaction() as state:
+                    current = self._task(state, task_id, version)
+                    receipt = current.setdefault('receipt', {})
+                    receipt.update(remote_id=remote['remote_id'], account_remote_id=remote['account_remote_id'],
+                                   remote_status=remote['remote_status'], visibility=remote['visibility'],
+                                   checked_at=remote['checked_at'], remote_post_id=remote['id'])
+                    if remote.get('url'):
+                        receipt['candidate_url'] = remote['url']
+                    if remote['remote_status'] == 'reviewing':
+                        self._event(current, 'accepted', '已读取本人作品；平台仍在审核中。')
+                    elif remote['remote_status'] == 'published' and remote['visibility'] == 'public':
+                        self._event(current, 'published', '已读取目标作品并核实公开可见。')
+                    else:
+                        self._event(current, 'accepted', '已读取本人作品；公开范围尚未确认。')
+                    current_account = state.get('accounts', {}).get(account['id'])
+                    if current_account and (current_account.get('operation') or {}).get('id') == op:
+                        current_account['operation'] = None
+                    return deepcopy(current)
+            return task
         op = task.get("operation_id")
         if op and task["status"] in {"unknown_result", "accepted", "dispatching"}:
             result = self.accounts.read_result(task["content"]["account_id"], op)
@@ -764,6 +825,15 @@ class WorkspaceService(PublishingService):
             valid = False
         if not req.confirmed or not valid:
             raise WorkflowError("请确认核对结果并填写有效作品链接；公网必须使用 HTTPS。", 422)
+        with self.store.transaction(write=False) as state:
+            original = deepcopy(self._task(state, task_id, req.expected_version))
+        remote = None
+        if original['content'].get('platform') in {'x', 'xiaohongshu'} and original['content'].get('mode') == 'real':
+            candidate = deepcopy(original)
+            candidate['receipt'] = {'public_url': req.public_url}
+            remote = self.remote_posts.read_task(candidate)
+            if remote is None:
+                raise WorkflowError('无法从所选账号读取该链接对应的本人作品，请核对账号和作品 ID。', 409)
         with self.store.transaction() as state:
             task = self._task(state, task_id, req.expected_version)
             if task["content"]["mode"] != "real" or task["status"] not in {"accepted", "unknown_result", "verification_required"}:
@@ -779,9 +849,19 @@ class WorkspaceService(PublishingService):
                         pass
                 except Timeout:
                     raise WorkflowError("发布进程仍在运行，请等待后再核对。") from None
-            task["receipt"] = {**(task.get("receipt") or {}), "result": "published", "public_url": req.public_url,
+            verified_state = 'published' if remote is None or remote['remote_status'] == 'published' else 'accepted'
+            task["receipt"] = {**(task.get("receipt") or {}), "result": verified_state, "public_url": req.public_url,
+                "not_submitted": False,
                 "verification": "manual_user_confirmation", "verified_at": self.clock().isoformat()}
-            self._event(task, "published", "用户已在平台人工核对作品链接。" + (" 备注：" + req.note if req.note else ""))
+            if remote is not None:
+                task['receipt'].update(remote_id=remote['remote_id'], account_remote_id=remote['account_remote_id'],
+                                       remote_post_id=remote['id'], remote_status=remote['remote_status'],
+                                       visibility=remote['visibility'],
+                                       checked_at=remote['checked_at'])
+            note = ('作品关联已核实，平台仍在审核中。' if remote is not None and remote['remote_status'] == 'reviewing'
+                    else '作品关联已核实，平台状态尚未确认。' if verified_state == 'accepted'
+                    else '用户已在平台人工核对作品链接。')
+            self._event(task, verified_state, note + (" 备注：" + req.note if req.note else ""))
             if a and (a.get("operation") or {}).get("id") == task.get("operation_id"):
                 a["operation"]["state"] = "finished"
             # Do not claim automated live end-to-end verification from a pasted URL.
@@ -797,6 +877,7 @@ class WorkspaceService(PublishingService):
         changed = super().recover()
         self.accounts.recover()
         self.interactions.recover()
+        self.remote_posts.recover()
         with self.store.transaction() as state:
             for a in state.get("accounts", {}).values():
                 op = a.get("operation") or {}

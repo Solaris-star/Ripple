@@ -18,7 +18,7 @@ import re
 import time
 import uuid
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import parse_qs, urlsplit, urlunsplit
 
 from .publishing import WorkflowError
 
@@ -193,6 +193,11 @@ class XhsOpsService:
             note_id = str(row.get('note_id') or '')[:100]
             url = str(row.get('url') or '')[:4096]
             if note_id and _public_url(url):
+                # 展示链接去掉了访问参数，不能覆盖已经保存的完整平台链接。
+                existing_url = str((data.get(note_id) or {}).get('url') or '')
+                if (parse_qs(urlsplit(existing_url).query).get('xsec_token')
+                        and not parse_qs(urlsplit(url).query).get('xsec_token')):
+                    continue
                 data[note_id] = {'url': url, 'at': now}
         if len(data) > MAX_LOCATORS:
             data = dict(sorted(data.items(), key=lambda item: float((item[1] or {}).get('at') or 0), reverse=True)[:MAX_LOCATORS])
@@ -212,7 +217,6 @@ class XhsOpsService:
     def _locator(self, account_id: str, *, note_id: str = '', url: str = '') -> tuple[str, str]:
         if url:
             note_id = self._remember_url(account_id, url)
-            return note_id, url[:4096]
         note_id = str(note_id or '')[:100]
         row = self._read_locators(account_id).get(note_id) if note_id else None
         locator = str((row or {}).get('url') or '')
@@ -259,9 +263,13 @@ class XhsOpsService:
                 raise WorkflowError("该账号正在执行登录、发布或互动操作，请稍后再读。", 429)
         result = self.accounts.run(
             account, 'xhs_interact' if interaction else 'xhs_read', operation_id,
-            headed=interaction, confirmed=bool(interaction), xhs_action=action, xhs_params=params,
+            headed=False, confirmed=bool(interaction), xhs_action=action,
+            xhs_params={**params, **({'expected_account_remote_id': str((account.get('identity') or {}).get('remote_id') or '')}
+                                    if action in {'notes', 'comments', 'reply'} else {})},
         )
         state = str(result.get('state') or 'error')
+        if interaction and state in {'login_required', 'verification_required'}:
+            return {**result, 'operation_id': operation_id}
         if interaction and result.get('not_submitted') is True:
             state = 'not_submitted'
         if state not in {'success', 'verified', 'partial', 'unknown_result', 'not_submitted'}:
@@ -359,8 +367,8 @@ class XhsOpsService:
     def interactions(self, account_id: str = '', limit: int = 100) -> dict[str, Any]:
         return self.workspace.interactions.list(platform='xiaohongshu', account_id=account_id, limit=limit)
 
-    def execute_interaction(self, interaction_id: str, confirmed: bool) -> dict[str, Any]:
-        return self.workspace.interactions.execute(interaction_id, confirmed)
+    def execute_interaction(self, interaction_id: str, confirmed: bool, expected_updated_at: str = '') -> dict[str, Any]:
+        return self.workspace.interactions.execute(interaction_id, confirmed, expected_updated_at)
 
     def query_interaction(self, interaction_id: str) -> dict[str, Any]:
         return self.workspace.interactions.refresh_result(interaction_id)['interaction']

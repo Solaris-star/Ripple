@@ -15,7 +15,7 @@ import time
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
-from .catalog import NATIVE, NAMES, environment_probe
+from .catalog import NATIVE, NAMES, environment_probe, native_publish_available
 from .catalog import X_BROWSER_ADAPTER
 from .execution_nodes import LOCAL_NODE_ID, ExecutionNodeService
 from .publishing import WorkflowError, fingerprint
@@ -334,7 +334,10 @@ class AccountService:
             return self.project(account)
 
     def run(self, account, operation, operation_id, *, headed=True, **extra):
-        ambiguous_operation = operation in {"publish", "xhs_interact"}
+        if operation == "publish" and not native_publish_available(account["platform"]):
+            return {"state": "failed_terminal", "not_submitted": True,
+                    "message": "当前安装未包含该平台的发布模块，未执行上传或发布。"}
+        ambiguous_operation = operation in {"publish", "xhs_interact", "x_interact", "remote_posts_write"}
         if account.get("execution_node_id", LOCAL_NODE_ID) != LOCAL_NODE_ID:
             return {"state": "failed_terminal", "not_submitted": True,
                     "message": "远程 Browser Node 发布传输尚未启用；账号登录态仍保留在该执行设备，不会上传到服务器。"}
@@ -346,7 +349,7 @@ class AccountService:
         operation_state = account.get("operation") or {}
         payload = {"operation": operation, "platform": account["platform"], "operation_id": operation_id,
                    "private_dir": str(private), "headed": headed, "profile_label": str(account.get("label") or "")[:80],
-                   "browser_channel": operation_state.get("browser_channel") or self.environment["browser"], **extra}
+                   "browser_channel": operation_state.get("browser_channel") or account.get("browser_channel") or self.environment["browser"], **extra}
         # Model/API keys and personal tool configuration are not inherited.
         keep = {"SYSTEMROOT", "WINDIR", "TEMP", "TMP", "PATH", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "PLAYWRIGHT_BROWSERS_PATH"}
         env = {k: v for k, v in os.environ.items() if k.upper() in keep}

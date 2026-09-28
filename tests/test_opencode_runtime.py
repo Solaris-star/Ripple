@@ -36,6 +36,12 @@ def test_opencode_adapter_preserves_runtime_contract_and_legacy_alias(tmp_path, 
     assert isinstance(rt, AgentRuntimeAdapter)
     assert isinstance(OpenCodeError("fixture"), AgentRuntimeError)
     monkeypatch.setattr(rt, "_health", lambda _settings: {"healthy": True, "version": "fixture-version"})
+    monkeypatch.setattr(rt, "_request", lambda *args, **kwargs: {
+        "model": "ripple/fixture-model", "instructions": [
+            str(rt.workspace_dir / "RIPPLE_AGENT.md"),
+            rt._tool_binding_path("http://127.0.0.1:7860").as_posix(),
+        ],
+    })
     status = rt.status("http://127.0.0.1:7860")
     assert status["runtime"] == "opencode"
     assert status["healthy"] is True
@@ -55,7 +61,7 @@ def test_private_config_uses_env_refs_and_denies_generic_tools(tmp_path):
     assert all(cfg["tools"][name] is False for name in ["bash", "edit", "write", "read", "webfetch", "websearch"])
     assert (rt.workspace_dir / "RIPPLE_AGENT.md").read_text(encoding="utf-8") == "fixture"
     assert (rt.workspace_dir / "tools" / "ripple_fixture.ts").is_file()
-    assert cfg["instructions"] == [str((rt.workspace_dir / "RIPPLE_AGENT.md").resolve())]
+    assert cfg["instructions"] == [str((rt.workspace_dir / "RIPPLE_AGENT.md").resolve()), "{env:RIPPLE_TOOL_BINDING_FILE}"]
 
 
 def test_run_turn_rejects_non_ripple_tool_even_when_requested(tmp_path, monkeypatch):
@@ -82,6 +88,7 @@ def test_process_env_is_narrow_and_passes_tool_token(tmp_path, monkeypatch):
     assert out["RIPPLE_LLM_API_KEY"] == "fixture-secret"
     assert out["RIPPLE_AGENT_TOOL_TOKEN"] == rt.tool_token
     assert out["RIPPLE_TOOL_BASE"] == "http://127.0.0.1:7860"
+    assert "\\" not in out["RIPPLE_TOOL_BINDING_FILE"]
     assert "SHOULD_NOT_LEAK_TO_OPENCODE" not in out
     assert "IMG_API_KEY" not in out
 
@@ -213,3 +220,34 @@ def test_close_terminates_only_owned_process(tmp_path):
     p = P(); rt._process = p; rt._owned = True
     rt.close()
     assert p.terminated is True and rt._process is None
+
+
+@pytest.mark.parametrize("status", ["pending", "running"])
+@pytest.mark.parametrize("completed_message", [True, False])
+def test_media_tool_is_not_finished_by_completed_message_or_idle_session(tmp_path, monkeypatch, status, completed_message):
+    rt = runtime(tmp_path)
+    monkeypatch.setattr(rt, "get_or_create", lambda *_: "ses_fixture")
+    def row(tool_status):
+        return {"info": {"id": "image-call", "role": "assistant", "time": {"completed": 1 if completed_message else None}}, "parts": [
+            {"type": "tool", "tool": "ripple_generate_image", "callID": "image-one", "state": {
+                "status": tool_status, "output": json.dumps({"kind": "image", "path": "AI媒体生成/ok.png"}) if tool_status == "completed" else None,
+            }},
+        ]}
+    text = {"info": {"id": "text-after", "role": "assistant", "time": {"completed": 1 if completed_message else None}},
+            "parts": [{"type": "text", "text": "正文已写好，配图仍在生成。"}]}
+    states = [[], [row(status), text], [row(status), text], [row("completed"), text]]
+    def messages(_):
+        assert states, "工具完成后应结束轮询"
+        return states.pop(0)
+    monkeypatch.setattr(rt, "_messages", messages)
+    monkeypatch.setattr(rt, "_request", lambda *args, **kwargs: {})
+    monkeypatch.setattr("ripple.opencode_runtime.time.sleep", lambda _: None)
+    ticks = iter(index * .6 for index in range(100))
+    monkeypatch.setattr("ripple.opencode_runtime.time.monotonic", lambda: next(ticks))
+    events = []
+    rt.run_turn("image-regression", "配图", "system", [], "http://localhost", lambda k, t: events.append((k, t)),
+                timeout=20, enabled_tools=["ripple_generate_image"])
+    assert states == []
+    media = [json.loads(value) for kind, value in events if kind == "media"]
+    assert [value["status"] for value in media] == [status, "completed"]
+    assert media[-1]["path"] == "AI媒体生成/ok.png"

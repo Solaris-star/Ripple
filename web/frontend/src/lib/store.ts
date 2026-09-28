@@ -1,11 +1,13 @@
 import type { TopicUseContext, UploadedFile } from './api';
+import type { MediaTask } from './mediaTask';
 
 export interface ChatArtifact {
   kind: 'content_draft';
   id: string;
   version_id: string;
   title: string;
-  status: 'draft';
+  status: 'draft' | 'proposal';
+  proposal_id?: string;
 }
 
 export interface ContentChatContext {
@@ -34,6 +36,7 @@ export interface ChatMessage {
   thinking?: string;   // 模型思考过程（隐思考），流式结束后持久保留
   activity?: string;   // 工具/执行活动步骤（换行分隔），持久保留
   artifacts?: ChatArtifact[]; // Agent 工具产生的受控业务引用，用于跳回对应工作台
+  mediaTasks?: MediaTask[]; // 图片工具状态单独保留，不依赖正文中的成功声明
   turnSkills?: string[]; // 仅本轮注入的 Skill 指导；不授予工具权限
   turnTools?: string[]; // 旧版本兼容字段；新 AI 协作不再允许用户直接注入原子 Tool
 }
@@ -43,13 +46,20 @@ export interface ChatSession {
   title: string;
   messages: ChatMessage[];
   persona?: string;
+  workScope?: SessionWorkScope; // 创建/首次发送时固定；后续全局范围切换不会改写
   created: number;
   sessionKey?: string;  // OpenCode session id，用于后端删除
   pendingTurnId?: string; // 进行中的可重连 job；浏览器重开后继续按 eventId 续流
   archived?: boolean;   // 归档：从 History 主列表移到「已归档」区
+  updatedAt?: number; // 最近一条消息的时间；整理列表不更新此值
+  archivedAt?: number;
+  pinned?: boolean;
+  manualTitle?: boolean;
+  draft?: string;
+  draftAttachments?: UploadedFile[];
+  draftSkills?: string[];
   contentContext?: ContentChatContext; // 从内容工作台进入的既有主稿引用；不复制正文到 localStorage
   topicContext?: TopicUseContext; // 从热点/活动/选题进入创作时保留结构化约束，供内容工作台展示与续接
-  workScope?: SessionWorkScope; // 首次发送时固定的账号/画像范围；后续切换全局范围不改写旧会话
 }
 
 /** 进行中的流式状态（存于 App，不随页面切换/ChatPage 卸载而丢失）。 */
@@ -58,6 +68,7 @@ export interface StreamState {
   thinking: string;
   activity: string;
   artifacts: ChatArtifact[];
+  mediaTasks?: MediaTask[];
 }
 
 /** 发布中心草稿：持久化到 localStorage，切页/刷新都不丢。 */
@@ -124,7 +135,6 @@ export function savePublishDraft(d: PublishDraft): void {
   writeBrowserLocalValue('publish_draft', JSON.stringify(d));
 }
 
-const MAX_SESSIONS = 100;
 const TITLE_MAX_CHARS = 24;
 
 /** 上次活跃会话 id：重开网页时据此续接上次对话（修复"今天再问就忘了"）。 */
@@ -147,6 +157,7 @@ export function loadSessions(): ChatSession[] {
     // 兼容旧版本：附件内部指令曾被直接存进用户消息，加载时拆出并隐藏。
     return sessions.map((session) => ({
       ...session,
+      updatedAt: session.updatedAt || session.created,
       messages: session.messages.map((message) => {
         if (message.role !== 'user' || message.agentContent || !message.content.includes('【附件素材】')) {
           return message;
@@ -164,30 +175,26 @@ export function loadSessions(): ChatSession[] {
   }
 }
 
-/** 保存前清理：只保留最新 1 个空会话（避免空会话无限堆积），并封顶总数。 */
-function prune(sessions: ChatSession[]): ChatSession[] {
-  let keptEmpty = false;
-  const pruned = sessions.filter((s) => {
-    if (s.messages.length > 0) return true;
-    if (keptEmpty) return false;
-    keptEmpty = true;
+/** 会话属于用户数据：存储失败必须通知界面，不能静默丢弃空会话或旧记录。 */
+export function saveSessions(sessions: ChatSession[]): boolean {
+  try {
+    localStorage.setItem(browserLocalKey('sessions'), JSON.stringify(sessions));
     return true;
-  });
-  return pruned.slice(0, MAX_SESSIONS);
-}
-
-export function saveSessions(sessions: ChatSession[]): void {
-  writeBrowserLocalValue('sessions', JSON.stringify(prune(sessions)));
+  } catch {
+    window.dispatchEvent(new CustomEvent('ripple:session-storage-error'));
+    return false;
+  }
 }
 
 export function createSession(persona?: string, workScope?: SessionWorkScope): ChatSession {
   return {
     id: generateId(),
-    title: 'New Chat',
+    title: '新会话',
     messages: [],
     persona,
     workScope,
     created: Date.now(),
+    updatedAt: Date.now(),
   };
 }
 
@@ -303,7 +310,7 @@ export function generateSessionTitle(message: string, _seed = message): string {
 }
 
 export function updateSessionTitle(session: ChatSession): void {
-  if (session.messages.length > 0 && session.title === 'New Chat') {
+  if (!session.manualTitle && session.messages.length > 0 && (session.title === 'New Chat' || session.title === '新会话')) {
     session.title = generateSessionTitle(session.messages[0].content, session.id);
   }
 }

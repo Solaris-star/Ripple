@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
+    "test:unit": "node --experimental-strip-types --test test/*.test.ts",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -14,7 +15,8 @@
     "dompurify": "^3.4.15",
     "marked": "^18.0.6",
     "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "react-dom": "^19.2.7",
+    "twitter-text": "3.1.0"
   },
   "devDependencies": {
     "@types/node": "^24.13.2",

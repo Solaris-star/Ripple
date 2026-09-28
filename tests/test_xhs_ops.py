@@ -371,10 +371,13 @@ def test_interaction_draft_idempotency_guard_and_execute_once(tmp_path, monkeypa
     executions = []
     def execute_run(account, operation, operation_id, **extra):
         executions.append((operation, operation_id, extra["xhs_action"]))
-        return {"state": "verified", "data": {"results": [{"id": "c1", "status": "verified", "reason": ""}]}}
+        return {"state": "verified", "data": {"results": [{"id": "c1", "status": "verified", "reason": "", "evidence": {
+            "kind": "platform_receipt", "target_id": "note123", "target_comment_id": "c1", "account_remote_id": "u1",
+            "reply_id": "sent1", "text": extra["xhs_params"]["items"][0]["reply"],
+        }}]}}
     monkeypatch.setattr(service.accounts, "run", execute_run)
-    result = service.xhs_ops.execute_interaction(draft["id"], True)
-    duplicate = service.xhs_ops.execute_interaction(draft["id"], True)
+    result = service.xhs_ops.execute_interaction(draft["id"], True, draft["updated_at"])
+    duplicate = service.xhs_ops.execute_interaction(draft["id"], True, draft["updated_at"])
     assert result["status"] == "verified"
     assert duplicate["status"] == "verified"
     assert len(executions) == 1
@@ -394,13 +397,16 @@ def test_unknown_interaction_requires_query_not_resubmit(tmp_path, monkeypatch):
         sends.append(operation_id)
         return {"state": "unknown_result", "data": {"status": "unknown_result", "reason": ""}}
     monkeypatch.setattr(service.accounts, "run", uncertain)
-    result = service.xhs_ops.execute_interaction(draft["id"], True)
+    result = service.xhs_ops.execute_interaction(draft["id"], True, draft["updated_at"])
     assert result["status"] == "unknown_result"
-    same = service.xhs_ops.execute_interaction(draft["id"], True)
+    same = service.xhs_ops.execute_interaction(draft["id"], True, draft["updated_at"])
     assert same["status"] == "unknown_result" and len(sends) == 1
 
     monkeypatch.setattr(service.accounts, "read_result", lambda account_id, operation_id: {
-        "state": "verified", "data": {"status": "verified", "reason": ""}, "operation_id": operation_id,
+        "state": "verified", "data": {"status": "verified", "reason": "", "evidence": {
+            "kind": "platform_receipt", "target_id": "note123", "target_comment_id": "",
+            "account_remote_id": "u1", "reply_id": "published-comment", "text": "测试互动",
+        }}, "operation_id": operation_id,
     })
     queried = service.xhs_ops.query_interaction(draft["id"])
     assert queried["status"] == "verified"

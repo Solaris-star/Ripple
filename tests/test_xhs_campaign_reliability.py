@@ -133,6 +133,10 @@ class _Clock:
 
 
 class _EmptyMatches:
+    @property
+    def first(self):
+        return self
+
     def count(self):
         return 0
 
@@ -195,7 +199,9 @@ class _Page:
     def wait_for_timeout(self, ms):
         self.clock.now += ms / 1000
 
-    def locator(self, _selector):
+    def locator(self, selector):
+        if selector == ".login-container":
+            return _EmptyMatches()
         return SimpleNamespace(inner_text=lambda **_kwargs: "创作者中心 活动广场")
 
     def get_by_text(self, *_args, **_kwargs):

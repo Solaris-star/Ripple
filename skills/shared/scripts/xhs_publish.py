@@ -32,6 +32,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import login_state  # noqa: E402
@@ -379,7 +380,33 @@ def _normalize_content(text: str) -> str:
     return text.strip("\n")
 
 
-def _fill_and_submit(page, title, content, tags):
+def _published_note_id(payload: object) -> str:
+    """只接受发布响应中明确的作品 ID 字段。"""
+    if (not isinstance(payload, dict) or payload.get("success") is False
+            or payload.get("code") not in (None, 0, "0", 200, "200")):
+        return ""
+    candidates = []
+    data = payload.get("data")
+    result = payload.get("result")
+    if isinstance(result, (int, str)) and str(result).isdigit() and str(result) != "0":
+        return ""
+    if isinstance(data, str):
+        candidates.append(data)
+    if isinstance(result, str):
+        candidates.append(result)
+    for item in (payload, data, result, data.get("note") if isinstance(data, dict) else None,
+                 data.get("note_info") if isinstance(data, dict) else None):
+        if not isinstance(item, dict):
+            continue
+        for key in ("noteId", "note_id", "note_id_str", "id"):
+            value = str(item.get(key) or "")
+            if re.fullmatch(r"[0-9A-Za-z]{16,40}", value):
+                candidates.append(value)
+    unique = set(candidates)
+    return unique.pop() if len(unique) == 1 else ""
+
+
+def _fill_and_submit(page, title, content, tags, receipt_file: str = "", operation_id: str = "", account_remote_id: str = ""):
     """标题→正文→话题→长度校验→发布→成功校验。"""
     content = _normalize_content(content)         # 修连续空行导致的发布失败
     title_el = page.query_selector(SELECTORS["title_input"])
@@ -398,10 +425,37 @@ def _fill_and_submit(page, title, content, tags):
 
     _check_overflow(page)
 
+    receipts = []
+    network_evidence = []
+    submitting = False
+    def capture(response):
+        if not submitting:
+            return
+        try:
+            url = urlsplit(response.url)
+            if url.hostname not in {"creator.xiaohongshu.com", "edith.xiaohongshu.com"} or response.request.method != "POST":
+                return
+            request_data = response.request.post_data or ""
+            payload = response.json() if response.status == 200 else {}
+            note_id = _published_note_id(payload)
+            network_evidence.append({"path": url.path, "status": response.status,
+                                     "request_contains_title": title in request_data,
+                                     "code": payload.get("code") if isinstance(payload, dict) else None,
+                                     "note_id": note_id,
+                                     "response": payload if url.path == "/web_api/sns/v2/note" and title in request_data else None})
+            if title not in request_data:
+                return
+            if note_id:
+                receipts.append(note_id)
+        except Exception:
+            pass
+    page.on("response", capture)
+
     kind, btn = _wait_publish_clickable(page, 15)
     btn.scroll_into_view_if_needed()
     page.wait_for_timeout(300)
     box = btn.bounding_box()
+    submitting = True
     if kind == "new" and box:
         # xhs-publish-btn 是宽横条(闭合 Shadow DOM)，内含[暂存离开][发布]两个按钮；
         # 点 host 中心会落在两按钮间隙→无效。发布按钮在右侧约 62% 处（实测像素为品牌红），按坐标点它。
@@ -414,6 +468,12 @@ def _fill_and_submit(page, title, content, tags):
     page.wait_for_timeout(1000)
     _confirm_publish_dialog(page)   # 若弹二次确认框，点确认
     _wait_publish_success(page, 40)
+    if receipt_file:
+        Path(receipt_file).with_name('publish-network.json').write_text(
+            json.dumps({'operation_id': operation_id, 'responses': network_evidence[:100]}, ensure_ascii=False), encoding='utf-8')
+    if len(set(receipts)) == 1 and receipt_file and account_remote_id:
+        Path(receipt_file).write_text(json.dumps({"remote_id": receipts[0], "account_remote_id": account_remote_id,
+                                                 "operation_id": operation_id, "evidence": "platform_create_response"}, ensure_ascii=False), encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -584,6 +644,13 @@ def _publish(a, kind: str) -> int:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.set_default_timeout(300000)
         try:
+            expected_account = str(getattr(a, 'account_remote_id', '') or '')
+            if expected_account:
+                from ripple.xhs_reply import IDENTITY_JS
+                page.goto(EXPLORE_URL, wait_until='domcontentloaded')
+                page.wait_for_timeout(900)
+                if page.evaluate(IDENTITY_JS) != [expected_account]:
+                    _die('小红书浏览器账号与所选账号不一致，未执行上传。')
             page.goto(PUBLISH_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(1500)
             if not page.query_selector(SELECTORS["login_ok"]) and "login" in page.url.lower():
@@ -596,7 +663,9 @@ def _publish(a, kind: str) -> int:
                 _click_publish_tab(page, "上传视频")
                 page.wait_for_timeout(1000)
                 _upload_video(page, media[0])
-            _fill_and_submit(page, a.title, a.content or "", tags)
+            _fill_and_submit(page, a.title, a.content or "", tags,
+                             str(getattr(a, "receipt_file", "")), str(getattr(a, "operation_id", "")),
+                             str(getattr(a, "account_remote_id", "")))
         except PWTimeout as e:
             _die(f"步骤超时（选择器可能已失效，检查 SELECTORS）：{e}")
         finally:
@@ -648,6 +717,8 @@ def cmd_whoami(a) -> int:
                         result["avatar"] = img.get_attribute("src") or ""
                     a_el = page.query_selector('.main-container .user a[href^="/user/profile/"]')
                     href = a_el.get_attribute("href") if a_el else None
+                    if href:
+                        result["uid"] = href.split('/user/profile/', 1)[-1].split('?', 1)[0].strip('/')
                     if href:  # 昵称在个人主页，explore 页只有头像
                         try:
                             page.goto("https://www.xiaohongshu.com" + href,

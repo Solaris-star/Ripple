@@ -255,6 +255,47 @@ def test_start_content_is_idempotent_for_confirmed_brief(tmp_path, monkeypatch):
     assert created == ["idea-content-test"]
 
 
+def test_manual_start_content_without_ai_or_brief_preserves_idea(tmp_path, monkeypatch):
+    import asyncio
+    from web import app as upstream
+    from ripple.workspace import WorkspaceService
+
+    service = make_service(tmp_path, [])
+    idea = service.create_idea({"title": "手动写稿", "note": "先归类，再清理", "persona": "测试画像",
+                                "target_platforms": ["xiaohongshu"], "status": "pending"}, stage="saved")
+    work = WorkspaceService(tmp_path / "outputs", private=tmp_path / "private")
+    monkeypatch.setattr(upstream, "_IDEATION", service)
+    monkeypatch.setattr(upstream, "_RIPPLE_WORKSPACE", work)
+    monkeypatch.setattr(upstream, "_recommendation_ai_backend", lambda: None)
+    try:
+        request = upstream.IdeaStartContentInput(manual=True, idempotency_key="manual-content-test")
+        first = asyncio.run(upstream.api_idea_start_content(idea["id"], request))
+        again = asyncio.run(upstream.api_idea_start_content(idea["id"], request))
+        assert first["created"] is True and again["created"] is False
+        assert first["content"]["id"] == again["content"]["id"]
+        assert first["content"]["content"]["body"] == "先归类，再清理"
+        assert first["idea"]["target_platforms"] == ["xiaohongshu"]
+        assert first["idea"]["persona"] == "测试画像"
+        assert first["idea"]["stage"] == "production"
+        assert first["idea"]["content_id"] == first["content"]["id"]
+    finally:
+        work.close()
+
+
+def test_ai_start_still_requires_confirmed_current_brief(tmp_path, monkeypatch):
+    import asyncio
+    from fastapi import HTTPException
+    from web import app as upstream
+
+    service = make_service(tmp_path, [])
+    idea = service.create_idea({"title": "未确认策划", "status": "pending"}, stage="saved")
+    monkeypatch.setattr(upstream, "_IDEATION", service)
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(upstream.api_idea_start_content(idea["id"], upstream.IdeaStartContentInput(
+            expected_revision=1, idempotency_key="still-require-brief")))
+    assert error.value.status_code == 409
+
+
 def test_idea_plan_requires_and_preserves_user_selected_time(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace

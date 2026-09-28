@@ -565,10 +565,12 @@ class XService:
         if (account.get("operation") or {}).get("state") in {"running", "recovery_required"}:
             errors.append("X 账号有未结束或待核对的操作。")
         body = str(content.get("body") or "")
+        from .x_text import count_reply
+        count = count_reply(body)
+        if not count["valid"]:
+            errors.append(f"X 正文须为有效文字，最多 280 加权字符；当前为 {count['weighted_length']}。")
         if not body.strip():
             errors.append("X 发布需要正文；标题仅作为 Ripple 本地任务名称。")
-        if len(body) > 280:
-            errors.append("Ripple Native X 首版正文限制为 280 字符。")
         if content.get("tags"):
             errors.append("X 的话题请直接写入正文；独立话题字段应留空。")
         if len(content.get("media") or []) > MAX_IMAGES:

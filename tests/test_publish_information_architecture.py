@@ -38,10 +38,11 @@ def test_content_workbench_owns_variant_editing_and_publish_execution():
     assert "平台版本正文" in executor
     assert "平台版本目标账号" in executor
     assert "平台版本计划时间" in executor
-    assert "预检并审核" in executor
+    assert "保存草稿" in executor
+    assert "准备发布" in executor
     assert "发布到所选账号" in executor
-    assert "确认真实发布授权" in executor
-    assert "发布管理" in executor
+    assert "确认并发布" in executor
+    assert "查看发布详情" in executor
 
 
 def test_publish_subnav_uses_task_management_label():

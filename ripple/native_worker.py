@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 from filelock import FileLock, Timeout
 from .catalog import NATIVE, biliup_binary
+from .bilibili_options import upload_options
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "skills/shared/scripts"
@@ -63,10 +64,14 @@ def structured_identity(raw: str) -> dict:
 
 def execute(payload: dict) -> dict:
     platform, operation = payload["platform"], payload["operation"]
-    if platform not in NATIVE or operation not in {"login", "probe", "publish", "xhs_read", "xhs_interact", "campaign_read"}:
+    if platform not in NATIVE or operation not in {"login", "probe", "publish", "xhs_read", "xhs_interact", "x_read", "x_interact", "campaign_read", "remote_posts_read", "remote_posts_write"}:
         raise ValueError("unsupported operation")
+    if operation in {"remote_posts_read", "remote_posts_write"} and platform not in {"x", "xiaohongshu"}:
+        raise ValueError("remote post operation requires X or Xiaohongshu")
     if operation in {"xhs_read", "xhs_interact"} and platform != "xiaohongshu":
         raise ValueError("xiaohongshu operation requires xiaohongshu account")
+    if operation in {"x_read", "x_interact"} and platform != "x":
+        raise ValueError("x operation requires x account")
     if operation == "campaign_read" and platform != "douyin":
         raise ValueError("campaign_read currently supports douyin creator accounts only")
     if not re.fullmatch(r'[a-f0-9]{32}', payload.get('operation_id', '')):
@@ -147,6 +152,7 @@ def execute(payload: dict) -> dict:
     opts.task_id = payload.get("task_id")
     opts.version_id = payload.get("version_id")
     opts.operation_id = payload.get("operation_id")
+    opts.receipt_file = str(run_dir / "publish-receipt.json")
     # Bind library launch to an explicitly separate profile and installed channel.
     from playwright.sync_api import BrowserType
     original_launch = BrowserType.launch_persistent_context
@@ -168,6 +174,39 @@ def execute(payload: dict) -> dict:
             rc = fn(*args)
         return rc, log.text
 
+    if operation in {"remote_posts_read", "remote_posts_write"}:
+        if operation == "remote_posts_write" and payload.get("confirmed") is not True:
+            return {"state": "not_submitted", "not_submitted": True, "message": "缺少作品写入确认。"}
+        from .remote_browser import RemoteBrowserError, run as read_remote_posts
+        try:
+            params = payload.get("remote_params") if isinstance(payload.get("remote_params"), dict) else {}
+            if operation == "remote_posts_write" and (run_dir / "submission.json").exists():
+                return {"state": "unknown_result", "not_submitted": False,
+                        "message": "该操作已有提交记录，只允许核对。"}
+            data = read_remote_posts(platform, module, opts, directory,
+                                     str(payload.get("remote_action") or ""),
+                                     {**params, "submission_file": str(run_dir / "submission.json")})
+            return {"state": "success", "not_submitted": operation == "remote_posts_read" or data.get('not_submitted') is True,
+                    "data": data}
+        except RemoteBrowserError as exc:
+            code = str(exc)
+            return {"state": code if code in {"login_required", "account_mismatch", "verification_required"} else "read_failed",
+                    "not_submitted": operation == "remote_posts_read" or not (run_dir / "submission.json").exists(),
+                    "message": code[:100], "data": {}}
+
+    if operation in {"x_read", "x_interact"}:
+        from .x_interactions_browser import XInteractionError, error_message
+        action = str(payload.get("x_action") or "")
+        if (operation == "x_read" and action not in {"contents", "comments"}) or (operation == "x_interact" and (action != "reply" or payload.get("confirmed") is not True)):
+            return {"state": "not_submitted", "not_submitted": True, "message": "不支持的 X 操作或缺少人工确认。", "data": {}}
+        params = payload.get("x_params") if isinstance(payload.get("x_params"), dict) else {}
+        try:
+            data = module.run_interactions(opts, action, {**params, "submission_file": str(run_dir / "submission.json")})
+            return {"state": "success", "data": data}
+        except XInteractionError as exc:
+            return {"state": str(exc) if str(exc) in {"login_required", "verification_required"} else "failed_terminal",
+                    "not_submitted": not (run_dir / "submission.json").exists(), "message": error_message(str(exc)), "data": {}}
+
     if operation in {"xhs_read", "xhs_interact"}:
         if operation == "xhs_interact" and payload.get("confirmed") is not True:
             return {"state": "not_submitted", "not_submitted": True, "message": "缺少真实互动授权。", "data": {}}
@@ -181,7 +220,8 @@ def execute(payload: dict) -> dict:
         try:
             data = xhs_browser.run(
                 str(payload.get("xhs_action") or ""), directory,
-                payload.get("xhs_params") if isinstance(payload.get("xhs_params"), dict) else {},
+                {**(payload.get("xhs_params") if isinstance(payload.get("xhs_params"), dict) else {}),
+                 "submission_file": str(run_dir / "submission.json")},
             )
         except xhs_browser.XhsBrowserError as exc:
             code = str(exc)
@@ -191,6 +231,12 @@ def execute(payload: dict) -> dict:
             if code == "login_required":
                 return {"state": "verification_required", "not_submitted": operation == "xhs_interact",
                         "message": "小红书登录态已失效，请先重新连接账号。", "data": {}}
+            if code in {"account_identity_missing", "account_mismatch", "target_owner_unconfirmed", "comments_sync_unconfirmed"}:
+                return {"state": "not_submitted" if operation == "xhs_interact" else "failed_terminal", "not_submitted": True,
+                        "message": {"account_identity_missing": "缺少账号身份，请在账号与平台重新校验。",
+                                    "account_mismatch": "浏览器账号与所选账号不一致，请重新校验。",
+                                    "target_owner_unconfirmed": "无法确认作品属于当前账号，已停止读取。",
+                                    "comments_sync_unconfirmed": "未取得有效评论数据，同步失败；这不代表零评论。"}[code], "data": {}}
             return {"state": "not_submitted" if operation == "xhs_interact" else "failed_terminal",
                     "not_submitted": operation == "xhs_interact", "message": "小红书操作参数或页面状态不符合要求。", "data": {}}
         if operation == "xhs_read":
@@ -241,7 +287,10 @@ def execute(payload: dict) -> dict:
     for key in ("name", "remote_id"):
         if expected.get(key) and identity.get(key) != expected[key]:
             return {"state": "verification_required", "not_submitted": True, "message": "账号身份已变化，未执行上传。"}
+    opts.account_remote_id = identity["remote_id"]
     c = payload["content"]
+    # 在写入提交标记之前拒绝未审核或无效的投稿参数。
+    bili_options = upload_options(c.get("options") or {}) if platform == "bilibili" else []
     paths = payload.get("media_paths", [])
     opts.title, opts.content, opts.desc, opts.tags = c["title"], c["body"], c["body"], c.get("tags", "")
     opts.images = ",".join(paths)
@@ -257,7 +306,7 @@ def execute(payload: dict) -> dict:
         binary = biliup_binary()
         if not binary:
             return {"state": "failed_terminal", "not_submitted": True, "message": "biliup 尚未安装。"}
-        argv = [str(binary), "-u", opts.cookie, "upload", paths[0], "--title", c["title"], "--tid", "36", "--copyright", "1", "--tag", c.get("tags") or "日常", "--desc", c["body"]]
+        argv = [str(binary), "-u", opts.cookie, "upload", paths[0], "--title", c["title"], *bili_options, "--tag", c.get("tags") or "日常", "--desc", c["body"]]
         result = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=840)
         return {"state": "accepted" if result.returncode == 0 else "unknown_result", "message": "投稿程序已返回；请在平台核对作品。", "evidence": "biliup_exit"}
     # Upstream scripts occasionally retry the final click internally. Intercept
@@ -295,8 +344,21 @@ def execute(payload: dict) -> dict:
                     "message": "X 浏览器发布在最终提交前中止；未点击发布，可检查页面状态后重新审核。"}
         return {"state": "unknown_result", "not_submitted": False,
                 "message": "上传或提交结果未确认，请先在平台核对，禁止直接重发。"}
-    return {"state": "accepted" if rc == 0 else "unknown_result", "not_submitted": False,
-            "message": "发布器已返回页面结果，待核对作品链接。", "evidence": "upstream_ui_signal"}
+    outcome = {"state": "accepted" if rc == 0 else "unknown_result", "not_submitted": False,
+               "message": "发布器已返回页面结果，待核对平台作品状态。", "evidence": "upstream_ui_signal"}
+    receipt_path = run_dir / "publish-receipt.json"
+    try:
+        if receipt_path.stat().st_size < 8192:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if (receipt.get("operation_id") == payload["operation_id"]
+                    and receipt.get("account_remote_id") == identity["remote_id"]
+                    and re.fullmatch(r"[0-9]{1,30}" if platform == "x" else r"[0-9a-zA-Z]{16,40}", str(receipt.get("remote_id") or ""))):
+                outcome.update(remote_id=receipt["remote_id"], account_remote_id=receipt["account_remote_id"],
+                               candidate_url=str(receipt.get("public_url") or "")[:2048],
+                               evidence=str(receipt.get("evidence") or "platform_response")[:80])
+    except (OSError, ValueError, TypeError):
+        pass
+    return outcome
 
 
 def main():
@@ -304,12 +366,17 @@ def main():
     directory = Path(payload["private_dir"]).resolve()
     run_dir = directory / "operations" / payload["operation_id"]
     run_dir.mkdir(parents=True, exist_ok=True)
-    ambiguous = payload.get("operation") in {"publish", "xhs_interact"}
+    ambiguous = payload.get("operation") in {"publish", "xhs_interact", "x_interact", "remote_posts_write"}
     outcome = {"state": "unknown_result" if ambiguous else "error", "message": "平台操作未完成，请检查浏览器环境、网络或账号状态。"}
     try:
         with FileLock(str(directory / "browser-operation.lock"), timeout=0):
             with redirect_stdout(Tail()), redirect_stderr(Tail()):
-                outcome = execute(payload)
+                if ambiguous and (run_dir / "result.json").exists():
+                    outcome = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+                elif ambiguous and ((run_dir / "submission.json").exists() or (run_dir / "xhs-interaction-intent.json").exists()):
+                    outcome = {"state": "unknown_result", "message": "该操作已有提交记录，须先人工核对，不能重新执行。"}
+                else:
+                    outcome = execute(payload)
     except Timeout:
         outcome = {"state": "verification_required", "not_submitted": True, "message": "该账号的浏览器正在使用，请稍后重试。"}
     except BaseException:

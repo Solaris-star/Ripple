@@ -60,6 +60,15 @@ RECEIPT_HOSTS = {
 }
 
 
+def native_publish_available(platform: str) -> bool:
+    """检查随项目提供的发布模块，不导入或执行平台脚本。"""
+    spec = NATIVE.get(platform)
+    if not spec:
+        return False
+    scripts = Path(__file__).resolve().parents[1] / "skills" / "shared" / "scripts"
+    return (scripts / f"{spec['module']}.py").is_file()
+
+
 def biliup_candidates(executable: Path | None = None, *, windows: bool | None = None) -> list[Path]:
     """Only consider the biliup executable belonging to Ripple's active Python."""
     python = (executable or Path(sys.executable)).resolve()

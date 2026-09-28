@@ -45,6 +45,8 @@ if str(PROJECT_ROOT / "scripts") not in sys.path:
 from ripple.persona import load_profile_text, persona_prefix, chat_turn_message, profile_exists, _FILE_ORDER
 from ripple.content_profiles import ContentProfileService, validate_profile_storage_name
 from ripple.agent_runtime import AgentRuntimeError, AgentRuntimeManager, AgentToolBridgeConfig
+from ripple.agent_credentials import agent_tool_token
+from ripple.ideation_engine import candidate_failure_message
 from ripple.agent_profiles import AgentProfileRegistry
 from ripple.agent_tool_bridge import AgentToolLease, RippleAgentToolBridge, install_agent_tool_bridge
 from ripple.claude_code_runtime import ClaudeCodeAgentAdapter
@@ -933,7 +935,7 @@ def _agent_runtime_env() -> dict[str, str]:
     return env
 
 
-_AGENT_TOOL_TOKEN = secrets.token_urlsafe(32)
+_AGENT_TOOL_TOKEN = agent_tool_token(app.state.ripple.private)
 _AGENT_PROVISIONING = AgentAdapterProvisioningService(app.state.ripple.private)
 app.state.agent_provisioning = _AGENT_PROVISIONING
 _OPENCODE_ADAPTER = OpenCodeAgentAdapter(PROJECT_ROOT, app.state.ripple.private, _agent_runtime_env, tool_token=_AGENT_TOOL_TOKEN)
@@ -1047,7 +1049,7 @@ def _ripple_agent_system(persona: str | None) -> str:
     return (
         "你是 Ripple Agent，是 Ripple 内容工作台的自然语言控制层。"
         "你可以讨论选题和创作，并通过可用的 ripple_* 工具读取热点/选题/画像、小红书推荐流/搜索/作品/评论，查询媒体生成能力、生成图片/视频、创建或更新内容主稿、发布任务草稿或平台互动草稿；五类已迁移高频技能统一通过 ripple_operation 返回结构化分析或预览。"
-        "如果用户消息包含 Ripple 当前内容上下文（content_id/version_id），把它当作正在讨论的既有主稿；除非用户明确要求另建内容，否则不要创建重复内容。用户要求修改标题、正文、话题或素材时，直接用 ripple_content_draft 写回同一 content_id，并带 expected_version 做版本化更新。若先生成了图片/视频，需要把生成结果 path 与当前 media 合并后一起写回；每次更新后继续使用工具返回的新 version_id。"
+        "如果用户消息包含 Ripple 当前内容上下文（content_id/version_id），把它当作正在讨论的既有主稿；除非用户明确要求另建内容，否则不要创建重复内容。用户要求修改标题、正文、话题或素材时，调用 ripple_content_draft 提交对同一 content_id 的修改建议，必须带 expected_version；建议不会立即改动主稿，用户可在界面预览后应用。若先生成了图片/视频，需要把生成结果 path 与当前 media 合并写入建议。"
         "从当前主稿衍生文件产物时，应让产物契约保留该 content_id 和对应 version_id（manifest 字段 content_id/source_version_id），使素材与成品能归档回同一份 Mother；没有可靠 ID 时不要按标题猜测归属。"
         "发布任务草稿和互动草稿都不等于审核、上传、回复、删除或公开发布；真实外部写操作必须留给 Ripple 工作台的用户确认，绝不声称草稿已执行。"
         "不要尝试 shell、文件编辑、网页登录、验证码或任何未提供的工具。"
@@ -1496,8 +1498,7 @@ def _agent_runtime_selectable(runtime_id: str) -> tuple[bool, dict, dict, dict]:
     return selectable, detected, status, capabilities
 
 
-@app.get("/api/agent/runtimes")
-async def api_agent_runtimes():
+def _agent_runtimes_payload() -> dict:
     profile_state = _AGENT_PROFILES.state(scan_if_empty=False)
     profiles = {
         str(row.get("runtime_id")): row for row in profile_state.get("profiles", [])
@@ -1560,6 +1561,13 @@ async def api_agent_runtimes():
     return {"default_runtime": default_runtime, "items": items}
 
 
+@app.get("/api/agent/runtimes")
+async def api_agent_runtimes():
+    # Local runtime detection can be slow; keep it off the event loop so unrelated
+    # page-data responses can complete immediately.
+    return await asyncio.to_thread(_agent_runtimes_payload)
+
+
 @app.post("/api/agent/runtimes/{runtime_id}/adapters/{adapter_id}/actions")
 async def api_agent_adapter_action(runtime_id: str, adapter_id: str, req: AgentAdapterActionInput):
     """Run one server-declared action for a detected Agent's trusted adapter option."""
@@ -1585,22 +1593,31 @@ async def api_agent_adapter_action(runtime_id: str, adapter_id: str, req: AgentA
         raise HTTPException(exc.status, str(exc)) from exc
 
 
+def _agent_capabilities_http_payload() -> dict:
+    model = _model_config_status()
+    return {**_agent_capability_payload(), "models": model["models"], "default_model": model["default_model"]}
+
+
 @app.get("/api/agent/capabilities")
 async def api_agent_capabilities():
-    return {**_agent_capability_payload(), "models": _model_config_status()["models"], "default_model": _model_config_status()["default_model"]}
+    return await asyncio.to_thread(_agent_capabilities_http_payload)
 
 
 def _public_agent_session_config(value: dict) -> dict:
     return {k: v for k, v in value.items() if k != "enabled_tools"}
 
 
+def _agent_session_config_payload(session_id: str) -> dict:
+    return _public_agent_session_config(_AGENT_CAPABILITIES.get_session(
+        session_id, _AGENT_CAPABILITIES.model_state(_model_config_status()["default_model"]), get_skills(),
+        **_agent_session_registry_args(),
+    ))
+
+
 @app.get("/api/agent/sessions/{session_id}/config")
 async def api_agent_session_config(session_id: str):
     try:
-        return _public_agent_session_config(_AGENT_CAPABILITIES.get_session(
-            session_id, _AGENT_CAPABILITIES.model_state(_model_config_status()["default_model"]), get_skills(),
-            **_agent_session_registry_args(),
-        ))
+        return await asyncio.to_thread(_agent_session_config_payload, session_id)
     except WorkflowError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
 
@@ -1662,9 +1679,13 @@ async def api_agent_profile_acknowledge(profile_id: str):
         raise HTTPException(exc.status, str(exc)) from exc
 
 
+def _agent_extensions_payload() -> dict:
+    return {**_AGENT_CAPABILITIES.extensions_state(), "plugins": list(_agent_capability_payload()["plugins"])}
+
+
 @app.get("/api/agent/extensions")
 async def api_agent_extensions():
-    return {**_AGENT_CAPABILITIES.extensions_state(), "plugins": list(_agent_capability_payload()["plugins"])}
+    return await asyncio.to_thread(_agent_extensions_payload)
 
 
 @app.put("/api/agent/extensions")
@@ -2655,12 +2676,15 @@ async def api_chat_job_stream(turn_id: str, after: int = 0):
                 idle_since = time.monotonic()
                 for event in batch:
                     cursor = int(event["id"])
+                    kind = event.get("event") or event.get("type")
+                    data = event.get("data") if "event" in event else (
+                        {"sessionKey": event.get("sessionKey")} if kind == "done" else event.get("text", ""))
                     yield {
                         "id": str(cursor),
-                        "event": event["event"],
-                        "data": json.dumps(event.get("data"), ensure_ascii=False),
+                        "event": kind,
+                        "data": json.dumps(data, ensure_ascii=False),
                     }
-                    if event["event"] in ("done", "error"):
+                    if kind in ("done", "error"):
                         return
             else:
                 # Keep proxy connections active; reconnecting remains safe if it still drops.
@@ -2713,9 +2737,17 @@ async def api_chat_stream_agent(req: ChatRequest):
     loop = asyncio.get_running_loop()
     event_seq = 0
     artifacts: list[dict[str, Any]] = []
+    media_tasks: dict[str, dict[str, Any]] = {}
 
     def to_client(kind: str, text: str = "", **extra) -> None:
         nonlocal event_seq
+        if kind == "media":
+            try:
+                value = json.loads(text)
+                if isinstance(value, dict) and value.get("tool") == "ripple_generate_image" and value.get("id"):
+                    media_tasks[str(value["id"])] = value
+            except (TypeError, ValueError):
+                pass
         event_seq += 1
         payload = {"id": event_seq, "type": kind, "text": text, **extra}
         try:
@@ -2725,6 +2757,16 @@ async def api_chat_stream_agent(req: ChatRequest):
         except OSError:
             pass
         queue.put_nowait(payload)
+
+    def finish_media_tasks() -> list[dict[str, Any]]:
+        # 对话结束不等于图片成功，保留没有收到工具结果的任务。
+        for identity, value in list(media_tasks.items()):
+            if value.get("status") in {"pending", "running"}:
+                row = {**value, "status": "interrupted", "finished_at": int(time.time() * 1000),
+                       "error": "本轮对话已结束，但图片工具没有返回完成结果。"}
+                media_tasks[identity] = row
+                to_client("media", json.dumps(row, ensure_ascii=False))
+        return list(media_tasks.values())
 
     async def supervisor() -> None:
         xlock = _CrossProcLock(sk)
@@ -2781,21 +2823,21 @@ async def api_chat_stream_agent(req: ChatRequest):
                 await asyncio.sleep(0)
                 if sk in _STOPPED_CHAT:
                     _STOPPED_CHAT.discard(sk)
-                    _save_turn(pk, "done", text, {"turn_id": turn_id, "sessionKey": remote_session, "stopped": True, "runtime": runtime_id, "artifacts": artifacts})
+                    _save_turn(pk, "done", text, {"turn_id": turn_id, "sessionKey": remote_session, "stopped": True, "runtime": runtime_id, "artifacts": artifacts, "mediaTasks": finish_media_tasks()})
                 else:
-                    _save_turn(pk, "done", text, {"turn_id": turn_id, "sessionKey": remote_session, "runtime": runtime_id, "artifacts": artifacts})
+                    _save_turn(pk, "done", text, {"turn_id": turn_id, "sessionKey": remote_session, "runtime": runtime_id, "artifacts": artifacts, "mediaTasks": finish_media_tasks()})
                 to_client("done", sessionKey=remote_session)
         except AgentRuntimeError as exc:
             if sk in _STOPPED_CHAT:
                 _STOPPED_CHAT.discard(sk)
-                _save_turn(pk, "done", "", {"turn_id": turn_id, "sessionKey": remote_session, "stopped": True, "runtime": runtime_id, "artifacts": artifacts})
+                _save_turn(pk, "done", "", {"turn_id": turn_id, "sessionKey": remote_session, "stopped": True, "runtime": runtime_id, "artifacts": artifacts, "mediaTasks": finish_media_tasks()})
                 to_client("done", sessionKey=remote_session)
             else:
-                _save_turn(pk, "done", "", {"turn_id": turn_id, "error": str(exc), "runtime": runtime_id, "artifacts": artifacts})
+                _save_turn(pk, "done", "", {"turn_id": turn_id, "error": str(exc), "runtime": runtime_id, "artifacts": artifacts, "mediaTasks": finish_media_tasks()})
                 to_client("error", str(exc))
                 to_client("done", sessionKey=remote_session)
         except Exception:
-            _save_turn(pk, "done", "", {"turn_id": turn_id, "error": "Ripple Agent 执行失败", "runtime": runtime_id, "artifacts": artifacts})
+            _save_turn(pk, "done", "", {"turn_id": turn_id, "error": "Ripple Agent 执行失败", "runtime": runtime_id, "artifacts": artifacts, "mediaTasks": finish_media_tasks()})
             to_client("error", "Ripple Agent 执行失败，请检查本地 Runtime。")
             to_client("done", sessionKey=remote_session)
         finally:
@@ -2818,7 +2860,7 @@ async def api_chat_stream_agent(req: ChatRequest):
             if item is done_marker:
                 break
             kind = item["type"]
-            if kind in {"token", "thinking", "activity", "artifact", "error"}:
+            if kind in {"token", "thinking", "activity", "artifact", "media", "error"}:
                 yield {"id": str(item["id"]), "event": kind, "data": json.dumps(item.get("text", ""), ensure_ascii=False)}
             elif kind == "done":
                 yield {"id": str(item["id"]), "event": "done", "data": json.dumps({"sessionKey": item.get("sessionKey")}, ensure_ascii=False)}
@@ -4177,14 +4219,15 @@ async def agent_tool_content_draft(req: AgentContentDraftRequest, request: Reque
         if not req.expected_version:
             raise HTTPException(422, "更新内容需要 expected_version")
         current = app.state.ripple.library.get(req.content_id)
-        item = app.state.ripple.library.revise(req.content_id, MotherRevision(
+        proposal = app.state.ripple.library.propose(req.content_id, MotherRevision(
             title=current["content"]["title"] if req.title is None else req.title,
             body=current["content"].get("body", "") if req.body is None else req.body,
             tags=current["content"].get("tags", "") if req.tags is None else req.tags,
             media=current["content"].get("media", []) if req.media is None else req.media,
             project_id=current["content"].get("project_id", "local"), expected_version=req.expected_version,
-        ))
-        updated = True
+        ), req.idempotency_key)
+        return {"kind": "content_draft", "id": proposal["content_id"], "version_id": proposal["base_version_id"],
+                "title": proposal["after"]["title"], "status": "proposal", "proposal_id": proposal["id"], "updated": False}
     else:
         if req.expected_version:
             raise HTTPException(422, "新建内容不能携带 expected_version")
@@ -4507,10 +4550,33 @@ def _campaign_local_priority(item: dict) -> tuple[int, int]:
     return score, int(item.get("updated_at") or 0)
 
 
+def _campaign_search_normalize(value: str) -> str:
+    import unicodedata
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _campaign_matches_search(item: dict, terms: list[str]) -> bool:
+    if not terms:
+        return True
+    # Only displayed activity information; never internal IDs or raw evidence.
+    fields = ("title", "organizer", "summary", "activity_type", "reward_type", "reward_summary",
+              "required_topics", "content_requirements", "eligibility", "prizes",
+              "winning_conditions", "reward_rules")
+    parts = []
+    for field in fields:
+        value = item.get(field)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            parts.extend(part for part in value if isinstance(part, str))
+    text = _campaign_search_normalize(" ".join(parts))
+    return all(term in text for term in terms)
+
+
 def _campaign_page_result(*, platform: str = "all", account_id: str = "", sort: str = "recommend",
                           page: int = 1, activity_type: str = "all", reward_type: str = "all",
                           deadline: str = "all", qualification: str = "all",
-                          snapshot_id: str = "") -> dict[str, Any]:
+                          snapshot_id: str = "", q: str = "") -> dict[str, Any]:
     allowed_platforms = {"all", *CAMPAIGN_PLATFORM_LABELS.keys()}
     if platform not in allowed_platforms:
         raise WorkflowError("不支持的活动平台筛选。", 422)
@@ -4520,6 +4586,10 @@ def _campaign_page_result(*, platform: str = "all", account_id: str = "", sort: 
         raise WorkflowError("不支持的资格状态筛选。", 422)
     if len(account_id) > 80 or len(snapshot_id) > 80:
         raise WorkflowError("活动分页参数过长。", 422)
+    if len(q) > 120:
+        raise WorkflowError("活动搜索关键词不能超过 120 个字符。", 422)
+    query = _campaign_search_normalize(q)
+    search_terms = query.split()
     page = max(1, min(int(page or 1), 100000))
     page_size = 10
 
@@ -4576,7 +4646,7 @@ def _campaign_page_result(*, platform: str = "all", account_id: str = "", sort: 
 
     rows = [
         row for row in rows
-        if _campaign_page_filter(
+        if _campaign_matches_search(row, search_terms) and _campaign_page_filter(
             row, activity_type=activity_type, reward_type=reward_type,
             deadline=deadline, qualification=qualification,
             account_id=selected_account_id if account_id else "",
@@ -4608,6 +4678,7 @@ def _campaign_page_result(*, platform: str = "all", account_id: str = "", sort: 
         "total_pages": total_pages,
         "range_start": range_start,
         "range_end": range_end,
+        "query": query,
         "sort": sort,
         "platform": platform,
         "account_id": selected_account_id,
@@ -5399,8 +5470,9 @@ app.state.campaign_scheduler_tick = _campaign_scheduler_tick
 
 @app.get("/api/campaigns/sources")
 async def api_campaign_sources():
-    _ensure_ai_provider_migration()
-    return _CAMPAIGN_SOURCES.public_state()
+    # Source/account inspection must not block independent activity-list requests.
+    await asyncio.to_thread(_ensure_ai_provider_migration)
+    return await asyncio.to_thread(_CAMPAIGN_SOURCES.public_state)
 
 
 @app.put("/api/campaigns/sources/{platform}")
@@ -5546,13 +5618,14 @@ async def api_campaign_list():
 async def api_campaign_page(
     platform: str = "all", account_id: str = "", sort: str = "recommend", page: int = 1,
     activity_type: str = "all", reward_type: str = "all", deadline: str = "all",
-    qualification: str = "all", snapshot_id: str = "",
+    qualification: str = "all", snapshot_id: str = "", q: str = "",
 ):
     try:
-        return _campaign_page_result(
+        return await asyncio.to_thread(
+            _campaign_page_result,
             platform=platform, account_id=account_id, sort=sort, page=page,
             activity_type=activity_type, reward_type=reward_type,
-            deadline=deadline, qualification=qualification, snapshot_id=snapshot_id,
+            deadline=deadline, qualification=qualification, snapshot_id=snapshot_id, q=q,
         )
     except WorkflowError as exc:
         raise HTTPException(exc.status, str(exc)) from exc
@@ -5764,7 +5837,10 @@ class IdeaBriefConfirm(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
-class IdeaStartContentInput(IdeaBriefConfirm):
+class IdeaStartContentInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(default=0, ge=0)
+    manual: bool = False
     idempotency_key: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
 
 
@@ -6097,11 +6173,13 @@ async def _run_idea_job(run_id: str) -> None:
             if _IDEATION.run_cancelled(run_id):
                 return
             _IDEATION.set_run(run_id, stage="校验来源与约束")
+            diagnostics = {}
             recommendations = parse_idea_candidates(
                 raw, int(request.get("limit") or 6), existing,
                 allowed_source_refs={source["id"] for source in sources}, target_platforms=targets,
                 source_title_refs={source["title"]: source["id"] for source in sources if source["kind"] == "trend"},
                 campaign_by_ref=campaign_by_ref,
+                diagnostics=diagnostics,
             )
             origin = str(request.get("origin") or "manual")
             if origin == "automatic":
@@ -6117,7 +6195,14 @@ async def _run_idea_job(run_id: str) -> None:
                     })
                     return
             elif not recommendations:
-                raise WorkflowError("Agent 没有返回通过结构、来源和去重校验的选题。", 502)
+                raise WorkflowError(candidate_failure_message(diagnostics), 502)
+            # 用户约束由应用保存，不能依赖模型自行转述后再传入策划。
+            constraints = []
+            for field in ("goal", "instruction"):
+                value = str(request.get(field) or "").strip()
+                constraints.extend(value[index:index + 500] for index in range(0, len(value), 500))
+            for recommendation in recommendations:
+                recommendation["requirements"] = list(dict.fromkeys([*constraints, *recommendation.get("requirements", [])]))[:30]
             created = _IDEATION.store_candidates(
                 run_id, request["persona"], [{
                     **value, "source": f"Agent 推荐 · {request['persona']}", "status": "pending",
@@ -6558,7 +6643,7 @@ async def api_idea_start_content(iid: str, req: IdeaStartContentInput):
     try:
         idea = _IDEATION.get_idea(iid)
         brief = idea.get("brief")
-        if not brief or brief.get("status") != "confirmed" or int(brief.get("revision") or 0) != req.expected_revision:
+        if not req.manual and (not brief or brief.get("status") != "confirmed" or int(brief.get("revision") or 0) != req.expected_revision):
             raise IdeationError("请先确认当前策划版本，再进入内容制作。", 409)
         if idea.get("content_id"):
             try:
@@ -6566,7 +6651,7 @@ async def api_idea_start_content(iid: str, req: IdeaStartContentInput):
             except WorkflowError:
                 pass
         content = _RIPPLE_WORKSPACE.library.create(MotherCreate(
-            title=idea["title"], body="", media=[], tags="", project_id="local", idempotency_key=req.idempotency_key,
+            title=idea["title"][:200], body=(idea.get("note") or "") if req.manual else "", media=[], tags="", project_id="local", idempotency_key=req.idempotency_key,
         ))
         updated = _IDEATION.attach_content(iid, content["id"])
         if updated.get("plan_id"):

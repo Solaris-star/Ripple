@@ -104,16 +104,48 @@ def test_native_publisher_receives_literal_approved_content(native,platform):
     assert marker['task_id']==p['task_id'] and marker['version_id']==p['version_id']
 
 
+def test_native_publish_receipt_requires_matching_operation_and_account(native):
+    p=payload(native,'xiaohongshu')
+    module=native.modules[NATIVE['xiaohongshu']['module']]
+    def publish(a):
+        Path(a.receipt_file).write_text(json.dumps({
+            'operation_id':a.operation_id,'remote_id':'6ab8f2d4000000000a02053b',
+            'account_remote_id':a.account_remote_id,'evidence':'platform_create_response',
+        }),encoding='utf-8')
+        return 0
+    native.monkeypatch.setattr(module,'cmd_publish',publish)
+    result=worker.execute(p)
+    assert result['state']=='accepted'
+    assert result['remote_id']=='6ab8f2d4000000000a02053b'
+    assert result['account_remote_id']=='fixture-user'
+
+    other=payload(native,'xiaohongshu')
+    def wrong_account(a):
+        Path(a.receipt_file).write_text(json.dumps({
+            'operation_id':a.operation_id,'remote_id':'6ab8f2d4000000000a02053b',
+            'account_remote_id':'different-user',
+        }),encoding='utf-8')
+        return 0
+    native.monkeypatch.setattr(module,'cmd_publish',wrong_account)
+    rejected=worker.execute(other)
+    assert rejected['state']=='accepted'
+    assert 'remote_id' not in rejected
+
+
 def test_biliup_command_uses_account_cookie_and_literal_argv(native):
     invocations=[]
     native.monkeypatch.setattr(worker,'biliup_binary',lambda:native.root/'biliup.exe')
     native.monkeypatch.setattr(worker.subprocess,'run',lambda argv,**kw:invocations.append((argv,kw)) or SimpleNamespace(returncode=0))
     p=payload(native,'bilibili',media=True)
+    p['content']['options'] = {'bilibili_tid': 201, 'bilibili_copyright': 2, 'bilibili_source': '原作者；不是命令'}
     assert worker.execute(p)['state']=='accepted'
     argv,opts=invocations[0]
     assert argv[1:4]==['-u',str(Path(p['private_dir'])/'cookies.json'),'upload']
     assert argv[4]==p['media_paths'][0]
     assert argv[argv.index('--title')+1]==p['content']['title']
+    assert argv[argv.index('--tid')+1] == '201'
+    assert argv[argv.index('--copyright')+1] == '2'
+    assert argv[argv.index('--source')+1] == '原作者；不是命令'
     assert not opts.get('shell')
     assert opts['stdout'] is subprocess.DEVNULL and opts['stderr'] is subprocess.DEVNULL
 

@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import time
 import uuid
+from urllib.parse import urlsplit
 
 import content_guard
 import login_state
@@ -24,6 +25,12 @@ PROFILE_NAME = "XProfile"
 MAX_IMAGES = 4
 SUPPORTED_IMAGES = {".png", ".jpg", ".jpeg", ".webp"}
 LAUNCH_ARGS = ["--no-first-run", "--no-default-browser-check"]
+
+
+def run_interactions(options, action: str, params: dict) -> dict:
+    from ripple.x_interactions_browser import run
+    import sys
+    return run(sys.modules[__name__], options, action, params)
 
 
 def _profile(a) -> Path:
@@ -117,6 +124,16 @@ def identity_from_page(page) -> dict:
     return {"loggedIn": False, "name": "", "uid": ""}
 
 
+def _wait_identity(page) -> dict:
+    result = {"loggedIn": False, "name": "", "uid": ""}
+    for _ in range(30):
+        result = identity_from_page(page)
+        if result.get("loggedIn"):
+            return result
+        page.wait_for_timeout(350)
+    return result
+
+
 def _launch(a, *, headed: bool):
     from playwright.sync_api import sync_playwright
     manager = sync_playwright().start()
@@ -179,8 +196,7 @@ def cmd_whoami(a) -> int:
     try:
         manager, context, page = _launch(a, headed=False)
         page.goto(X_HOME, wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_timeout(1200)
-        result = identity_from_page(page)
+        result = _wait_identity(page)
     except Exception:
         result["error"] = "x_browser_probe_failed"
     finally:
@@ -212,10 +228,16 @@ def _atomic_submission(a) -> None:
 
 
 def _fill_composer(page, text: str) -> None:
-    composer = _first_visible(page, [
-        '[data-testid="tweetTextarea_0"]',
-        'div[role="textbox"][contenteditable="true"]',
-    ])
+    composer = None
+    for _ in range(18):
+        composer = _first_visible(page, [
+            '[role="dialog"][aria-modal="true"] [data-testid="tweetTextarea_0"]',
+            '[data-testid="tweetTextarea_0"]',
+            'div[role="textbox"][contenteditable="true"]',
+        ])
+        if composer is not None:
+            break
+        page.wait_for_timeout(350)
     if composer is None:
         raise RuntimeError("X composer not found")
     composer.click()
@@ -242,11 +264,17 @@ def _upload_images(page, paths: list[str]) -> None:
         if path.suffix.lower() not in SUPPORTED_IMAGES or not path.is_file():
             raise RuntimeError("unsupported X image")
         files.append(str(path))
-    picker = _first_visible(page, [
-        'input[data-testid="fileInput"]',
-        'input[type="file"][accept*="image"]',
-        'input[type="file"]',
-    ])
+    picker = None
+    for _ in range(18):
+        picker = _first_visible(page, [
+            '[role="dialog"][aria-modal="true"] input[data-testid="fileInput"]',
+            'input[data-testid="fileInput"]',
+            'input[type="file"][accept*="image"]',
+            'input[type="file"]',
+        ])
+        if picker is not None:
+            break
+        page.wait_for_timeout(350)
     if picker is None:
         raise RuntimeError("X image picker not found")
     picker.set_input_files(files)
@@ -306,8 +334,10 @@ def cmd_publish(a) -> int:
     text = (getattr(a, "desc", None) or getattr(a, "content", None) or "").strip()
     if not text:
         raise RuntimeError("X 正文不能为空")
-    if len(text) > 280:
-        raise RuntimeError("X 浏览器模式首版正文限制 280 字符")
+    from ripple.x_text import count_reply
+    count = count_reply(text)
+    if not count["valid"]:
+        raise RuntimeError(f"X 浏览器模式正文最多 280 加权字符；当前为 {count['weighted_length']}")
     if getattr(a, "tags", ""):
         raise RuntimeError("X 话题需直接写入正文")
     content_guard.guard_or_die([text], exec_mode=True,
@@ -315,16 +345,80 @@ def cmd_publish(a) -> int:
                                label="X 浏览器发布内容")
     images = list(getattr(a, "image_paths", None) or [])
     manager, context, page = _launch(a, headed=bool(getattr(a, "headed", True)))
+    receipts = []
+    mutation_responses = []
+    submitting = False
+    expected_handle = ""
+    def capture(response):
+        if not submitting:
+            return
+        try:
+            url = urlsplit(response.url)
+            if url.hostname not in {"x.com", "www.x.com"} or response.request.method != "POST":
+                return
+            request = response.request.post_data_json
+            variables = request.get("variables", {}) if isinstance(request, dict) else {}
+            if "/graphql/" in url.path and len(mutation_responses) < 10:
+                payload = response.json() if response.status == 200 else {}
+                mutation_responses.append({"operation": url.path.rsplit("/", 1)[-1],
+                                           "status": response.status, "response": payload})
+                receipt_file = Path(getattr(a, "receipt_file", ""))
+                if receipt_file.name:
+                    raw = json.dumps(mutation_responses, ensure_ascii=False)
+                    if len(raw.encode("utf-8")) <= 1024 * 1024:
+                        receipt_file.with_name("platform-write-responses.json").write_text(raw, encoding="utf-8")
+            if not url.path.endswith("/CreateTweet") or response.status != 200:
+                return
+            if variables.get("tweet_text") != text:
+                return
+            payload = response.json()
+            if payload.get("errors"):
+                return
+            receipt_file = Path(getattr(a, "receipt_file", ""))
+            if receipt_file.name:
+                try:
+                    raw = json.dumps(payload, ensure_ascii=False)
+                    if len(raw.encode("utf-8")) <= 1024 * 1024:
+                        receipt_file.with_name("platform-create-response.json").write_text(raw, encoding="utf-8")
+                except (OSError, ValueError):
+                    pass
+            from ripple.x_interactions_browser import extract_posts
+            handle = expected_handle
+            matches = [post for post in extract_posts(payload).values() if post["author"] == handle and post["content"] == text]
+            if len(matches) == 1:
+                receipts.append({"remote_id": matches[0]["id"], "account_remote_id": "x-web:" + handle,
+                                 "public_url": matches[0]["url"], "evidence": "platform_create_response"})
+        except Exception:
+            pass
+    page.on("response", capture)
     try:
         page.goto(X_COMPOSE, wait_until="domcontentloaded", timeout=45_000)
-        page.wait_for_timeout(1200)
-        identity = identity_from_page(page)
+        identity = _wait_identity(page)
         if not identity["loggedIn"]:
             raise RuntimeError("X 登录态已失效")
+        if getattr(a, "account_remote_id", "") and identity.get("uid") != a.account_remote_id:
+            raise RuntimeError("X 浏览器账号与所选账号不一致")
+        expected_handle = str(identity.get("uid") or "").removeprefix("x-web:")
         _fill_composer(page, text)
         _upload_images(page, images)
+        submitting = True
         if not submit_prepared_post(page, a):
             raise RuntimeError("X 点击发布后没有获得可确认的页面信号")
+        page.wait_for_timeout(800)
+        if receipts:
+            receipt_file = Path(getattr(a, "receipt_file", ""))
+            if receipt_file.name:
+                receipt_file.write_text(json.dumps({**receipts[0], "operation_id": getattr(a, "operation_id", "")}, ensure_ascii=False), encoding="utf-8")
         return 0
+    except Exception as exc:
+        receipt_file = Path(getattr(a, "receipt_file", ""))
+        if receipt_file.name:
+            try:
+                receipt_file.with_name("pre-submit-error.json").write_text(
+                    json.dumps({"type": type(exc).__name__, "message": str(exc)[:300]}, ensure_ascii=False),
+                    encoding="utf-8")
+            except OSError:
+                pass
+        raise
     finally:
         _safe_close(manager, context)

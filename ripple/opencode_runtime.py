@@ -7,6 +7,7 @@ is loopback-only and receives only a narrow environment with a private config.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import mimetypes
 import os
@@ -26,6 +27,7 @@ from typing import Callable
 from .agent_capabilities import GENERIC_DENY, INTERNAL_TOOLS
 from .agent_runtime import AgentRuntimeError
 from .agent_runtime import AgentToolBridgeConfig
+from .media_events import MediaTaskTracker
 
 
 class OpenCodeError(AgentRuntimeError):
@@ -219,7 +221,7 @@ class OpenCodeAgentAdapter:
                     "models": {item: {"name": item} for item in settings.get("models", [model])},
                 }
             },
-            "instructions": [str(instructions)],
+            "instructions": [str(instructions), "{env:RIPPLE_TOOL_BINDING_FILE}"],
             "permission": {"*": "deny", "ripple_*": "allow"},
             "tools": {
                 "bash": False, "edit": False, "write": False, "read": False, "grep": False,
@@ -228,6 +230,21 @@ class OpenCodeAgentAdapter:
             },
         }
         _atomic_json(self.config_path, config)
+
+    def _tool_binding_path(self, tool_base: str) -> Path:
+        # 仅将摘要放进进程配置，用于核对其启动时继承的凭据和回调地址。
+        binding = json.dumps([str(self.private_dir), self.tool_token, tool_base.rstrip("/")])
+        digest = hashlib.sha256(binding.encode("utf-8")).hexdigest()
+        return self.private_dir / "tool-bindings" / f"{digest}.md"
+
+    def _validate_running(self, settings: dict[str, str], tool_base: str) -> None:
+        config = self._request("/config", timeout=3, settings=settings)
+        instructions = str((self.workspace_dir / "RIPPLE_AGENT.md").resolve())
+        if (not isinstance(config, dict) or config.get("model") != f"ripple/{settings['model']}"
+                or instructions not in (config.get("instructions") or [])):
+            raise OpenCodeError("OpenCode 端口已被其他配置占用，请调整 RIPPLE_OPENCODE_PORT。", 409)
+        if self._tool_binding_path(tool_base).as_posix() not in config.get("instructions", []):
+            raise OpenCodeError("OpenCode 的工具连接已过期，请重启 Ripple 管理的 OpenCode 和 Ripple 服务后重试。", 409)
 
     def _process_env(self, settings: dict[str, str], tool_base: str) -> dict[str, str]:
         keep = {"SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROFILE",
@@ -240,6 +257,8 @@ class OpenCodeAgentAdapter:
             "RIPPLE_LLM_MODELS": ",".join(settings.get("models", [settings["model"]])),
             "RIPPLE_AGENT_TOOL_TOKEN": self.tool_token,
             "RIPPLE_TOOL_BASE": tool_base.rstrip("/"),
+            # OpenCode 直接将环境变量替换进 JSON，Windows 路径必须使用正斜杠。
+            "RIPPLE_TOOL_BINDING_FILE": self._tool_binding_path(tool_base).as_posix(),
             "OPENCODE_CONFIG": str(self.config_path),
             "OPENCODE_DISABLE_AUTOUPDATE": "1",
             "OPENCODE_DISABLE_DEFAULT_PLUGINS": "1",
@@ -251,12 +270,12 @@ class OpenCodeAgentAdapter:
         with self._lock:
             healthy = self._health(settings)
             if healthy:
-                # Never silently attach to an unrelated server on the chosen port.
-                config = self._request("/config", timeout=3, settings=settings)
-                if not isinstance(config, dict) or config.get("model") != f"ripple/{settings['model']}":
-                    raise OpenCodeError("OpenCode 端口已被其他配置占用，请调整 RIPPLE_OPENCODE_PORT。", 409)
+                self._validate_running(settings, tool_base)
                 return {"healthy": True, "version": healthy.get("version", ""), "model": settings["model"], "port": int(settings["port"])}
             self._write_config(settings)
+            binding_path = self._tool_binding_path(tool_base)
+            binding_path.parent.mkdir(parents=True, exist_ok=True)
+            binding_path.write_text("<!-- Ripple 工具连接标记，无模型指令。 -->\n", encoding="utf-8")
             executable = self._binary()
             try:
                 self.private_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +296,11 @@ class OpenCodeAgentAdapter:
                     raise OpenCodeError("OpenCode Runtime 启动后立即退出。")
                 healthy = self._health(settings)
                 if healthy:
+                    try:
+                        self._validate_running(settings, tool_base)
+                    except OpenCodeError:
+                        self.close()
+                        raise
                     return {"healthy": True, "version": healthy.get("version", ""), "model": settings["model"], "port": int(settings["port"])}
                 time.sleep(.2)
             self.close()
@@ -294,6 +318,11 @@ class OpenCodeAgentAdapter:
             except OpenCodeError as exc:
                 return {"configured": True, "healthy": False, "detail": str(exc), "runtime": self.runtime_id, "model": settings["model"]}
         health = self._health(settings)
+        if health:
+            try:
+                self._validate_running(settings, tool_base)
+            except OpenCodeError as exc:
+                return {"configured": True, "healthy": False, "detail": str(exc), "runtime": self.runtime_id, "model": settings["model"]}
         return {"configured": True, "healthy": bool(health), "runtime": self.runtime_id,
                 "version": (health or {}).get("version", ""), "model": settings["model"], "port": int(settings["port"])}
 
@@ -364,12 +393,16 @@ class OpenCodeAgentAdapter:
         version_id = str(raw.get("version_id") or "")
         if not re.fullmatch(r"[a-f0-9]{32}", content_id) or not re.fullmatch(r"[a-f0-9]{64}", version_id):
             return None
+        proposal_id = str(raw.get("proposal_id") or "")
+        if proposal_id and not re.fullmatch(r"[a-f0-9]{32}", proposal_id):
+            return None
         return {
             "kind": "content_draft",
             "id": content_id,
             "version_id": version_id,
             "title": str(raw.get("title") or "")[:200],
-            "status": "draft",
+            "status": "proposal" if proposal_id else "draft",
+            **({"proposal_id": proposal_id} if proposal_id else {}),
         }
 
     @staticmethod
@@ -462,6 +495,7 @@ class OpenCodeAgentAdapter:
             emitted_reasoning = ""
             seen_activities: set[str] = set()
             seen_artifacts: set[str] = set()
+            media_tasks = MediaTaskTracker()
             assistant_id = ""
             last_change = time.monotonic()
             while time.monotonic() - started < timeout:
@@ -476,6 +510,17 @@ class OpenCodeAgentAdapter:
                     message_id = str(info.get("id") or "")
                     if message_id and message_id not in before_ids:
                         candidates.append(row)
+                tools_pending = False
+                for candidate in candidates:
+                    for index, part in enumerate(candidate.get("parts") or []):
+                        if not isinstance(part, dict) or part.get("type") != "tool":
+                            continue
+                        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                        status = str(state.get("status") or "running")
+                        tools_pending = tools_pending or status in {"pending", "running"}
+                        identity = str(part.get("callID") or part.get("id") or f"{(candidate.get('info') or {}).get('id')}:{index}")
+                        media_tasks.update(identity, str(part.get("tool") or part.get("name") or ""), status,
+                                           state.get("output", state.get("result")), emit, error=state.get("error"))
                 if candidates:
                     row = candidates[-1]
                     text, reasoning, activities, artifacts, info = self._message_text(row)
@@ -505,10 +550,10 @@ class OpenCodeAgentAdapter:
                     if error:
                         raise OpenCodeError("模型或工具执行失败，请检查 Agent Runtime 状态。", 502)
                     completed = ((info or {}).get("time") or {}).get("completed")
-                    if completed:
+                    if completed and not tools_pending:
                         return emitted_text, session_id
                 # If a provider has no explicit completion timestamp, an idle session with visible output is terminal.
-                if emitted_text and time.monotonic() - last_change > 1.0:
+                if emitted_text and not tools_pending and time.monotonic() - last_change > 1.0:
                     try:
                         status = self._request("/session/status", timeout=3)
                         current = status.get(session_id) if isinstance(status, dict) else None

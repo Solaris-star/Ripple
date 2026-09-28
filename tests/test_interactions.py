@@ -76,6 +76,35 @@ def test_capabilities_expose_real_platforms_only_and_fail_closed(tmp_path):
     assert "互动能力尚未接入" in rows["zhihu"]["note"]
 
 
+def test_connected_account_without_identity_requires_verification_before_remote_reads(tmp_path, monkeypatch):
+    service, account_id = service_with_account(tmp_path, connected=True)
+    with service.store.transaction() as state:
+        state['accounts'][account_id]['identity'] = None
+    calls = []
+    monkeypatch.setattr(service.xhs_ops, 'notes', lambda *a, **kw: calls.append(a))
+    cap = next(row for row in service.interactions.capabilities()['items'] if row['platform'] == 'xiaohongshu')['accounts'][0]
+    assert cap['availability'] == 'needs_verification'
+    assert cap['read_comments'] is False and cap['reply'] is False
+    with pytest.raises(WorkflowError, match='校验账号身份'):
+        service.interactions.remote_contents(account_id)
+    source = seed_remote_source(service, account_id)
+    seed_xhs_locator(service, account_id)
+    draft = service.interactions.create_draft(platform='xiaohongshu', source_id=source['id'], kind='reply',
+        items=[{'id': 'c1', 'reply': '仍可保存的草稿'}], idempotency_key='missing-identity-draft')
+    with pytest.raises(WorkflowError, match='校验账号身份'):
+        service.interactions.execute(draft['id'], True, draft['updated_at'])
+    assert service.interactions._get_row(draft['id'])['attempts'] == 0
+    assert calls == []
+    service.close()
+
+
+def test_english_request_is_an_approximate_demand(tmp_path):
+    from ripple.interactions import _analyze
+    result = _analyze([{'id': 'english', 'content': 'Thanks! A short example would help.'}])
+    assert result['approximate'] is True
+    assert 'demand' in result['comment_labels']['english']
+
+
 def test_legacy_import_source_remains_readable_and_analyzable_only(tmp_path):
     service = WorkspaceService(tmp_path / "outputs", private=tmp_path / "private")
     source = seed_legacy_import_source(service)
@@ -120,7 +149,7 @@ def test_existing_local_import_draft_is_read_only_and_never_executable(tmp_path)
     with pytest.raises(WorkflowError, match="只读保留"):
         service.interactions.cancel_draft(row["id"], expected_updated_at=row["updated_at"])
     with pytest.raises(WorkflowError, match="只读保留"):
-        service.interactions.execute(row["id"], True)
+        service.interactions.execute(row["id"], True, row["updated_at"])
     assert service.interactions.list(platform="generic")["items"][0]["attempts"] == 0
 
 
@@ -166,7 +195,7 @@ def test_legacy_xhs_interactions_migrate_without_replay_and_remain_visible_disco
     assert row["platform"] == "xiaohongshu" and row["legacy_origin"] == "xhs_interactions"
     with service.store.transaction(write=False) as state:
         assert "legacy001" in state["xhs_interactions"] and "legacy001" in state["interactions"]
-    resolved = service.interactions.resolve_unknown("legacy001", result="not_submitted", confirmed=True)
+    resolved = service.interactions.resolve_unknown("legacy001", result="not_submitted", confirmed=True, item_id="c1", expected_updated_at=row["updated_at"])
     assert resolved["status"] == "not_submitted"
     assert service.accounts.delete(account_id, True)["deleted"] is True
 
@@ -194,13 +223,13 @@ def test_manual_unknown_resolution_records_source_and_unblocks_account_delete(tm
             "attempts": 1, "operation_id": "b" * 32, "result": None,
             "created_at": "2026-09-01T00:00:00+00:00", "updated_at": "2026-09-01T00:00:01+00:00",
         }}
-    with pytest.raises(WorkflowError, match="已经在对应平台人工检查"):
+    with pytest.raises(WorkflowError, match="逐条核对"):
         service.interactions.resolve_unknown("i2", result="not_submitted", confirmed=False)
     resolved = service.interactions.resolve_unknown(
-        "i2", result="not_submitted", confirmed=True, note="已在平台人工检查，没有看到该评论",
+        "i2", result="not_submitted", confirmed=True, item_id="comment", expected_updated_at="2026-09-01T00:00:01+00:00", note="已在平台人工检查，没有看到该评论",
     )
     assert resolved["status"] == "not_submitted"
-    assert resolved["resolution"]["source"] == "manual_platform_check"
+    assert resolved["item_results"][0]["resolution"]["source"] == "manual_platform_check"
     assert service.accounts.delete(account_id, True)["deleted"] is True
 
 
@@ -232,18 +261,21 @@ def test_xhs_unknown_is_not_replayed_and_refresh_is_not_platform_verify(tmp_path
         sends.append((operation, operation_id, extra.get("xhs_action")))
         return {"state": "unknown_result", "data": {"status": "unknown_result", "reason": ""}}
     monkeypatch.setattr(service.accounts, "run", uncertain)
-    first = service.interactions.execute(draft["id"], True)
-    second = service.interactions.execute(draft["id"], True)
+    first = service.interactions.execute(draft["id"], True, draft["updated_at"])
+    second = service.interactions.execute(draft["id"], True, draft["updated_at"])
     assert first["status"] == second["status"] == "unknown_result" and len(sends) == 1
     assert service.accounts.get(account_id)["operation"]["state"] == "recovery_required"
 
     monkeypatch.setattr(service.accounts, "read_result", lambda aid, oid: {
-        "state": "verified", "data": {"status": "verified", "reason": ""}, "operation_id": oid,
+        "state": "verified", "data": {"status": "verified", "reason": "", "evidence": {
+            "kind": "platform_receipt", "target_id": "note123", "target_comment_id": "",
+            "account_remote_id": "u1", "reply_id": "published-comment", "text": "测试评论",
+        }}, "operation_id": oid,
     })
     refreshed = service.interactions.refresh_result(draft["id"])
     assert refreshed["interaction"]["status"] == "verified"
     assert refreshed["platform_verified"] is False and refreshed["source"] == "local_worker"
-    assert "没有重新查询平台" in refreshed["note"]
+    assert "未重新查询平台" in refreshed["note"]
     assert service.accounts.get(account_id)["operation"] is None
     with pytest.raises(WorkflowError, match="主动远端复核尚未接入"):
         service.interactions.verify_platform(draft["id"])
@@ -270,7 +302,7 @@ def test_recovery_turns_dispatching_interaction_unknown_without_replay(tmp_path)
     row = service.interactions.list(account_id=account_id)["items"][0]
     assert row["status"] == "unknown_result" and row["attempts"] == 1
     assert service.accounts.get(account_id)["operation"]["state"] == "recovery_required"
-    assert service.interactions.resolve_unknown(interaction_id, result="not_submitted", confirmed=True)["status"] == "not_submitted"
+    assert service.interactions.resolve_unknown(interaction_id, result="not_submitted", confirmed=True, item_id="c1", expected_updated_at=row["updated_at"])["status"] == "not_submitted"
     assert service.accounts.get(account_id)["operation"] is None
 
 
@@ -283,14 +315,14 @@ def test_disconnected_xhs_can_keep_remote_draft_but_cannot_execute(tmp_path):
     )
     assert draft["status"] == "draft"
     with pytest.raises(WorkflowError, match="未连接"):
-        service.interactions.execute(draft["id"], True)
+        service.interactions.execute(draft["id"], True, draft["updated_at"])
     assert service.interactions.list(account_id=account_id)["items"][0]["attempts"] == 0
 
 
 def test_generic_api_has_no_import_route_and_old_xhs_routes_still_work(tmp_path, monkeypatch):
     app = FastAPI()
     service = install(app, tmp_path / "outputs", private=tmp_path / "private")
-    account = service.accounts.create(AccountInput(platform="xiaohongshu", label="API XHS", idempotency_key="api-interaction-account"))
+    account = service.accounts.create(AccountInput(platform="xiaohongshu", label="测试 XHS", idempotency_key="interaction-test-account-1"))
     with service.store.transaction() as state:
         state["accounts"][account["id"]].update(status="connected", identity={"logged_in": True, "name": "api", "remote_id": "u2"})
     seed_xhs_locator(service, account["id"])

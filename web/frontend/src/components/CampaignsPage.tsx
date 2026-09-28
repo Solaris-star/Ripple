@@ -3,7 +3,7 @@ import {
   cancelCampaignEnrichment, configureCampaignSource, createCampaign, createIdea, createSchedule, enrichCampaign,
   fetchCampaignEnrichmentStatus, fetchCampaignPage, fetchCampaignSources,
   fetchXCampaignEnrichmentStatus,
-  fetchStatus, fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, refreshXhsCampaignDetail,
+  fetchTrends, previewCampaignImport, recommendIdeas, refreshCampaigns, refreshXhsCampaignDetail,
   saveCampaign, updateCampaign, verifyCampaign,
 } from '../lib/api';
 import type {
@@ -19,6 +19,8 @@ import {
 } from './icons';
 import { PlatformBadge, PlatformIcon } from './PlatformBrand';
 import { platformDisplayName } from '../lib/platforms';
+import { CampaignPageCache } from '../lib/campaignPageCache';
+import '../styles/campaign-search.css';
 
 interface CampaignsPageProps {
   persona: string;
@@ -273,15 +275,15 @@ function paginationItems(page: number, totalPages: number): Array<number | 'elli
 export default function CampaignsPage({
   persona, aiReady, accountIds = [], currentAccountId = '', personas, onPersonaChange, onNewPersona, onOpenSettings, onOpenIdeas,
 }: CampaignsPageProps) {
-  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
-  const [pageData, setPageData] = useState<CampaignPageResponse | null>(null);
+  const [campaignRows, setCampaignRows] = useState<Campaign[]>([]);
+  const [pageResponse, setPageData] = useState<CampaignPageResponse | null>(null);
+  const [loadedViewKey, setLoadedViewKey] = useState('');
   const [page, setPage] = useState(1);
   const [snapshotChanged, setSnapshotChanged] = useState(false);
   const [sources, setSources] = useState<CampaignSourceCapability[]>([]);
   const [automaticCount, setAutomaticCount] = useState(0);
   const [trendGroups, setTrendGroups] = useState<TrendGroup[]>([]);
   const [loading, setLoading] = useState(true);
-  const [campaignsLoaded, setCampaignsLoaded] = useState(false);
   const [sourcesLoaded, setSourcesLoaded] = useState(false);
   const [connectionIssue, setConnectionIssue] = useState('');
   const [reconnecting, setReconnecting] = useState(false);
@@ -316,8 +318,15 @@ export default function CampaignsPage({
   const retryAttemptRef = useRef(0);
   const campaignsLoadedRef = useRef(false);
   const sourcesLoadedRef = useRef(false);
+  const pageCacheRef = useRef(new CampaignPageCache<CampaignPageResponse>());
+  const loadAbortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+  const [sourceIssue, setSourceIssue] = useState('');
 
   const [platformFilter, setPlatformFilter] = useState('all');
+  const [searchInput, setSearchInput] = useState('');
+  const [keyword, setKeyword] = useState('');
+  const [searchComposing, setSearchComposing] = useState(false);
   const [typeFilter, setTypeFilter] = useState('all');
   const [rewardFilter, setRewardFilter] = useState('all');
   const [deadlineFilter, setDeadlineFilter] = useState('all');
@@ -335,8 +344,16 @@ export default function CampaignsPage({
   const refreshLabel = platformFilter === 'all' ? '刷新全部活动' : `刷新${platformLabel(platformFilter)}活动`;
   const paidRefresh = sources.some((source) => refreshTargets.includes(source.platform) && (source.schedule?.cost === 'paid' || source.platform === 'x' || source.status === 'ready_fallback'));
   const refreshHint = paidRefresh ? '当前范围包含收费来源，手动刷新会额外消耗 Token / 接口额度。' : '仅刷新当前范围的免费来源，不额外启动付费 Agent 或收费备用。';
-  const viewKey = JSON.stringify([platformFilter, accountFilter, sortMode, page, typeFilter, rewardFilter, deadlineFilter, qualificationFilter]);
+  const viewKey = JSON.stringify([platformFilter, accountFilter, sortMode, page, typeFilter, rewardFilter, deadlineFilter, qualificationFilter, keyword]);
   currentViewRef.current = viewKey;
+  // Never render another platform's rows/count while its request is being cancelled.
+  const pageData = loadedViewKey === viewKey ? pageResponse : pageCacheRef.current.get(viewKey) || null;
+  const campaignsLoaded = pageData !== null;
+  const campaigns = loadedViewKey === viewKey ? campaignRows : pageData?.items || [];
+  const setCampaigns = (update: Parameters<typeof setCampaignRows>[0]) => {
+    pageCacheRef.current.clear();
+    setCampaignRows(update);
+  };
 
   const [form, setForm] = useState<CampaignInput | null>(null);
   const [editId, setEditId] = useState<string | null>(null);
@@ -397,136 +414,136 @@ export default function CampaignsPage({
   }, [scheduleRetry]);
 
   const load = useCallback(async (initial = false) => {
+    if (!mountedRef.current) return;
     const requestId = ++loadRequestRef.current;
-    if (initial && !campaignsLoadedRef.current && !sourcesLoadedRef.current) setLoading(true);
+    loadAbortRef.current?.abort();
+    const isCurrent = () => mountedRef.current && requestId === loadRequestRef.current && currentViewRef.current === viewKey;
+    const cache = pageCacheRef.current;
+    const cached = initial ? cache.get(viewKey) : undefined;
+    // Explicit revalidation follows refreshes/mutations and must bypass old views.
+    if (!initial) cache.clear();
+    const generation = cache.generation;
+    const applyPage = (value: CampaignPageResponse) => {
+      const resultKey = JSON.stringify([platformFilter, accountFilter, sortMode, value.page, typeFilter, rewardFilter, deadlineFilter, qualificationFilter, keyword]);
+      if (!cached) cache.set(resultKey, value, generation);
+      setCampaignRows(value.items || []);
+      setPageData(value);
+      setLoadedViewKey(resultKey);
+      if (value.page !== page) setPage(value.page);
+      if (platformFilter === 'xiaohongshu' && value.snapshot_id) snapshotIdRef.current = value.snapshot_id;
+      campaignsLoadedRef.current = true;
+      setSnapshotChanged(false);
+      setSelected((current) => current ? value.items.find((x) => x.id === current.id) || current : null);
+      clearRetry(); setReconnecting(false); setConnectionIssue(''); setError('');
+    };
+    if (cached) {
+      applyPage(cached);
+      setLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    loadAbortRef.current = controller;
+    setLoading(true); setError(''); setSnapshotChanged(false);
     const listSort: CampaignListSort = platformFilter === 'xiaohongshu'
       ? (sortMode === 'latest' ? 'latest' : 'default')
       : (['recommend', 'new', 'deadline', 'saved'].includes(sortMode) ? sortMode as CampaignListSort : 'recommend');
     try {
-      let runtime;
-      try {
-        runtime = await fetchStatus();
-      } catch {
-        if (requestId === loadRequestRef.current) markConnectionFailure();
-        return;
-      }
-      if (!runtime.features?.campaigns || !runtime.features?.campaign_sources_v2) {
-        if (requestId === loadRequestRef.current) {
-          setReconnecting(false);
-          setConnectionIssue('当前运行中的 Ripple 后端版本较旧，尚未加载活动中心 API。请重启 Ripple 服务后再试。');
-          clearRetry();
-        }
-        return;
-      }
-
-      const [campaignResult, sourceResult, accountResult, agentResult, xRuleResult] = await Promise.allSettled([
-        fetchCampaignPage({
-          platform: platformFilter,
-          account_id: accountFilter === 'all' ? '' : accountFilter,
-          sort: listSort,
-          page,
-          activity_type: typeFilter,
-          reward_type: rewardFilter,
-          deadline: deadlineFilter,
-          qualification: qualificationFilter,
-          snapshot_id: platformFilter === 'xiaohongshu' ? snapshotIdRef.current : '',
-        }),
-        fetchCampaignSources(), rippleApi<Account[]>('/api/ripple/accounts'),
-        fetchCampaignEnrichmentStatus(), fetchXCampaignEnrichmentStatus(),
-      ]);
-      if (requestId !== loadRequestRef.current) return;
-
-      let coreFailed = false;
-      let logicalError = '';
-      if (campaignResult.status === 'fulfilled') {
-        const value = campaignResult.value;
-        setCampaigns(value.items || []);
-        setPageData(value);
-        if (value.page !== page) setPage(value.page);
-        if (platformFilter === 'xiaohongshu' && value.snapshot_id) snapshotIdRef.current = value.snapshot_id;
-        setSnapshotChanged(false);
-        setCampaignsLoaded(true);
-        campaignsLoadedRef.current = true;
-        setSelected((current) => current ? value.items.find((x) => x.id === current.id) || current : null);
-      } else {
-        const reason = campaignResult.reason;
+      // Browsing is a local list read: no Agent readiness check or collection request.
+      const value = await fetchCampaignPage({
+        platform: platformFilter,
+        account_id: accountFilter === 'all' ? '' : accountFilter,
+        sort: listSort, page, activity_type: typeFilter, reward_type: rewardFilter,
+        deadline: deadlineFilter, qualification: qualificationFilter, q: keyword,
+        snapshot_id: platformFilter === 'xiaohongshu' ? snapshotIdRef.current : '',
+      }, { signal: controller.signal });
+      if (!isCurrent() || controller.signal.aborted || generation !== cache.generation) return;
+      applyPage(value);
+    } catch (reason) {
+      if (!isCurrent() || controller.signal.aborted) return;
+      if (isNetworkError(reason)) markConnectionFailure();
+      else {
         const message = reason instanceof Error ? reason.message : '活动分页读取失败';
-        if (isNetworkError(reason)) coreFailed = true;
-        else {
-          logicalError = message;
-          if (message.includes('排序已更新')) setSnapshotChanged(true);
-        }
-      }
-
-      if (sourceResult.status === 'fulfilled') {
-        const sourceState = sourceResult.value;
-        setSources(sourceState.items || []);
-        setAutomaticCount(sourceState.automatic_count || 0);
-        setSourcesLoaded(true);
-        sourcesLoadedRef.current = true;
-        if (sourceState.server_now) setServerOffset(sourceState.server_now - Math.floor(Date.now() / 1000));
-      } else if (isNetworkError(sourceResult.reason)) {
-        coreFailed = true;
-      } else {
-        logicalError ||= sourceResult.reason instanceof Error ? sourceResult.reason.message : '活动源状态读取失败';
-      }
-
-      if (accountResult.status === 'fulfilled') setAccounts(accountResult.value);
-      if (agentResult.status === 'fulfilled') setEnrichmentStatus(agentResult.value);
-      if (xRuleResult.status === 'fulfilled') setXEnrichmentStatus(xRuleResult.value);
-
-      if (coreFailed) {
-        markConnectionFailure();
-      } else {
-        clearRetry();
-        setReconnecting(false);
-        setConnectionIssue('');
-        setError(logicalError);
+        setError(message);
+        setSnapshotChanged(message.includes('排序已更新'));
       }
     } finally {
-      if (requestId === loadRequestRef.current && initial) setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [
-    accountFilter, clearRetry, deadlineFilter, markConnectionFailure, page, platformFilter,
-    qualificationFilter, rewardFilter, sortMode, typeFilter,
+    accountFilter, clearRetry, deadlineFilter, keyword, markConnectionFailure, page, platformFilter,
+    qualificationFilter, rewardFilter, sortMode, typeFilter, viewKey,
   ]);
+
+  const loadMetadata = useCallback(async () => {
+    // These responses update independently and never gate list rendering.
+    await Promise.allSettled([
+      fetchCampaignSources().then((state) => {
+        if (!mountedRef.current) return;
+        setSources(state.items || []); setAutomaticCount(state.automatic_count || 0);
+        setSourcesLoaded(true); sourcesLoadedRef.current = true; setSourceIssue('');
+        if (state.server_now) setServerOffset(state.server_now - Math.floor(Date.now() / 1000));
+      }).catch(() => {
+        if (mountedRef.current) setSourceIssue('活动源状态暂时无法更新，活动列表仍可独立浏览；稍后自动重试。');
+      }),
+      rippleApi<Account[]>('/api/ripple/accounts').then((value) => { if (mountedRef.current) setAccounts(value); }),
+      fetchCampaignEnrichmentStatus().then((value) => { if (mountedRef.current) setEnrichmentStatus(value); }),
+      fetchXCampaignEnrichmentStatus().then((value) => { if (mountedRef.current) setXEnrichmentStatus(value); }),
+    ]);
+  }, []);
 
   useEffect(() => {
     loadRef.current = load;
   }, [load]);
 
   useEffect(() => {
+    mountedRef.current = true;
     void load(true);
-    const refreshTimer = window.setInterval(() => { void load(false); }, 60 * 1000);
+    return () => { loadAbortRef.current?.abort(); };
+  }, [load]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    void loadMetadata();
+    // Refresh local snapshots/status only; this does not trigger platform collection.
+    const refreshTimer = window.setInterval(() => {
+      void loadRef.current(false); void loadMetadata();
+    }, 60 * 1000);
     const clockTimer = window.setInterval(() => setClock(Math.floor(Date.now() / 1000)), 1000);
     return () => {
-      window.clearInterval(refreshTimer);
-      window.clearInterval(clockTimer);
+      mountedRef.current = false;
+      window.clearInterval(refreshTimer); window.clearInterval(clockTimer);
       if (retryTimerRef.current != null) window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
     };
-  }, [load]);
+  }, [loadMetadata]);
+
+  useEffect(() => {
+    if (searchComposing || searchInput.trim() === keyword) return;
+    const timer = window.setTimeout(() => { setKeyword(searchInput.trim()); setPage(1); }, 250);
+    return () => window.clearTimeout(timer);
+  }, [searchInput, searchComposing, keyword]);
 
   useEffect(() => {
     if (!['running', 'queued', 'cancelling'].includes(enrichmentPhase)) return;
     const timer = window.setInterval(() => {
       fetchCampaignEnrichmentStatus().then((status) => {
         setEnrichmentStatus(status);
-        if (!['running', 'queued', 'cancelling'].includes(status.status)) void load(false);
+        if (!['running', 'queued', 'cancelling'].includes(status.status)) void loadRef.current(false);
       }).catch(() => undefined);
     }, 1800);
     return () => window.clearInterval(timer);
-  }, [enrichmentPhase, load]);
+  }, [enrichmentPhase]);
 
   useEffect(() => {
     if (!xBatchActive) return;
     const timer = window.setInterval(() => {
       fetchXCampaignEnrichmentStatus().then((status) => {
         setXEnrichmentStatus(status);
-        if (!['running', 'queued'].includes(status.status)) void load(false);
+        if (!['running', 'queued'].includes(status.status)) void loadRef.current(false);
       }).catch(() => undefined);
     }, 1800);
     return () => window.clearInterval(timer);
-  }, [xBatchActive, load]);
+  }, [xBatchActive]);
 
   useEffect(() => {
     const selectedTrends = loadTrendSelection();
@@ -548,18 +565,24 @@ export default function CampaignsPage({
       setSources(result.sources.items || []);
       setAutomaticCount(result.sources.automatic_count || 0);
       setSourcesLoaded(true); sourcesLoadedRef.current = true;
-      if (currentViewRef.current !== originView) return;
+      const fresh = result.results.filter((row) => row.status === 'fresh');
+      if (fresh.length) pageCacheRef.current.clear();
+      if (currentViewRef.current !== originView) {
+        if (fresh.length) await loadRef.current(false);
+        return;
+      }
       setSelected((current) => current ? result.campaigns.find((row) => row.id === current.id) || current : null);
       clearRetry(); setReconnecting(false); setConnectionIssue('');
-      const fresh = result.results.filter((row) => row.status === 'fresh');
       const failed = result.results.filter((row) => !['fresh', 'cached'].includes(row.status));
       showToast(`${refreshLabel}：${fresh.length} 个来源完成${failed.length ? `，${failed.length} 个来源需要处理` : ''}`);
-      if (failed.length) setError(failed.map((row) => `${platformLabel(row.platform)}：${row.error || row.status}`).join('；'));
       if (platformFilter === 'xiaohongshu' && fresh.some((row) => row.platform === 'xiaohongshu')) {
         snapshotIdRef.current = ''; setSnapshotChanged(false);
         if (page !== 1) setPage(1); else await loadRef.current(false);
       } else if (fresh.length) {
         await loadRef.current(false);
+      }
+      if (currentViewRef.current === originView && failed.length) {
+        setError(failed.map((row) => `${platformLabel(row.platform)}：${row.error || row.status}`).join('；'));
       }
     } catch (e) {
       if (currentViewRef.current !== originView) return;
@@ -579,6 +602,7 @@ export default function CampaignsPage({
       setSelected(updated);
       setCampaigns((rows) => rows.map((row) => row.id === updated.id ? updated : row));
       showToast('活动规则已重新核验');
+      await loadRef.current(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : '活动规则核验失败');
     } finally {
@@ -596,6 +620,7 @@ export default function CampaignsPage({
       if (updated.xhs_detail_status === 'parsed') showToast('已重新读取小红书规则详情');
       else if (updated.xhs_detail_status === 'no_structured_rules') showToast('详情已读取，当前页面未提供可结构化的完整规则');
       else showToast('详情读取完成，请查看规则状态');
+      await loadRef.current(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : '小红书规则详情读取失败');
     } finally {
@@ -611,6 +636,7 @@ export default function CampaignsPage({
       setCampaigns((rows) => rows.map((row) => row.id === result.item.id ? result.item : row));
       setSelected((current) => current?.id === result.item.id ? result.item : current);
       showToast(result.called ? 'Agent 已完成规则补全' : '当前证据无需重复调用 Agent');
+      await loadRef.current(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Agent 补全失败');
     } finally { setEnrichingId(''); }
@@ -641,11 +667,14 @@ export default function CampaignsPage({
       const state = await configureCampaignSource(sourceEditor.platform, sourceDraft);
       setSources(state.items || []); setAutomaticCount(state.automatic_count || 0);
       setSourceEditor(null); showToast('活动数据源配置已保存');
+      pageCacheRef.current.clear(); snapshotIdRef.current = '';
+      void loadRef.current(false);
     } catch (e) { setError(e instanceof Error ? e.message : '活动数据源配置失败'); }
     finally { setSourceSaving(false); }
   };
 
   const changePlatformFilter = (value: string) => {
+    setError(''); setConnectionIssue('');
     snapshotIdRef.current = '';
     setSnapshotChanged(false);
     setPage(1);
@@ -664,6 +693,7 @@ export default function CampaignsPage({
   };
 
   const acceptLatestSnapshot = () => {
+    pageCacheRef.current.clear();
     snapshotIdRef.current = '';
     setSnapshotChanged(false);
     setError('');
@@ -777,7 +807,7 @@ export default function CampaignsPage({
       const saved = editId ? await updateCampaign(editId, payload) : await createCampaign(payload);
       setForm(null);
       setEditId(null);
-      await load();
+      await loadRef.current(false);
       setSelected(saved);
       showToast(editId ? '活动规则已更新并生成新版本' : '活动已导入');
     } catch (e) {
@@ -792,7 +822,7 @@ export default function CampaignsPage({
       const value = await saveCampaign(campaign.id, !campaign.saved);
       setCampaigns((rows) => rows.map((x) => x.id === value.id ? value : x));
       setSelected((current) => current?.id === value.id ? value : current);
-      await load(false);
+      await loadRef.current(false);
     } catch (e) {
       showToast(e instanceof Error ? e.message : '收藏失败');
     }
@@ -960,6 +990,24 @@ export default function CampaignsPage({
         })}
       </section>}
 
+      <form className="campaign-search" role="search" aria-label="活动关键词搜索" onSubmit={(e) => {
+        e.preventDefault();
+        if (searchComposing) return;
+        const next = searchInput.trim();
+        if (next === keyword && page === 1 && !loading && (error || connectionIssue)) void loadRef.current(false);
+        else { setKeyword(next); setPage(1); }
+      }}>
+        <input className="field" type="search" aria-label="搜索活动" maxLength={120}
+          placeholder={`搜索${platformFilter === 'all' ? '全部平台' : platformLabel(platformFilter)}活动：名称、话题、主办方…`}
+          value={searchInput} onChange={(e) => setSearchInput(e.target.value)}
+          onCompositionStart={() => setSearchComposing(true)} onCompositionEnd={() => setSearchComposing(false)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && e.nativeEvent.isComposing) e.preventDefault(); }} />
+        <button className="btn btn-sm btn-primary" type="submit">搜索</button>
+        {(searchInput || keyword) && <button className="btn btn-sm" type="button" aria-label="清空活动搜索"
+          onClick={() => { setSearchInput(''); setKeyword(''); setPage(1); }}>清空</button>}
+      </form>
+      <p className="campaign-search-help">搜索当前平台全部已同步活动，不限当前页；多个关键词用空格分隔，可与下方筛选组合使用。</p>
+
       <div className="campaign-filters">
         <select className="field" value={platformFilter} onChange={(e) => changePlatformFilter(e.target.value)}>
           <option value="all">全部平台</option>
@@ -1007,30 +1055,31 @@ export default function CampaignsPage({
         {sortOptions.map(([key, label]) => (
           <button key={key} className={sortMode === key ? 'active' : ''} onClick={() => changeSortMode(key)}>{label}</button>
         ))}
-        <span>{campaignsLoaded && pageData
-          ? `共 ${pageData.total} 个活动 · 第 ${pageData.range_start}–${pageData.range_end} 条 · ${pageData.page}/${pageData.total_pages} 页${pageData.truncated ? ' · 来源结果达到同步上限' : ''}`
-          : '活动数据未读取'}</span>
+        <span aria-live="polite">{campaignsLoaded && pageData
+          ? `${keyword ? `“${keyword}” · ` : ''}共 ${pageData.total} 个活动 · 第 ${pageData.range_start}–${pageData.range_end} 条 · ${pageData.page}/${pageData.total_pages} 页${pageData.truncated ? ' · 来源结果达到同步上限' : ''}`
+          : loading || loadedViewKey !== viewKey && !error && !connectionIssue ? '正在读取活动…' : '活动数据未读取'}</span>
       </div>
 
       {connectionIssue && <div className={`campaign-connection-notice ${reconnecting ? 'reconnecting' : ''}`}>{connectionIssue}{reconnecting && <span>自动重试中…</span>}</div>}
       {snapshotChanged && <div className="campaign-snapshot-notice"><span>小红书活动排序已有新快照，当前页面没有混入新旧两批顺序。</span><button className="r2-text-button" onClick={acceptLatestSnapshot}>查看最新排序</button></div>}
       {platformFilter === 'xiaohongshu' && pageData?.source_status === 'stale' && <div className="campaign-snapshot-notice stale"><span>当前展示上次成功同步的小红书官方排序快照。</span></div>}
+      {sourceIssue && <div className="campaign-connection-notice">{sourceIssue}</div>}
       {error && <div className="notice-error">{error}</div>}
       <div className="campaign-layout">
-        <main className="campaign-list">
-          {loading && !campaignsLoaded && <div className="campaign-empty">正在读取活动…</div>}
-          {!loading && !campaignsLoaded && (
+        <main className="campaign-list" aria-busy={loading || !campaignsLoaded && !error && !connectionIssue}>
+          {!campaignsLoaded && (loading || !error && !connectionIssue) && <div className="campaign-empty" role="status">正在读取活动…</div>}
+          {!loading && !campaignsLoaded && (error || connectionIssue) && (
             <div className="campaign-empty">
               <IconCompass size={28} />
               <strong>活动数据暂时无法读取</strong>
-              <p>Ripple 正在自动重新连接后端。连接恢复后会自动载入活动，不会把未读取状态当成 0 条数据。</p>
+              <p>{reconnecting ? 'Ripple 正在自动重新连接后端。连接恢复后会自动载入活动。' : '请根据上方提示处理，或重新尝试当前筛选；读取失败不会显示成 0 条活动。'}</p>
             </div>
           )}
           {campaignsLoaded && visible.length === 0 && (
             <div className="campaign-empty">
               <IconCompass size={28} />
-              <strong>{hasSourceRows ? '当前筛选条件没有匹配活动' : currentSource && !currentSource.automatic ? `${currentSource.label}活动源尚未就绪` : '还没有已确认的创作活动'}</strong>
-              <p>{hasSourceRows ? '调整筛选条件继续查看。' : currentSource && !currentSource.automatic ? currentSource.detail : '手动刷新只获取当前范围的活动，不会调用其他平台。'}</p>
+              <strong>{keyword ? `未找到与“${keyword}”匹配的活动` : hasSourceRows ? '当前筛选条件没有匹配活动' : currentSource && !currentSource.automatic ? `${currentSource.label}活动源尚未就绪` : '还没有已确认的创作活动'}</strong>
+              <p>{keyword ? '仅搜索当前平台已同步的活动。请尝试其他关键词，或调整筛选条件。' : hasSourceRows ? '调整筛选条件继续查看。' : currentSource && !currentSource.automatic ? currentSource.detail : '手动刷新只获取当前范围的活动，不会调用其他平台。'}</p>
               {!hasSourceRows && <div style={{ display: 'flex', gap: 8 }}>
                 {canRefresh && <button className="btn btn-primary btn-sm" title={refreshHint} disabled={refreshing || !sourcesLoaded} onClick={() => void refreshNow()}>{refreshing ? '刷新中…' : refreshLabel}</button>}
                 {currentSource && !currentSource.automatic && ['x', 'xiaohongshu', 'douyin'].includes(currentSource.platform) && <button className="btn btn-primary btn-sm" onClick={() => openSourceEditor(currentSource)}>配置{currentSource.label}活动源</button>}

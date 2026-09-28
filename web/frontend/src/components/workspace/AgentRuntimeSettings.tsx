@@ -76,6 +76,7 @@ export default function AgentRuntimeSettings() {
     return SUPPORTED.map((item) => byId.get(item.runtime) || fallbackRuntime(item.runtime, item.name));
   }, [runtimes]);
   const profileByRuntime = useMemo(() => new Map((profiles?.profiles || []).map((row) => [row.runtime_id, row])), [profiles]);
+  const defaultRuntime = displayed.find((row) => row.runtime === runtimes?.default_runtime);
 
   const scan = async () => {
     if (busy) return;
@@ -90,7 +91,7 @@ export default function AgentRuntimeSettings() {
 
   const setDefault = async (profileId: string) => {
     setBusy(true); setError(''); setNotice('');
-    try { setProfiles(await setDefaultAgentProfile(profileId)); setRuntimes(await fetchAgentRuntimes()); setNotice('默认 Agent 已更新。'); }
+    try { setProfiles(await setDefaultAgentProfile(profileId)); setRuntimes(await fetchAgentRuntimes()); setNotice('默认 Agent 已更新，仅新建会话使用新默认设置。'); }
     catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   };
 
@@ -125,6 +126,8 @@ export default function AgentRuntimeSettings() {
   return <section className="r2-settings-section" data-section="agent-runtimes">
     <div><h2>Agent</h2></div>
     <div className="r2-settings-form"><Feedback error={error} notice={notice} />
+      <div className="focus-agent-summary"><div><span>默认 Agent</span><strong>{defaultRuntime?.name || '尚未设置'}</strong></div><div><span>模型来源</span><strong>{defaultRuntime?.current_model || '跟随本机 Agent 配置'}</strong></div><div><span>检测结果</span><strong>{defaultRuntime ? CONNECTION_LABEL[defaultRuntime.connection_state || ''] || defaultRuntime.connection_state || '待检测' : '读取中'}</strong></div></div>
+      <p className="r2-muted">更改默认 Agent 或模型只影响新会话。已有会话保留各自的设置。</p>
       <div className="r2-section-heading"><strong>本机 Agent</strong><button className="r2-button" disabled={busy} onClick={() => void scan()}>{busy && !activeAction ? '扫描中…' : '重新扫描'}</button></div>
       <div className="r2-agent-runtime-list">{displayed.map((runtime) => {
         const profile = profileByRuntime.get(runtime.runtime);

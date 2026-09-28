@@ -2,10 +2,14 @@ import { useMemo, useState } from 'react';
 import type { ChatMessage } from '../lib/store';
 import { renderMarkdown } from '../lib/sanitize';
 import { IconCopy, IconCheck, IconRetry } from './icons';
+import ContentProposalCard from './ContentProposalCard';
+import MediaTaskList from './MediaTaskList';
+import { finishToolActivity } from '../lib/toolActivity';
 
 export interface BubbleActions {
   onCopy: () => void;
   onRetry?: () => void;    // 仅最后一轮可用（append-only：不改写历史）
+  onRetryMedia?: () => void;
   canModify: boolean;      // 流式中禁用 retry
 }
 
@@ -16,6 +20,9 @@ interface MessageBubbleProps {
   activity?: string;
   actions?: BubbleActions;
   onOpenContent?: (contentId: string) => void;
+  onContentUpdated?: (contentId: string) => void;
+  canApplyProposal?: boolean;
+  onUploadMedia?: () => void;
 }
 
 function ActionBar({ actions }: { actions: BubbleActions }) {
@@ -37,7 +44,7 @@ function ActionBar({ actions }: { actions: BubbleActions }) {
   );
 }
 
-export default function MessageBubble({ message, isStreaming, thinking, activity, actions, onOpenContent }: MessageBubbleProps) {
+export default function MessageBubble({ message, isStreaming, thinking, activity, actions, onOpenContent, onContentUpdated, canApplyProposal, onUploadMedia }: MessageBubbleProps) {
   const html = useMemo(() => {
     if (message.role === 'user') return '';
     return renderMarkdown(message.content);
@@ -62,7 +69,7 @@ export default function MessageBubble({ message, isStreaming, thinking, activity
   // 思考 / 活动：流式时用实时值；结束后用消息里持久化的值 —— 一直保留，不隐藏
   const effThinking = isStreaming ? (thinking || '') : (message.thinking || '');
   const liveActivity = isStreaming ? (activity || '') : '';
-  const doneSteps = !isStreaming ? (message.activity || '') : '';
+  const doneSteps = !isStreaming ? finishToolActivity(message.activity || '') : '';
   const artifacts = message.artifacts || [];
 
   const livePanel = (effThinking || liveActivity || doneSteps) ? (
@@ -86,7 +93,7 @@ export default function MessageBubble({ message, isStreaming, thinking, activity
   ) : null;
 
   // 等待回复中（还没有正文、思考、活动）
-  if (isStreaming && !message.content && !effThinking && !liveActivity && artifacts.length === 0) {
+  if (isStreaming && !message.content && !effThinking && !liveActivity && artifacts.length === 0 && !message.mediaTasks?.length) {
     return (
       <div className="message-row assistant">
         <div className="message-bubble assistant">
@@ -105,8 +112,11 @@ export default function MessageBubble({ message, isStreaming, thinking, activity
       <div className="msg-col assistant">
         <div className="message-bubble assistant">
           {livePanel}
+          {!!message.mediaTasks?.length && <MediaTaskList tasks={message.mediaTasks} live={isStreaming} onRetry={actions?.canModify ? actions.onRetryMedia : undefined} onUpload={onUploadMedia} />}
           {message.content && <div dangerouslySetInnerHTML={{ __html: html }} />}
-          {artifacts.length > 0 && <div className="chat-artifact-list">{artifacts.map((artifact) => <div className="chat-artifact-card" key={`${artifact.kind}-${artifact.id}-${artifact.version_id}`}><div className="chat-artifact-icon">文</div><div className="chat-artifact-main"><span>内容工作台草稿</span><strong>{artifact.title || '未命名内容'}</strong><small>草稿 · 已保存到 Ripple 内容库</small></div>{onOpenContent && <button onClick={() => onOpenContent(artifact.id)}>打开内容工作台</button>}</div>)}</div>}
+          {artifacts.length > 0 && <div className="chat-artifact-list">{artifacts.map((artifact) => artifact.proposal_id
+            ? <ContentProposalCard key={artifact.proposal_id} artifact={artifact} onChanged={onContentUpdated} canApply={canApplyProposal} />
+            : <div className="chat-artifact-card" key={`${artifact.kind}-${artifact.id}-${artifact.version_id}`}><div className="chat-artifact-icon">文</div><div className="chat-artifact-main"><span>内容工作台草稿</span><strong>{artifact.title || '未命名内容'}</strong><small>草稿 · 已保存到 Ripple 内容库</small></div>{onOpenContent && <button onClick={() => onOpenContent(artifact.id)}>打开内容工作台</button>}</div>)}</div>}
           {isStreaming && <span className="streaming-cursor" />}
         </div>
         {actions && !isStreaming && <ActionBar actions={actions} />}

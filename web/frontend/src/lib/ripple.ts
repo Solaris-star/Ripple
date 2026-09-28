@@ -1,4 +1,5 @@
 import { csrfToken, securedFetchOptions } from './security';
+import { apiErrorMessage } from './apiError';
 
 export interface ChannelConnectionOption {
   id: string; label: string; status: 'available' | 'planned' | 'unavailable';
@@ -7,7 +8,7 @@ export interface ChannelConnectionOption {
 export interface Channel {
   id: string; name: string; connected: boolean; direct_publish: boolean;
   status: string; local_export: boolean; reason: string; formats: string[];
-  adapter_available: boolean; adapter: string; environment_ready: boolean; account_count: number;
+  adapter_available: boolean; publish_available?: boolean; adapter: string; environment_ready: boolean; account_count: number;
   live_verified: boolean; scope_note: string;
   connection_methods?: string[]; connection_options?: ChannelConnectionOption[];
 }
@@ -19,7 +20,7 @@ export interface Account {
   id: string; platform: string; label: string; status: string; auth_revision: number;
   identity: { logged_in: boolean; name: string; remote_id: string } | null;
   checked_at: string | null; message: string; live_verified: boolean;
-  operation: { id: string; kind: string; state: string; started_at: string; task_id?: string; browser_channel?: string; execution_node_id?: string; command_id?: string } | null;
+  operation: { id: string; kind: string; state: string; started_at: string; interaction_id?: string; task_id?: string; browser_channel?: string; execution_node_id?: string; command_id?: string } | null;
   login_state?: string; qr_available?: boolean; qr_revision?: string; login_url?: string;
   execution_node_id?: string; profile_id?: string; browser_channel?: string | null;
   adapter?: string; external_id?: string; bridge_revision?: string; capabilities?: string[];
@@ -46,6 +47,11 @@ export interface XhsInteraction {
   created_at: string; updated_at: string;
 }
 export interface InteractionCapability {
+  supported?: boolean;
+  availability?: 'ready' | 'supported' | 'unsupported' | 'unsupported_connection' | 'missing_dependency' | 'needs_verification' | 'disconnected';
+  experimental?: boolean;
+  accounts?: (InteractionCapability & { account_id: string; reason: string })[];
+  reason?: string;
   platform: string; name: string; read_contents: boolean; read_comments: boolean;
   reply: boolean; comment: boolean; delete: boolean; refresh_result: boolean; platform_verify: boolean;
   account_count: number; connected_count: number; note: string;
@@ -54,6 +60,7 @@ export interface InteractionComment {
   id: string; nickname: string; content: string; time: number; time_str: string; like: string; parent: string;
 }
 export interface InteractionSource {
+  limit?: number; sample_scope?: string;
   id: string; kind: 'import' | 'remote'; platform: string; label: string; account_id: string; account_label: string;
   target_id: string; target_url: string; count: number; comments?: InteractionComment[]; created_at: string; updated_at: string;
 }
@@ -67,9 +74,17 @@ export interface InteractionInsight {
 }
 export interface InteractionContentSummary { id: string; title: string; url: string; metrics: XhsMetrics; }
 export interface InteractionItem { id?: string; nickname?: string; content?: string; reply?: string; }
+export interface InteractionItemResult {
+  id: string; status: 'pending' | 'submitting' | 'verified' | 'not_submitted' | 'unknown_result'; reason?: string;
+  evidence?: { kind?: string; reply_id?: string; target_comment_id?: string; account_remote_id?: string; text?: string };
+  resolution?: { source: string; result: string; note: string; at: string };
+}
 export interface Interaction {
+  retryable_item_ids?: string[];
+  retry_exclusions?: { id: string; interaction_id: string; status: string }[];
+  item_results?: InteractionItemResult[]; retry_of?: string;
   id: string; platform: string; source_kind: 'import' | 'remote'; source_id: string; delivery: 'local' | 'remote';
-  account_id: string; account_label: string; target_id: string; target_url: string; note_id?: string; note_url?: string;
+  account_id: string; account_label: string; target_id: string; target_url: string; target_label?: string; note_id?: string; note_url?: string;
   kind: 'reply' | 'delete' | 'comment'; payload: { items?: InteractionItem[]; text?: string };
   status: 'draft' | 'dispatching' | 'verified' | 'partial' | 'unknown_result' | 'not_submitted' | 'cancelled';
   attempts: number; operation_id: string | null; result?: { results?: { id: string; status: string; reason: string }[]; status?: string; reason?: string } | null;
@@ -113,8 +128,9 @@ export interface Task {
   approval: { version_id: string; at: string; real_publish_confirmed?: boolean; auth_revision?: number } | null;
   review_context?: { account_id?: string; auth_revision?: number; label: string; identity?: Account['identity']; adapter?: string; connector_id?: string };
   variant_id?: string; variant_version_id?: string;
+  preflight_problems?: string[];
   content_profile_context?: { profile_id: string; profile_revision: number; profile_name: string; legacy_name: string; binding_revision: number; target_kind: 'account' | 'blog'; account_id: string; overrides: Record<string, unknown> } | null;
-  receipt: { adapter: string; simulated: boolean; artifact_url?: string; public_url: string | null; result: string; verification?: string; not_submitted?: boolean; flow_id?: string; remote_status?: number; candidate_url?: string; draft_media_id?: string; publish_id?: string; publish_status?: number; draft_only?: boolean } | null;
+  receipt: { adapter: string; simulated: boolean; artifact_url?: string; public_url: string | null; result: string; verification?: string; evidence?: string; not_submitted?: boolean; flow_id?: string; remote_status?: string | number; visibility?: string; remote_id?: string; account_remote_id?: string; remote_post_id?: string; checked_at?: string; candidate_url?: string; draft_media_id?: string; publish_id?: string; publish_status?: number; draft_only?: boolean } | null;
   events: { at: string; status: string; note: string; version_id?: string }[];
 }
 export type WatermarkStatus = 'evidence' | 'unknown' | 'unsupported' | 'unavailable' | 'error';
@@ -175,6 +191,28 @@ export interface BlogConnector {
 export interface CalendarItem {
   id: string; title: string; platform: string; account: string; scheduled_at: string; timezone: string; status: string; mode: string;
 }
+export interface RemotePost {
+  id: string; platform: 'x' | 'xiaohongshu'; account_id: string; account_remote_id: string;
+  remote_id: string; original_remote_id: string; version_ids: string[]; linked_versions: string[];
+  kind: string; title: string; body: string; topics: string[]; media: { id?: string; kind?: string; url: string }[];
+  url: string; remote_status: string; visibility: string; checked_at: string; created_at: string;
+  version: string; task_ids: string[]; action_ids: string[]; detail_complete: boolean;
+  capabilities: { edit: boolean; edit_reason: string; delete: boolean; delete_reason: string };
+}
+export interface RemotePostAction {
+  id: string; post_id: string; platform: string; account_id: string; remote_id: string;
+  kind: 'edit' | 'delete'; operation_id: string; confirmed_version: string; auth_revision: number;
+  snapshot: RemotePost; changes: { title?: string; body?: string; topics?: string[] };
+  status: 'preview' | 'dispatching' | 'verified' | 'not_submitted' | 'unknown_result' | 'reviewing' | 'partial';
+  evidence: Record<string, unknown> | null; reason?: string; created_at: string; updated_at: string;
+}
+
+export interface ContentPlan {
+  id: string; version: number; title: string; status: 'planned';
+  scheduled_local: string; scheduled_at: string; timezone: string; fold: 0 | 1 | null;
+  source_id: string; variant_id: string; variant_version_id: string; task_id: string;
+}
+export type CalendarEntry = (CalendarItem & { kind: 'publish_task' }) | (ContentPlan & { kind: 'plan' });
 export interface RippleStatus {
   brand: string; version: string; local_only: boolean; live_publishing: boolean; ai_enabled: boolean; native_adapters: boolean;
   environment: { browser: string | null; browsers?: string[]; biliup: boolean; requires_extension: boolean };
@@ -184,9 +222,7 @@ export const base = window.location.pathname.replace(/\/index\.html$/, '').repla
 export function errorText(error: unknown): string { return error instanceof Error ? error.message : '操作未完成，请重试。'; }
 
 function detail(payload: { detail?: string | { msg: string }[] }, fallback: string): string {
-  if (typeof payload.detail === 'string') return payload.detail;
-  if (Array.isArray(payload.detail)) return payload.detail.map(v => v.msg).join('；');
-  return fallback;
+  return apiErrorMessage(payload, fallback);
 }
 const inflightGets = new Map<string, Promise<unknown>>();
 
@@ -299,9 +335,9 @@ export const xhsInteractions = (accountId = '', limit = 100) => api<{ items: Xhs
 export const createXhsInteraction = (payload: {
   account_id: string; note_id?: string; url?: string; kind: 'reply' | 'delete' | 'comment'; items?: XhsInteractionItem[]; text?: string; idempotency_key: string;
 }) => api<XhsInteraction>('/api/ripple/xiaohongshu/interactions', 'POST', { note_id: '', url: '', items: [], text: '', ...payload });
-export const executeXhsInteraction = (id: string) => api<XhsInteraction>(`/api/ripple/xiaohongshu/interactions/${encodeURIComponent(id)}/execute`, 'POST', { confirmed: true });
+export const executeXhsInteraction = (id: string, expectedUpdatedAt: string) => api<XhsInteraction>(`/api/ripple/xiaohongshu/interactions/${encodeURIComponent(id)}/execute`, 'POST', { confirmed: true, expected_updated_at: expectedUpdatedAt });
 export const queryXhsInteraction = (id: string) => api<XhsInteraction>(`/api/ripple/xiaohongshu/interactions/${encodeURIComponent(id)}/query`, 'POST', {});
-export const fetchInteractionCapabilities = () => api<{ items: InteractionCapability[] }>('/api/ripple/interactions/capabilities');
+export const fetchInteractionCapabilities = () => api<{ items: InteractionCapability[]; schema_version?: number; restart_required?: boolean }>('/api/ripple/interactions/capabilities');
 export const fetchStructuredOperations = () => api<{ items: StructuredOperationMeta[] }>('/api/ripple/operations');
 export const fetchOperationTemplates = () => api<{ items: OperationTemplate[] }>('/api/ripple/operations/templates');
 export const executeStructuredOperation = <T>(operation: StructuredOperationId, input: Record<string, unknown>, source: Record<string, unknown> = {}) => api<OperationResult<T>>(`/api/ripple/operations/${encodeURIComponent(operation)}/execute`, 'POST', { input, source });
@@ -309,7 +345,7 @@ export const fetchOperationResults = <T = Record<string, unknown>>(operation: St
 export const fetchInteractionSources = (platform = '', limit = 24) => api<{ items: InteractionSource[] }>(`/api/ripple/interactions/sources?platform=${encodeURIComponent(platform)}&limit=${limit}`);
 export const fetchInteractionSource = (id: string) => api<InteractionSource>(`/api/ripple/interactions/sources/${encodeURIComponent(id)}`);
 export const analyzeInteractionSource = (id: string) => api<InteractionInsight>(`/api/ripple/interactions/sources/${encodeURIComponent(id)}/analysis`);
-export const fetchInteractionContents = (accountId: string, limit = 30) => api<{ platform: string; source: string; fetched_at: string; items: InteractionContentSummary[] }>(`/api/ripple/interactions/accounts/${encodeURIComponent(accountId)}/contents?limit=${limit}`);
+export const fetchInteractionContents = (accountId: string, limit = 30) => api<{ platform: string; source: string; fetched_at: string; items: InteractionContentSummary[]; limit?: number; sample_scope?: string }>(`/api/ripple/interactions/accounts/${encodeURIComponent(accountId)}/contents?limit=${limit}`);
 export const syncInteractionComments = (accountId: string, payload: { target_id?: string; target_url?: string; target_label?: string; limit?: number }) => api<InteractionSource>(`/api/ripple/interactions/accounts/${encodeURIComponent(accountId)}/comments`, 'POST', { target_id: '', target_url: '', target_label: '', limit: 100, ...payload });
 export const fetchInteractions = (filters: { platform?: string; account_id?: string; status?: string; limit?: number } = {}) => {
   const q = new URLSearchParams(); if (filters.platform) q.set('platform', filters.platform); if (filters.account_id) q.set('account_id', filters.account_id); if (filters.status) q.set('status', filters.status); q.set('limit', String(filters.limit || 200));
@@ -318,9 +354,10 @@ export const fetchInteractions = (filters: { platform?: string; account_id?: str
 export const createInteraction = (payload: { platform: string; account_id?: string; source_id?: string; target_id?: string; target_url?: string; kind: 'reply' | 'delete' | 'comment'; items?: InteractionItem[]; text?: string; idempotency_key: string }) => api<Interaction>('/api/ripple/interactions', 'POST', { account_id: '', source_id: '', target_id: '', target_url: '', items: [], text: '', ...payload });
 export const updateInteraction = (interaction: Interaction, payload: { items?: InteractionItem[]; text?: string }) => api<Interaction>(`/api/ripple/interactions/${encodeURIComponent(interaction.id)}`, 'PATCH', { expected_updated_at: interaction.updated_at, items: payload.items || [], text: payload.text || '' });
 export const cancelInteraction = (interaction: Interaction) => api<Interaction>(`/api/ripple/interactions/${encodeURIComponent(interaction.id)}/cancel`, 'POST', { expected_updated_at: interaction.updated_at });
-export const executeInteraction = (id: string) => api<Interaction>(`/api/ripple/interactions/${encodeURIComponent(id)}/execute`, 'POST', { confirmed: true });
+export const executeInteraction = (interaction: Interaction) => api<Interaction>(`/api/ripple/interactions/${encodeURIComponent(interaction.id)}/execute`, 'POST', { confirmed: true, expected_updated_at: interaction.updated_at });
 export const refreshInteractionResult = (id: string) => api<InteractionRefreshResult>(`/api/ripple/interactions/${encodeURIComponent(id)}/refresh-result`, 'POST', {});
-export const resolveUnknownInteraction = (id: string, result: 'verified' | 'not_submitted', note = '') => api<Interaction>(`/api/ripple/interactions/${encodeURIComponent(id)}/resolve-unknown`, 'POST', { result, confirmed: true, note });
+export const resolveUnknownInteraction = (interaction: Interaction, itemId: string, result: 'verified' | 'not_submitted', note = '') => api<Interaction>(`/api/ripple/interactions/${encodeURIComponent(interaction.id)}/resolve-unknown`, 'POST', { result, confirmed: true, note, item_id: itemId, expected_updated_at: interaction.updated_at });
+export const retryInteractionDraft = (interaction: Interaction, itemIds: string[]) => api<Interaction>(`/api/ripple/interactions/${encodeURIComponent(interaction.id)}/retry-draft`, 'POST', { item_ids: itemIds, expected_updated_at: interaction.updated_at });
 export const inspectImplicitWatermark = (path: string) => api<WatermarkInspection>(
   '/api/ripple/media/watermark/inspect', 'POST', { path },
 );
@@ -356,7 +393,7 @@ export function uploadMedia(file: File, onProgress?: (percent: number) => void):
 }
 export const LABELS: Record<string, string> = {
   draft: '草稿', review_ready: '待审核', approved: '已审核', scheduled: '已排期', dispatching: '执行中',
-  accepted: '已提交 · 待核对', published: '已发布 · 人工核对', simulated: '模拟完成', exported: '已导出', verification_required: '需人工处理',
+  accepted: '已提交 · 待核对', published: '已发布', simulated: '模拟完成', exported: '已导出', verification_required: '需人工处理',
   failed_retryable: '可重试', failed_terminal: '执行失败', unknown_result: '结果待核对', cancelled: '已取消',
 };
 export const ACCOUNT_LABELS: Record<string, string> = { disconnected: '未连接', connecting: '等待登录', connected: '已连接', expired: '需重新登录', error: '连接失败', deleting: '待清理' };

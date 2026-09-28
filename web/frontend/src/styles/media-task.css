@@ -1,0 +1,11 @@
+.r2-media-tasks { display: grid; gap: 10px; margin: 12px 0; }
+.r2-media-task { border: 1px solid var(--border); border-radius: 10px; padding: 12px; background: var(--surface-2); }
+.r2-media-task.failed { border-color: #d6a36c; }
+.r2-media-task-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.r2-media-task-heading strong { display: flex; align-items: center; gap: 7px; font-size: 13px; }
+.r2-media-task-heading small { color: var(--text-secondary); white-space: nowrap; font-size: 11px; }
+.r2-media-task p { margin: 8px 0 0; font-size: 12px; line-height: 1.6; color: var(--text-secondary); }
+.r2-media-task img { display: block; margin-top: 10px; max-width: 100%; max-height: 250px; border-radius: 7px; object-fit: contain; }
+.r2-media-task-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.r2-media-task-actions button { border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; background: var(--bg); color: var(--text); cursor: pointer; font-size: 12px; }
+.r2-media-task-actions button:hover { border-color: var(--text-secondary); }

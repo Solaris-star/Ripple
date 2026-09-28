@@ -15,11 +15,13 @@ from pathlib import Path
 import sys
 import re
 import uuid
+import time
 from typing import Any
 
 from .catalog import NAMES
 from .publishing import WorkflowError, fingerprint
 from .tenancy import DEFAULT_WORKSPACE_ID
+from .interaction_execution import InteractionExecution
 
 ROOT = Path(__file__).resolve().parents[1]
 SHARED_SCRIPTS = ROOT / "skills" / "shared" / "scripts"
@@ -29,11 +31,17 @@ import content_guard  # type: ignore  # noqa: E402
 
 MAX_INTERACTIONS = 500
 MAX_SOURCES = 24
-MAX_COMMENTS = 200
+MAX_COMMENTS = 100
+_LOADED_AT = time.time()
 
 # Capabilities are deliberately explicit. A legacy script existing in the repo is
 # not sufficient evidence that the managed Ripple adapter is safe to expose.
 _REMOTE_CAPABILITIES: dict[str, dict[str, Any]] = {
+    "x": {
+        "read_contents": True, "read_comments": True, "reply": True,
+        "comment": False, "delete": False, "refresh_result": True, "platform_verify": False,
+        "adapters": {"x-browser"},
+    },
     "xiaohongshu": {
         "read_contents": True,
         "read_comments": True,
@@ -47,7 +55,7 @@ _REMOTE_CAPABILITIES: dict[str, dict[str, Any]] = {
 }
 
 _QUESTION_RE = re.compile(r"[?？]|(?:怎么|如何|为啥|为什么|能不能|可以吗|多少|哪里|哪儿)")
-_DEMAND_RE = re.compile(r"(?:求|想要|想买|链接|教程|同款|参数|价格|多少钱|怎么买|怎么做|推荐|哪里买|在哪买)")
+_DEMAND_RE = re.compile(r"(?:求|想要|想买|链接|教程|同款|参数|价格|多少钱|怎么买|怎么做|推荐|哪里买|在哪买)|\b(?:example|tutorial|link|price|recommend|would help)\b", re.I)
 _COMPLAINT_RE = re.compile(r"(?:差|垃圾|坑|避雷|踩雷|翻车|失望|难用|太贵|骗人|假货|后悔|劝退|退款|bug|卡顿)", re.I)
 _POSITIVE_RE = re.compile(r"(?:喜欢|好用|推荐|值得|太棒|厉害|满意|惊喜|有用|干货|收藏|支持|谢谢|感谢|爱了|绝了)", re.I)
 _NEGATIVE_RE = re.compile(r"(?:差|垃圾|坑|避雷|踩雷|翻车|失望|难用|骗人|假货|后悔|劝退|退款|讨厌|不值|烂)", re.I)
@@ -127,7 +135,7 @@ def _analyze(comments: list[dict[str, Any]]) -> dict[str, Any]:
         "unique_authors": len({str(row.get("nickname") or "") for row in comments if row.get("nickname")}),
         "sentiment": {
             "distribution": dist,
-            "ratio": {key: round(value / total, 3) for key, value in dist.items()},
+            "ratio": {key: round(value / total, 3) if total else 0 for key, value in dist.items()},
             "positive_examples": positive[:3],
             "negative_examples": negative[:3],
         },
@@ -140,11 +148,48 @@ def _analyze(comments: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-class InteractionService:
+class InteractionService(InteractionExecution):
     def __init__(self, workspace):
         self.workspace = workspace
         self.store = workspace.store
         self.accounts = workspace.accounts
+
+    @staticmethod
+    def _connection_reason(account: dict[str, Any]) -> str:
+        if account.get("execution_node_id", "local") != "local":
+            return "评论互动暂不支持远程 Browser Node，请使用本地执行设备。"
+        platform = account.get("platform")
+        allowed = (_REMOTE_CAPABILITIES.get(platform) or {}).get("adapters", set())
+        if account.get("adapter", "native") not in allowed:
+            return "X 官方 API 连接尚未接入评论互动，请使用本地 x-browser。" if platform == "x" else "该账号连接方式暂不支持评论互动。"
+        return ""
+
+    @staticmethod
+    def _runtime_reason(platform: str) -> str:
+        if platform == "x":
+            try:
+                from .x_text import count_reply
+                count_reply("就绪")
+            except (ImportError, OSError):
+                return "X 互动依赖未就绪，请重新安装 Ripple，然后重启服务。"
+        return ""
+
+    @staticmethod
+    def _identity_reason(account: dict[str, Any]) -> str:
+        identity = account.get("identity") or {}
+        if not identity.get("logged_in") or not str(identity.get("remote_id") or "").strip():
+            return "需要重新校验账号身份，请点击“校验此账号”；已有评论和草稿仍可查看。"
+        return ""
+
+    @staticmethod
+    def _validate_platform_payload(platform: str, payload: dict[str, Any]) -> None:
+        if platform == "x":
+            reason = InteractionService._runtime_reason(platform)
+            if reason:
+                raise WorkflowError(reason, 503)
+            from .x_text import validate_reply
+            for item in payload.get("items", []):
+                validate_reply(item.get("reply", ""))
 
     def recover(self) -> int:
         """Reconcile in-flight interaction intent after a service restart, never replay it."""
@@ -154,13 +199,18 @@ class InteractionService:
             for row in rows.values():
                 if row.get("status") != "dispatching":
                     continue
-                row.update(status="unknown_result", updated_at=_now())
+                for item in row.get("item_results", []):
+                    if item.get("status") == "pending":
+                        item.update(status="not_submitted", reason="服务重启，尚未开始此条发送。")
+                    elif item.get("status") == "submitting":
+                        item.update(status="unknown_result", reason="执行中断，请逐条核对平台。")
+                row.update(status=self._execution_status(row), updated_at=_now())
                 changed += 1
                 account = state.get("accounts", {}).get(str(row.get("account_id") or ""))
                 operation = (account or {}).get("operation") or {}
                 if account and operation.get("id") == row.get("operation_id") and operation.get("kind") == "interaction":
                     operation["state"] = "recovery_required"
-                    account["operation"] = operation
+                    account["operation"] = operation if row["status"] == "unknown_result" else None
         return changed
 
     def capabilities(self) -> dict[str, Any]:
@@ -169,16 +219,44 @@ class InteractionService:
         items = []
         for platform in platforms:
             row = _capability(platform)
+            runtime_reason = self._runtime_reason(platform)
+            row.update(supported=platform in _REMOTE_CAPABILITIES, availability="missing_dependency" if runtime_reason else "supported" if platform in _REMOTE_CAPABILITIES else "unsupported", reason=runtime_reason)
             linked = [a for a in accounts if a.get("platform") == platform]
             row["account_count"] = len(linked)
             row["connected_count"] = sum(a.get("status") == "connected" for a in linked)
+            row["accounts"] = []
+            for account in linked:
+                connection_reason = self._connection_reason(account)
+                identity_reason = self._identity_reason(account) if account.get("status") == "connected" else ""
+                reason = connection_reason or runtime_reason or identity_reason
+                availability = ("unsupported_connection" if connection_reason else "missing_dependency" if runtime_reason else
+                                "needs_verification" if identity_reason else "disconnected" if account.get("status") != "connected" else "ready")
+                effective = _capability(platform)
+                for action in ("read_contents", "read_comments", "reply", "comment", "delete"):
+                    effective[action] = effective[action] and not reason and account.get("status") == "connected"
+                effective.update(account_id=account["id"], availability=availability, supported=platform in _REMOTE_CAPABILITIES,
+                                 reason=reason or ("账号未连接，请到账号与平台完成连接。" if account.get("status") != "connected" else ""))
+                row["accounts"].append(effective)
+            row["experimental"] = platform == "x"
             row["note"] = (
                 "已接入 Ripple 托管评论同步与写操作；平台复核仍需人工检查。"
                 if platform == "xiaohongshu" else
+                "实验性浏览器模式。X 官方限制非 API 网页自动化，使用可能导致账号永久封禁；这不是官方支持方式。"
+                if platform == "x" else
                 "互动能力尚未接入；当前账号连接只用于已支持的其他产品能力。"
             )
             items.append(row)
-        return {"items": items}
+        watched = [Path(__file__), Path(__file__).with_name("interaction_execution.py"), Path(__file__).with_name("x_text.py")]
+        return {"items": items, "schema_version": 2, "restart_required": any(path.stat().st_mtime > _LOADED_AT for path in watched)}
+
+    def _x_worker(self, account: dict, action: str, params: dict, *, operation_id: str = "") -> dict:
+        interaction = action == "reply"
+        result = self.accounts.run(account, "x_interact" if interaction else "x_read", operation_id or uuid.uuid4().hex,
+                                   headed=False, confirmed=interaction, x_action=action,
+                                   x_params={**params, "expected_account_remote_id": str((account.get("identity") or {}).get("remote_id") or "")})
+        if not interaction and result.get("state") != "success":
+            raise WorkflowError(str(result.get("message") or "X 同步失败，请检查登录和平台验证。"), 409)
+        return result
 
     def _migrate(self, state: dict[str, Any]) -> dict[str, dict[str, Any]]:
         rows = state.setdefault("interactions", {})
@@ -220,6 +298,12 @@ class InteractionService:
         # Compatibility aliases for the previous Xiaohongshu UI/API.
         value.setdefault("note_id", value.get("target_id", ""))
         value.setdefault("note_url", value.get("target_url", ""))
+        if row.get("status") not in {"draft", "cancelled"} and not row.get("item_results"):
+            value["item_results"] = [{"id": item.get("id", ""), "status": "unknown_result",
+                                      "reason": "历史记录缺少逐条执行证据，请人工核对。"}
+                                     for item in ((row.get("payload") or {}).get("items") or ([{"id": "comment"}] if row.get("kind") == "comment" else []))]
+            if value["item_results"]:
+                value["status"] = "unknown_result"
         return value
 
     @staticmethod
@@ -241,11 +325,12 @@ class InteractionService:
             platform = _clean_platform(platform)
         with self.store.transaction() as state:
             rows = list(self._migrate(state).values())
+            availability = {row["id"]: self._retry_availability(state, row) for row in rows}
         selected = [row for row in rows if (not platform or row.get("platform") == platform)
                     and (not account_id or row.get("account_id") == account_id)
                     and (not status or row.get("status") == status)]
         selected.sort(key=lambda row: row.get("created_at", ""), reverse=True)
-        return {"items": [self._project(row) for row in selected[:max(1, min(limit, 200))]]}
+        return {"items": [{**self._project(row), **availability[row["id"]]} for row in selected[:max(1, min(limit, 200))]]}
 
     def _source_rows(self, state: dict[str, Any]) -> dict[str, dict[str, Any]]:
         rows = state.setdefault("interaction_sources", {})
@@ -290,11 +375,18 @@ class InteractionService:
         account = self.accounts.get(account_id)
         if account.get("platform") != platform:
             raise WorkflowError("互动任务的平台与账号不匹配。", 422)
+        reason = self._connection_reason(account)
+        if reason:
+            raise WorkflowError(reason, 409)
         allowed_adapters = cap.get("adapters") or set()
         if allowed_adapters and account.get("adapter", "native") not in allowed_adapters:
             raise WorkflowError("该账号连接方式暂不支持托管互动。", 409)
         if require_connected and account.get("status") != "connected":
             raise WorkflowError("目标账号当前未连接；本地历史仍可查看，但远端同步/写入需要重新连接。", 409)
+        if require_connected:
+            reason = self._runtime_reason(platform) or self._identity_reason(account)
+            if reason:
+                raise WorkflowError(reason, 409)
         operation = account.get("operation") or {}
         if require_idle and operation.get("state") in {"running", "recovery_required"}:
             if operation.get("state") == "recovery_required":
@@ -306,6 +398,9 @@ class InteractionService:
         account = self.accounts.get(account_id)
         platform = str(account.get("platform") or "")
         self._account_for_remote(account_id, platform, "read_contents", require_connected=True, require_idle=True)
+        if platform == "x":
+            data = self._x_worker(account, "contents", {"limit": max(1, min(limit, 30))}).get("data") or {}
+            return {**data, "platform": platform, "source": "connected_account_posts", "fetched_at": _now()}
         if platform == "xiaohongshu":
             data = self.workspace.xhs_ops.notes(account_id, min(limit, 30))
             items = []
@@ -318,25 +413,35 @@ class InteractionService:
                     "url": str(row.get("url") or "")[:2048],
                     "metrics": deepcopy(row.get("metrics") or {}),
                 })
-            return {"platform": platform, "source": data.get("source"), "fetched_at": data.get("fetched_at"), "items": items}
+            return {"platform": platform, "source": data.get("source"), "fetched_at": data.get("fetched_at"), "items": items,
+                    "count": len(items), "limit": min(limit, 30), "sample_scope": "当前账号创作者页面的作品，最多 30 个"}
         raise WorkflowError("该平台的作品同步尚未接入。", 409)
 
     def remote_comments(self, *, account_id: str, target_id: str = "", target_url: str = "", target_label: str = "", limit: int = 100) -> dict[str, Any]:
         account = self.accounts.get(account_id)
         platform = str(account.get("platform") or "")
         self._account_for_remote(account_id, platform, "read_comments", require_connected=True, require_idle=True)
-        if platform != "xiaohongshu":
-            raise WorkflowError("该平台的评论同步尚未接入。", 409)
-        data = self.workspace.xhs_ops.comments(account_id, note_id=target_id, url=target_url, limit=min(limit, 100))
-        comments = [row for row in data.get("comments", []) if isinstance(row, dict)][:MAX_COMMENTS]
+        if platform == "x":
+            if not re.fullmatch(r"[0-9]{1,30}", target_id):
+                raise WorkflowError("需要真实的 X Post ID，请先读取本人作品。", 422)
+            data = self._x_worker(account, "comments", {"target_id": target_id, "limit": min(limit, 100)}).get("data") or {}
+        else:
+            data = self.workspace.xhs_ops.comments(account_id, note_id=target_id, url=target_url, limit=min(limit, 100))
+        if not isinstance(data.get("comments"), list):
+            raise WorkflowError("评论同步没有返回有效列表；同步失败，不代表零评论。", 502)
+        comments = [row for row in data["comments"] if isinstance(row, dict)][:MAX_COMMENTS]
         note_id = str(data.get("note_id") or target_id)[:100]
         locator_public = ""
         try:
+            if platform != "xiaohongshu":
+                raise WorkflowError("X 不使用小红书定位信息。", 409)
             _, locator = self.workspace.xhs_ops._locator(account_id, note_id=note_id, url=target_url)
             from .xhs_ops import _public_url
             locator_public = _public_url(locator)
         except WorkflowError:
             pass
+        if platform == "x":
+            locator_public = f"https://x.com/i/status/{note_id}"
         with self.store.transaction() as state:
             rows = self._source_rows(state)
             existing = next((row for row in rows.values() if row.get("kind") == "remote" and row.get("account_id") == account_id and row.get("target_id") == note_id), None)
@@ -346,6 +451,7 @@ class InteractionService:
                 "account_id": account_id, "account_label": str(account.get("label") or "")[:80],
                 "target_id": note_id, "target_url": locator_public, "comments": comments,
                 "count": len(comments), "updated_at": _now(),
+                "limit": min(limit, 100), "sample_scope": "当前作品页面已读取的评论样本，最多 100 条；不代表全量历史",
             })
             rows[source["id"]] = source
             if len(rows) > MAX_SOURCES:
@@ -354,15 +460,19 @@ class InteractionService:
                         rows.pop(row["id"], None)
             return self._project_source(source)
 
-    def _clean_payload(self, kind: str, items: list[dict[str, Any]], text: str) -> dict[str, Any]:
+    def _clean_payload(self, kind: str, items: list[dict[str, Any]], text: str, *, platform: str = "") -> dict[str, Any]:
         if kind == "reply":
             if not 1 <= len(items) <= 20:
                 raise WorkflowError("一次请选择 1–20 条评论回复。", 422)
             clean = []
+            ids = [str(item.get("id") or "") for item in items]
+            if any(not value for value in ids) or len(set(ids)) != len(ids):
+                raise WorkflowError("回复需要唯一的评论 ID，请重新同步评论。", 422)
             for item in items:
                 reply = str(item.get("reply") or "").strip()
-                if not reply or len(reply) > 1000:
-                    raise WorkflowError("回复内容不能为空且不能超过 1000 字符。", 422)
+                limit = 50000 if platform == "x" else 1000
+                if not reply or len(reply) > limit:
+                    raise WorkflowError(f"回复内容不能为空且不能超过 {limit} 个原始字符。", 422)
                 findings = content_guard.scan(reply)
                 if any(item.category in content_guard.BLOCK_CATEGORIES for item in findings):
                     raise WorkflowError("待发送内容包含疑似凭据或内部配置信息，请修改后再发送。", 422)
@@ -407,6 +517,10 @@ class InteractionService:
             if len(candidates) != 1:
                 raise WorkflowError("互动目标不属于当前评论数据源，或无法唯一定位。请刷新评论后重新选择。", 409)
             original = candidates[0]
+            if source.get("platform") == "x":
+                from .x_interactions_browser import belongs_to
+                if not belongs_to(original, source["target_id"], {str(row.get("id")): row for row in comments}):
+                    raise WorkflowError("无法确认该 X 评论的父级属于当前作品，请重新同步。", 409)
             row = {"id": str(original.get("id") or "")[:100],
                    "nickname": str(original.get("nickname") or "")[:80],
                    "content": str(original.get("content") or "")[:500]}
@@ -429,6 +543,8 @@ class InteractionService:
         if source:
             if platform != source.get("platform"):
                 raise WorkflowError("互动草稿的平台与评论记录不匹配。", 422)
+            if account_id and account_id != source.get("account_id"):
+                raise WorkflowError("所选账号与评论数据源不匹配。", 422)
             items = self._bind_source_items(source, kind, list(items or []))
             account_id = str(source.get("account_id") or "")
             target_id = str(source.get("target_id") or "")
@@ -436,12 +552,14 @@ class InteractionService:
         if not account_id:
             raise WorkflowError("互动草稿需要绑定具体平台账号。", 422)
         account = self._account_for_remote(account_id, platform, kind, require_connected=False)
+        if platform == "x" and (kind != "reply" or not source):
+            raise WorkflowError("X 首版仅支持回复已同步且归属可确认的作品评论。", 422)
         account_label = str(account.get("label") or "")[:80]
         if platform == "xiaohongshu":
             target_id, locator = self.workspace.xhs_ops._locator(account_id, note_id=target_id, url=target_url)
             from .xhs_ops import _public_url
             target_url = _public_url(locator)
-        payload = self._clean_payload(kind, list(items or []), text)
+        payload = self._clean_payload(kind, list(items or []), text, platform=platform)
         key = str(idempotency_key or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9._-]{8,128}", key):
             raise WorkflowError("互动草稿幂等键无效。", 422)
@@ -458,7 +576,7 @@ class InteractionService:
             if same:
                 return self._project(same)
             if len(rows) >= MAX_INTERACTIONS:
-                removable = sorted((row for row in rows.values() if row.get("status") not in {"dispatching", "unknown_result"}), key=lambda row: row.get("created_at", ""))
+                removable = sorted((row for row in rows.values() if row.get("status") == "cancelled" and not row.get("attempts")), key=lambda row: row.get("created_at", ""))
                 if not removable:
                     raise WorkflowError("互动任务已达到上限，请先处理待核对任务。", 422)
                 rows.pop(removable[0]["id"], None)
@@ -468,6 +586,7 @@ class InteractionService:
                 "platform": platform, "source_kind": source.get("kind") if source else "remote", "source_id": source_id,
                 "delivery": delivery, "account_id": account_id, "account_label": account_label,
                 "target_id": str(target_id or "")[:100], "target_url": str(target_url or "")[:2048],
+                "target_label": str((source or {}).get("label") or target_id)[:120],
                 "kind": kind, "payload": payload, "status": "draft", "attempts": 0, "operation_id": None,
                 "result": None, "created_at": _now(), "updated_at": _now(),
             }
@@ -495,7 +614,7 @@ class InteractionService:
                 for before, after in zip(current, proposed):
                     if any(str(before.get(key) or "") != str(after.get(key) or "") for key in ("id", "nickname", "content")):
                         raise WorkflowError("互动草稿的目标评论不能在编辑阶段更换。请重新建立任务。", 409)
-            payload = self._clean_payload(kind, proposed, text)
+            payload = self._clean_payload(kind, proposed, text, platform=str(row.get("platform")))
             row["payload"] = payload
             row["digest"] = fingerprint({"platform": row.get("platform"), "account_id": row.get("account_id"),
                                           "source_id": row.get("source_id"), "target_id": row.get("target_id"),
@@ -516,124 +635,6 @@ class InteractionService:
             if expected_updated_at != row.get("updated_at"):
                 raise WorkflowError("互动草稿已变化，请刷新后再取消。", 409)
             row.update(status="cancelled", updated_at=_now())
-            return self._project(row)
-
-    def execute(self, interaction_id: str, confirmed: bool) -> dict[str, Any]:
-        if not confirmed:
-            raise WorkflowError("请确认将已审阅的互动草稿发送到所选真实平台账号。", 422)
-        seed = self._get_row(interaction_id)
-        if seed.get("status") in {"dispatching", "unknown_result", "verified", "partial"}:
-            # Idempotent, but never treats a second click as authority to replay.
-            return self._project(seed)
-        if seed.get("status") != "draft":
-            raise WorkflowError("当前互动任务不能执行。", 409)
-        if seed.get("delivery") != "remote" or seed.get("source_kind") == "import":
-            raise WorkflowError("历史本地导入草稿只读保留，不能执行平台写入。", 409)
-        platform = str(seed.get("platform") or "")
-        account = self._account_for_remote(str(seed.get("account_id") or ""), platform, str(seed.get("kind") or ""), require_connected=True, require_idle=True)
-        if platform != "xiaohongshu":
-            raise WorkflowError("该平台的托管互动执行尚未接入。", 409)
-        target_id, locator = self.workspace.xhs_ops._locator(account["id"], note_id=str(seed.get("target_id") or ""), url="")
-        with self.store.transaction() as state:
-            rows = self._migrate(state)
-            row = rows.get(interaction_id)
-            if not row:
-                raise WorkflowError("互动任务不存在。", 404)
-            if row.get("status") in {"dispatching", "unknown_result", "verified", "partial"}:
-                return self._project(row)
-            if row.get("status") != "draft":
-                raise WorkflowError("当前互动任务不能执行。", 409)
-            current_account = state.get("accounts", {}).get(account["id"])
-            if not current_account or current_account.get("status") != "connected":
-                raise WorkflowError("目标账号当前未连接；草稿仍会保留。", 409)
-            current_operation = current_account.get("operation") or {}
-            if current_operation.get("state") in {"running", "recovery_required"}:
-                raise WorkflowError("目标账号当前有未结束或待核对的操作。", 409)
-            operation_id = uuid.uuid4().hex
-            row.update(status="dispatching", attempts=int(row.get("attempts") or 0) + 1,
-                       operation_id=operation_id, updated_at=_now(), account_label=str(account.get("label") or "")[:80])
-            current_account["operation"] = {
-                "id": operation_id, "kind": "interaction", "state": "running",
-                "interaction_id": interaction_id, "started_at": _now(),
-            }
-            work = deepcopy(row)
-        action = {"reply": "reply", "delete": "delete", "comment": "comment"}[str(work["kind"])]
-        try:
-            result = self.workspace.xhs_ops.execute_interaction_action(account["id"], action, locator, work["payload"], operation_id)
-        except Exception as exc:
-            # The execution intent was already persisted. An unexpected exception can
-            # no longer prove that the platform write did not happen, so fail closed.
-            self._finish(interaction_id, {"state": "unknown_result", "data": {}})
-            if isinstance(exc, WorkflowError):
-                raise
-            raise WorkflowError("互动执行意外中断，结果未知；请先核对，Ripple 不会自动重发。", 502) from exc
-        return self._finish(interaction_id, result)
-
-    def _finish(self, interaction_id: str, result: dict[str, Any]) -> dict[str, Any]:
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        states: list[str] = []
-        if isinstance(data.get("results"), list):
-            states = [str(item.get("status") or "") for item in data["results"] if isinstance(item, dict)]
-        elif data.get("status"):
-            states = [str(data.get("status"))]
-        if states and all(value == "verified" for value in states):
-            status = "verified"
-        elif states and all(value == "not_submitted" for value in states):
-            status = "not_submitted"
-        elif "unknown_result" in states or result.get("state") == "unknown_result":
-            status = "unknown_result"
-        elif states:
-            status = "partial"
-        else:
-            status = "unknown_result" if result.get("state") == "unknown_result" else "not_submitted"
-        with self.store.transaction() as state:
-            row = self._migrate(state).get(interaction_id)
-            if not row:
-                raise WorkflowError("互动任务记录已丢失，请人工核对平台后再操作。", 409)
-            row.update(status=status, result=deepcopy(data), updated_at=_now())
-            account = state.get("accounts", {}).get(str(row.get("account_id") or ""))
-            operation = (account or {}).get("operation") or {}
-            if account and operation.get("id") == row.get("operation_id") and operation.get("kind") == "interaction":
-                if status == "unknown_result":
-                    operation["state"] = "recovery_required"
-                    account["operation"] = operation
-                else:
-                    account["operation"] = None
-            return self._project(row)
-
-    def refresh_result(self, interaction_id: str) -> dict[str, Any]:
-        row = self._get_row(interaction_id)
-        if row.get("status") not in {"dispatching", "unknown_result"} or not row.get("operation_id"):
-            return {"source": "local_ledger", "platform_verified": False, "interaction": self._project(row)}
-        account_id = str(row.get("account_id") or "")
-        if not account_id:
-            return {"source": "local_worker", "platform_verified": False, "interaction": self._project(row)}
-        result = self.accounts.read_result(account_id, str(row["operation_id"]))
-        interaction = self._finish(interaction_id, {"state": result.get("state"), "data": result.get("data") or {}}) if result else self._project(row)
-        return {"source": "local_worker", "platform_verified": False, "interaction": interaction,
-                "note": "这里只刷新 Ripple 本地 Worker 回执；没有重新查询平台当前状态。"}
-
-    def resolve_unknown(self, interaction_id: str, *, result: str, confirmed: bool, note: str = "") -> dict[str, Any]:
-        if not confirmed:
-            raise WorkflowError("请确认你已经在对应平台人工检查了这次互动结果。", 422)
-        if result not in {"verified", "not_submitted"}:
-            raise WorkflowError("人工核对结果无效。", 422)
-        with self.store.transaction() as state:
-            row = self._migrate(state).get(interaction_id)
-            if not row:
-                raise WorkflowError("互动任务不存在。", 404)
-            if row.get("status") != "unknown_result":
-                raise WorkflowError("只有结果未知的真实互动可以记录人工核对结果。", 409)
-            account = state.get("accounts", {}).get(str(row.get("account_id") or ""))
-            operation = (account or {}).get("operation") or {}
-            if account and operation.get("id") == row.get("operation_id") and operation.get("kind") == "interaction":
-                account["operation"] = None
-            row.update(
-                status=result,
-                resolution={"source": "manual_platform_check", "result": result,
-                            "note": str(note or "").strip()[:500], "at": _now()},
-                updated_at=_now(),
-            )
             return self._project(row)
 
     def verify_platform(self, interaction_id: str) -> dict[str, Any]:

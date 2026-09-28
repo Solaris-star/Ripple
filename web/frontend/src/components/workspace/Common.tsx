@@ -7,7 +7,7 @@ import { platformDisplayName } from '../../lib/platforms';
 export function Mark({ platform, size = 17 }: { platform: string; size?: number }) {
   return <span className={`r2-mark r2-mark-${platform}`} title={platformDisplayName(platform)} aria-hidden="true"><PlatformIcon platform={platform} size={size} /></span>;
 }
-export function Status({ status }: { status: string }) { return <span className={`r2-status r2-status-${status}`}><i />{LABELS[status] || status}</span>; }
+export function Status({ status, label }: { status: string; label?: string }) { return <span className={`r2-status r2-status-${status}`}><i />{label || LABELS[status] || status}</span>; }
 export function Empty({ title, description, children }: { title: string; description?: string; children?: ReactNode }) {
   return <div className="r2-empty"><strong>{title}</strong>{description && <p>{description}</p>}{children}</div>;
 }

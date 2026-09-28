@@ -273,3 +273,10 @@
   .idea-brief-actions { flex-wrap: wrap; }
   .idea-brief-actions > span { flex-basis: 100%; }
 }
+.idea-count-field { display: flex; align-items: center; gap: 10px; margin: 10px 0; font-size: 13px; }
+.idea-count-field select { padding: 5px 10px; }
+.idea-count-field small { color: var(--text-muted); }
+.brief-simple .idea-lock { display: none; }
+.brief-simple .idea-brief-lock-row { grid-template-columns: 1fr; }
+.brief-simple .idea-outline-row input:nth-of-type(2) { display: none; }
+.idea-brief-block[hidden] { display: none; }

@@ -339,8 +339,6 @@ class AgentCapabilityRegistry:
             current["effort_mode"] = "instruction_fallback" if current["effort"] != "auto" else "auto"
             state = self._session_state(); sessions = state["sessions"]
             sessions[session_id] = {k: deepcopy(current[k]) for k in ("runtime_id", "profile_id", "runtime_locked", "model", "effort", "pinned_skills", "enabled_tools", "enabled_mcp_tools", "enabled_plugins")}
-            if len(sessions) > 200:
-                for key in list(sessions)[:-200]: sessions.pop(key, None)
             _atomic_json(self.sessions_path, state)
             return current
 
@@ -362,8 +360,6 @@ class AgentCapabilityRegistry:
             raw["profile_id"] = profile_id
             raw["runtime_locked"] = True
             sessions[session_id] = raw
-            if len(sessions) > 200:
-                for key in list(sessions)[:-200]: sessions.pop(key, None)
             _atomic_json(self.sessions_path, state)
 
     def execute_mcp(self, capability_id: str, arguments: dict) -> dict:

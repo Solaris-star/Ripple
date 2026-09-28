@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=83.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,7 @@ version = "0.2.7"
 description = "Ripple 本地优先内容工作台"
 readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSES/Unicode-3.0.txt", "LICENSES/twitter-text-parser-MIT.txt"]
 requires-python = ">=3.10"
 # 运行依赖统一安装，确保 Web、媒体处理和浏览器发布开箱可用。
 dependencies = [
@@ -21,7 +22,7 @@ dependencies = [
     "Pillow>=10,<13", "opencv-python>=4.8,<5", "numpy>=1.26,<3",
     "pandas>=2,<4", "matplotlib>=3.8,<4", "librosa>=0.10,<1",
     "faster-whisper>=1,<2", "edge-tts>=6,<8", "playwright>=1.45,<2",
-    "rembg>=2.0,<3", "biliup>=1,<2", "jieba>=0.42,<1", "snownlp>=0.12,<1",
+    "rembg>=2.0,<3", "biliup>=1,<2", "streamlink>=8.6,<9", "jieba>=0.42,<1", "snownlp>=0.12,<1",
     "markdown>=3.5,<4",
     "tzdata>=2025.2",
     "filelock>=3.20,<4", "httpx[socks]>=0.28,<1", "PyYAML>=6,<7", # HTTP(S)/SOCKS5 Provider proxy + IANA time zones
@@ -40,4 +41,4 @@ ripple = "ripple.cli:main"
 include = ["ripple*"]
 
 [tool.setuptools.package-data]
-ripple = ["agent_adapters.json"]
+ripple = ["agent_adapters.json", "data/*.json"]

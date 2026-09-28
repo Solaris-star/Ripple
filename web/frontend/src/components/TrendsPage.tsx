@@ -1,26 +1,23 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { fetchTrends, createIdea } from '../lib/api';
 import type { TrendGroup } from '../lib/api';
 import { IconFire, IconRefresh, IconBookmark, IconCheck, IconSkills } from './icons';
 import { api as rippleApi, xhsFeed, xhsSearch } from '../lib/ripple';
-import type { Account, XhsNoteSummary, XhsMetrics } from '../lib/ripple';
+import type { Account, XhsNoteSummary } from '../lib/ripple';
+import type { SessionWorkScope } from '../lib/store';
+import { sampleMetricSummary } from '../lib/creationIntent';
+import { platformDisplayName } from '../lib/platforms';
 import { TREND_PLATFORMS, ALL_TREND_KEYS, loadTrendSelection, saveTrendSelection } from '../lib/trendPrefs';
 import { PlatformIcon } from './PlatformBrand';
 
 interface TrendsPageProps {
+  workScope?: SessionWorkScope;
   onOpenIdeas: (seed: { trend_title: string; trend_platform: string }) => void;
   onBreakdown: (seed: string) => void;
 }
 
-function metricText(metrics: XhsMetrics): string {
-  const rows = [
-    ['赞', metrics.likes], ['藏', metrics.collects], ['评', metrics.comments], ['浏览', metrics.views],
-  ].filter((row) => typeof row[1] === 'number') as [string, number][];
-  return rows.map(([label, value]) => `${label} ${value.toLocaleString()}`).join(' · ');
-}
-
-export default function TrendsPage({ onOpenIdeas, onBreakdown }: TrendsPageProps) {
-  const [selected, setSelected] = useState<string[]>(() => loadTrendSelection());
+export default function TrendsPage({ workScope, onOpenIdeas, onBreakdown }: TrendsPageProps) {
+  const [selected, setSelected] = useState<string[]>(() => workScope?.platform && ALL_TREND_KEYS.includes(workScope.platform as never) ? [workScope.platform] : loadTrendSelection());
   const [groups, setGroups] = useState<TrendGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -33,26 +30,35 @@ export default function TrendsPage({ onOpenIdeas, onBreakdown }: TrendsPageProps
   const [xhsQuery, setXhsQuery] = useState('');
   const [xhsOpsItems, setXhsOpsItems] = useState<XhsNoteSummary[]>([]);
   const [xhsOpsScope, setXhsOpsScope] = useState('');
+  const loadSequence = useRef(0);
+  const sampleSequence = useRef(0);
 
   const save = async (title: string, source: string) => {
     if (saved.has(title)) return;
     try {
-      await createIdea({ title, source, status: 'pending' });
+      await createIdea({ title, source, status: 'pending', target_platforms: workScope?.platform ? [workScope.platform] : [] });
       setSaved((prev) => new Set(prev).add(title));
     } catch { /* keep the trend view usable if the idea store is temporarily busy */ }
   };
 
   const load = useCallback((pfs: string[], force = false) => {
-    if (pfs.length === 0) { setGroups([]); return; }
+    const sequence = ++loadSequence.current;
+    if (pfs.length === 0) { setGroups([]); setLoading(false); setError(''); return; }
     setLoading(true); setError('');
     fetchTrends(pfs.join(','), 15, { refresh: force })
-      .then((d) => { setGroups(d.trends); setUpdated(d.updated); })
-      .catch((e) => setError(e instanceof Error ? e.message : '热点服务请求失败。'))
-      .finally(() => setLoading(false));
+      .then((d) => { if (sequence === loadSequence.current) { setGroups(d.trends); setUpdated(d.updated); } })
+      .catch((e) => { if (sequence === loadSequence.current) setError(e instanceof Error ? e.message : '热点服务请求失败。'); })
+      .finally(() => { if (sequence === loadSequence.current) setLoading(false); });
   }, []);
 
   useEffect(() => { load(selected); }, [load, selected]);
   useEffect(() => { saveTrendSelection(selected); }, [selected]);
+  useEffect(() => {
+    if (workScope?.platform && ALL_TREND_KEYS.includes(workScope.platform as never)) {
+      const platform = workScope.platform;
+      setSelected((current) => current.length === 1 && current[0] === platform ? current : [platform]);
+    }
+  }, [workScope?.platform, workScope?.accountId]);
   useEffect(() => {
     rippleApi<Account[]>('/api/ripple/accounts')
       .then((rows) => {
@@ -62,6 +68,15 @@ export default function TrendsPage({ onOpenIdeas, onBreakdown }: TrendsPageProps
       })
       .catch(() => {});
   }, []);
+  useEffect(() => {
+    if (workScope?.platform !== 'xiaohongshu' || workScope.targetKind !== 'account') return;
+    setXhsCandidate(xhsAccounts.some((account) => account.id === workScope.accountId) ? workScope.accountId : '');
+  }, [workScope?.platform, workScope?.targetKind, workScope?.accountId, xhsAccounts]);
+  useEffect(() => {
+    // 切换账号后丢弃旧请求的结果，避免把上个账号的样本用于当前账号。
+    sampleSequence.current += 1;
+    setXhsOpsItems([]); setXhsOpsScope(''); setXhsOpsLoading(false);
+  }, [xhsCandidate]);
 
   const readXiaohongshu = async (accountId?: string) => {
     if (xhsLoading) return;
@@ -82,17 +97,20 @@ export default function TrendsPage({ onOpenIdeas, onBreakdown }: TrendsPageProps
   };
 
   const runXhsOps = async (mode: 'feed' | 'search') => {
+    if (xhsOpsLoading) return;
     if (!xhsCandidate) { setError('请先在「账号与平台」连接一个小红书账号。'); return; }
     if (mode === 'search' && !xhsQuery.trim()) { setError('请输入要搜索的小红书关键词。'); return; }
+    const sequence = ++sampleSequence.current;
     setXhsOpsLoading(true); setError('');
     try {
       const data = mode === 'feed'
         ? await xhsFeed(xhsCandidate, 16)
         : await xhsSearch(xhsCandidate, xhsQuery.trim(), 16);
+      if (sequence !== sampleSequence.current) return;
       setXhsOpsItems(data.items || []);
       setXhsOpsScope(mode === 'feed' ? '当前账号的个性化推荐样本' : `关键词「${xhsQuery.trim()}」搜索样本`);
-    } catch (e) { setError(e instanceof Error ? e.message : '小红书内容读取失败。'); }
-    finally { setXhsOpsLoading(false); }
+    } catch (e) { if (sequence === sampleSequence.current) setError(e instanceof Error ? e.message : '小红书内容读取失败。'); }
+    finally { if (sequence === sampleSequence.current) setXhsOpsLoading(false); }
   };
 
   const breakdown = (item: XhsNoteSummary) => {
@@ -123,6 +141,7 @@ export default function TrendsPage({ onOpenIdeas, onBreakdown }: TrendsPageProps
       </div>
 
       <div className="trend-platforms">
+        {workScope && <span className="r2-muted">当前账号：{workScope.accountLabel} · {platformDisplayName(workScope.platform)}</span>}
         <button className={`chip ${selected.length === ALL_TREND_KEYS.length ? 'active' : ''}`}
           onClick={() => setSelected((prev) => {
             const next = prev.length === ALL_TREND_KEYS.length ? [] : [...ALL_TREND_KEYS];
@@ -147,13 +166,15 @@ export default function TrendsPage({ onOpenIdeas, onBreakdown }: TrendsPageProps
         </div>
         {xhsOpsScope && <div className="xhs-sample-scope">样本范围：{xhsOpsScope} · {xhsOpsItems.length} 条。这里只代表本次可见样本。</div>}
         {xhsOpsItems.length > 0 && <div className="xhs-sample-list">
-          {xhsOpsItems.map((item, index) => <div className="xhs-sample-row" key={`${item.note_id}-${index}`}>
+          {xhsOpsItems.map((item, index) => {
+            const metrics = sampleMetricSummary(item.metrics || {});
+            return <div className="xhs-sample-row" key={`${item.note_id}-${index}`}>
             <span className="trend-rank">{index + 1}</span>
-            <div className="xhs-sample-main"><a href={item.url || undefined} target="_blank" rel="noreferrer">{item.title}</a><small>{item.author ? `@${item.author}` : '作者信息未读取'}{metricText(item.metrics) ? ` · ${metricText(item.metrics)}` : ' · 互动指标未读取'}</small></div>
+            <div className="xhs-sample-main"><a href={item.url || undefined} target="_blank" rel="noreferrer">{item.title}</a><small>{item.author ? `@${item.author}` : '作者信息未读取'} · {metrics.text}</small><small>指标完整度 {metrics.known}/{metrics.total} · 未读取的数据保持未知</small></div>
             <button className="trend-save" title="存入选题库" onClick={() => void save(item.title, xhsOpsScope)}>{saved.has(item.title) ? <IconCheck size={14} /> : <IconBookmark size={14} />}</button>
-            <button className="trend-use" onClick={() => breakdown(item)}><IconSkills size={12} /> 拆解</button>
+            <button className="trend-use" onClick={() => breakdown(item)}><IconSkills size={12} /> 分析内容</button>
             <button className="trend-use" title="围绕此热点找选题" onClick={() => onOpenIdeas({ trend_title: item.title, trend_platform: 'xiaohongshu' })}>找选题</button>
-          </div>)}
+          </div>; })}
         </div>}
         {!xhsCandidate && <div className="trend-empty-hint">连接小红书账号后可读取推荐流、关键词搜索、自己的近期作品和评论。Ripple 不复用日常浏览器登录态。</div>}
       </section>

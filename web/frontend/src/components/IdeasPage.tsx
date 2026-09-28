@@ -13,9 +13,12 @@ import { loadTrendSelection, TREND_PLATFORMS } from '../lib/trendPrefs';
 import { PlatformIcon } from './PlatformBrand';
 import { platformDisplayName } from '../lib/platforms';
 import { newId } from '../lib/id';
-import { executeStructuredOperation, fetchStructuredOperations } from '../lib/ripple';
-import type { OperationResult, TopicEvaluationOutput } from '../lib/ripple';
+import { api, executeStructuredOperation, fetchStructuredOperations } from '../lib/ripple';
+import type { Channel, OperationResult, TopicEvaluationOutput } from '../lib/ripple';
+import { channelCapabilityText } from '../lib/channelCapability';
 import IdeaBriefEditor from './IdeaBriefEditor';
+import type { SessionWorkScope } from '../lib/store';
+import { ideaContentContext } from '../lib/creationIntent';
 import '../styles/ideas-workbench.css';
 
 interface IdeasPageProps {
@@ -24,12 +27,13 @@ interface IdeasPageProps {
   persona: string;
   aiReady: boolean;
   accountIds?: string[];
+  workScope?: SessionWorkScope;
+  selectedPlatform?: string;
   personas: PersonaItem[];
   onPersonaChange: (name: string) => void;
   onNewPersona: () => void;
 }
 
-const TARGET_PLATFORMS = ['xiaohongshu', 'douyin', 'bilibili', 'wechat', 'weixin-channels', 'zhihu', 'x'] as const;
 const ACTIVE_RUNS = new Set(['queued', 'running', 'partial', 'waiting_user']);
 const STAGE_LABELS: Record<string, string> = {
   candidate: '候选', saved: '待深化', developing: '策划中', review: '待确认',
@@ -43,7 +47,7 @@ const BOARD_COLUMNS = [
   { key: 'done', label: '已完成', stages: ['done'] },
 ];
 
-const blankIdea = (persona = ''): IdeaInput => ({ title: '', note: '', source: '手动灵感', status: 'pending', stage: 'saved', persona });
+const blankIdea = (persona = '', platforms: string[] = []): IdeaInput => ({ title: '', note: '', source: '手动灵感', status: 'pending', stage: 'saved', persona, target_platforms: [...platforms] });
 const keyFor = (prefix: string) => (prefix + '-' + newId().replaceAll('-', '')).slice(0, 120);
 
 function recommendationLevel(score = 0): string {
@@ -63,7 +67,7 @@ function sourceLabel(source: IdeaSourceSnapshot): string {
 }
 
 export default function IdeasPage({
-  onUseTopic, onOpenContent, persona, aiReady, accountIds = [], personas, onPersonaChange, onNewPersona,
+  onUseTopic, persona, aiReady, accountIds = [], workScope, selectedPlatform, personas, onPersonaChange, onNewPersona,
 }: IdeasPageProps) {
   const [ideas, setIdeas] = useState<Idea[]>([]);
   const [runs, setRuns] = useState<IdeaRun[]>([]);
@@ -71,12 +75,20 @@ export default function IdeasPage({
   const [mineView, setMineView] = useState<'list' | 'board'>('list');
   const [mineFilter, setMineFilter] = useState('all');
   const [query, setQuery] = useState('');
-  const [targetPlatforms, setTargetPlatforms] = useState<string[]>([]);
+  const currentPlatform = workScope?.platform || selectedPlatform;
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const TARGET_PLATFORMS = channels.map(channel => channel.id);
+  const targetLabel = (platform: string) => `${platformDisplayName(platform)} · ${channelCapabilityText(channels.find(channel => channel.id === platform))}`;
+  useEffect(() => { void api<Channel[]>('/api/ripple/channels').then(setChannels).catch(() => setError('平台能力清单读取失败，请刷新页面后重试。')); }, []);
+  const [targetPlatforms, setTargetPlatforms] = useState<string[]>(() => currentPlatform ? [currentPlatform] : []);
   const [includeTrends, setIncludeTrends] = useState(true);
   const [includeCampaigns, setIncludeCampaigns] = useState(true);
   const [goal, setGoal] = useState('');
   const [effort, setEffort] = useState(120);
   const [instruction, setInstruction] = useState('');
+  const [candidateCount, setCandidateCount] = useState(3);
+  const [candidateRunId, setCandidateRunId] = useState('');
+  const [restoredTrendSources, setRestoredTrendSources] = useState<string[] | null>(null);
   const [workbenchMode, setWorkbenchMode] = useState<'proactive' | 'manual'>('manual');
   const [discovery, setDiscovery] = useState<IdeaDiscoveryState | null>(null);
   const [discoveryAccounts, setDiscoveryAccounts] = useState<IdeaDiscoveryAccount[]>([]);
@@ -104,6 +116,8 @@ export default function IdeasPage({
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [form, setForm] = useState<IdeaInput | null>(null);
   const [editId, setEditId] = useState('');
+  const [startingIdea, setStartingIdea] = useState('');
+  const startGate = useRef(false);
   const [briefIdea, setBriefIdea] = useState<Idea | null>(null);
   const [brief, setBrief] = useState<IdeaBrief | null>(null);
   const [briefBusy, setBriefBusy] = useState(false);
@@ -120,7 +134,21 @@ export default function IdeasPage({
   const discoveryHydratedRevision = useRef(-1);
   const discoveryModeInitialized = useRef(false);
 
-  const trendSelection = loadTrendSelection();
+  const trendSelection = restoredTrendSources || loadTrendSelection();
+  useEffect(() => { setCandidateRunId(''); setRestoredTrendSources(null); }, [persona]);
+
+  const restoreRun = (run: IdeaRun) => {
+    const request = run.request;
+    setCandidateRunId(run.id); setTab('candidates'); setWorkbenchMode('manual'); setHistoryOpen(false);
+    setGoal(String(request.goal || '')); setInstruction(String(request.instruction || ''));
+    setCandidateCount(Math.max(1, Math.min(12, Number(request.limit) || 3)));
+    setEffort(Number(request.effort_minutes) || 0);
+    setIncludeTrends(request.include_trends !== false); setIncludeCampaigns(request.include_campaigns !== false);
+    setTargetPlatforms(run.target_platforms);
+    setRestoredTrendSources(run.trend_sources);
+    setFixedTrendTitles(Array.isArray(request.trend_titles) ? request.trend_titles.filter((value): value is string => typeof value === 'string') : []);
+    setError(run.error || '');
+  };
   const trendLabels = TREND_PLATFORMS.filter((value) => trendSelection.includes(value.key)).map((value) => value.label);
 
   const showToast = (message: string) => {
@@ -176,6 +204,9 @@ export default function IdeasPage({
     setPolicyEditing(false);
   }, [persona]);
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    setTargetPlatforms(currentPlatform ? [currentPlatform] : []);
+  }, [currentPlatform, workScope?.accountId]);
   useEffect(() => {
     if (!discovery?.policy) setPolicyAccountIds(accountIds);
   }, [accountIds, discovery?.policy]);
@@ -249,6 +280,9 @@ export default function IdeasPage({
 
   const candidates = useMemo(() => ideas.filter((idea) => stageOf(idea) === 'candidate' && (!persona || !idea.persona || idea.persona === persona)), [ideas, persona]);
   const visibleCandidates = useMemo(() => candidates.filter((idea) => workbenchMode === 'proactive' ? idea.origin === 'automatic' : idea.origin !== 'automatic'), [candidates, workbenchMode]);
+  const latestRunId = candidateRunId || runs.find(run => run.kind === 'recommend' && run.persona === persona)?.id || '';
+  const batchCandidates = workbenchMode === 'proactive' ? visibleCandidates : visibleCandidates.filter(idea => idea.run_id === latestRunId);
+  const historyCandidates = workbenchMode === 'proactive' ? [] : visibleCandidates.filter(idea => idea.run_id !== latestRunId);
   const proactiveUnread = useMemo(() => candidates.filter((idea) => idea.origin === 'automatic' && idea.unread && idea.validity !== 'expired').length, [candidates]);
   const policyAvailableAccounts = useMemo(() => discoveryAccounts.filter((account) => account.status === 'connected' && policyTargets.includes(account.platform)), [discoveryAccounts, policyTargets]);
   const discoveryPolicy = discovery?.policy || null;
@@ -316,10 +350,11 @@ export default function IdeasPage({
         instruction: instruction.trim(),
         goal: goal.trim(),
         effort_minutes: effort,
-        limit: 6,
+        limit: candidateCount,
         idempotency_key: keyFor('ideas'),
       });
       setActiveRun(run);
+      setCandidateRunId(run.id);
       setRuns((current) => [run, ...current.filter((value) => value.id !== run.id)].slice(0, 20));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Agent 选题任务创建失败');
@@ -405,14 +440,27 @@ export default function IdeasPage({
     } finally { setBriefBusy(false); }
   };
 
-  const confirmBrief = async () => {
+  const confirmBrief = async (data: IdeaBriefData, locked: string[], startAfterConfirm = false) => {
     if (!briefIdea || !brief) return;
     setBriefBusy(true);
     try {
-      const confirmed = await confirmIdeaBrief(briefIdea.id, brief.revision);
+      const changed = JSON.stringify(data) !== JSON.stringify(brief.data)
+        || JSON.stringify(locked) !== JSON.stringify(brief.locked_fields || []);
+      const current = changed
+        ? await updateIdeaBrief(briefIdea.id, { expected_revision: brief.revision, data, locked_fields: locked })
+        : brief;
+      if (changed) setBrief(current);
+      const confirmed = await confirmIdeaBrief(briefIdea.id, current.revision);
       setBrief(confirmed);
+      if (startAfterConfirm) {
+        const result = await startIdeaContent(briefIdea.id, confirmed.revision, 'idea-' + briefIdea.id + '-brief-' + confirmed.revision + '-content')
+          .catch(cause => { throw new Error(`策划已保存，生成稿件失败：${cause instanceof Error ? cause.message : '请重试'}`); });
+        setBriefIdea(null); setBrief(null);
+        onUseTopic(ideaContentContext(result.idea, confirmed, result.content.id, result.created));
+        return;
+      }
       await load();
-      showToast('策划已确认，可以进入内容制作');
+      showToast('策划已确认，可以生成图文草稿');
     } finally { setBriefBusy(false); }
   };
 
@@ -421,26 +469,21 @@ export default function IdeasPage({
     setBriefBusy(true);
     try {
       const result = await startIdeaContent(briefIdea.id, brief.revision, 'idea-' + briefIdea.id + '-brief-' + brief.revision + '-content');
-      const context: TopicUseContext = {
-        title: result.idea.title,
-        ideaId: result.idea.id,
-        contentId: result.content.id,
-        brief: brief.data,
-        autoStart: false,
-        angle: result.idea.angle,
-        reason: result.idea.reason,
-        campaignId: result.idea.campaign_id,
-        campaignRuleVersion: result.idea.campaign_rule_version,
-        trendRefs: result.idea.trend_refs,
-        targetPlatforms: result.idea.target_platforms,
-        requirements: result.idea.requirements,
-        pendingChecks: result.idea.pending_checks,
-        source: result.idea.source,
-      };
+      const context = ideaContentContext(result.idea, brief, result.content.id, result.created);
       setBriefIdea(null);
       setBrief(null);
       onUseTopic(context);
     } finally { setBriefBusy(false); }
+  };
+
+  const startManualContent = async (idea: Idea) => {
+    if (startGate.current) return;
+    startGate.current = true; setStartingIdea(idea.id); setError('');
+    try {
+      const result = await startIdeaContent(idea.id, 0, `idea-${idea.id}-manual-content`, true);
+      onUseTopic(ideaContentContext(result.idea, null, result.content.id, false));
+    } catch (cause) { setError(cause instanceof Error ? cause.message : '打开稿件失败'); }
+    finally { startGate.current = false; setStartingIdea(''); }
   };
 
   const saveForm = async () => {
@@ -558,10 +601,11 @@ export default function IdeasPage({
       {idea.angle && <p>{idea.angle}</p>}
       <div className="idea-platform-list">{(idea.target_platforms || []).map((platform) => <span key={platform}><PlatformIcon platform={platform} size={12} />{platformDisplayName(platform)}</span>)}</div>
       <footer>
-        {stage === 'saved' && <button className="btn btn-sm btn-primary" onClick={() => void develop(idea)} disabled={!aiReady}>深化策划</button>}
+        {!['archived', 'rejected', 'done'].includes(stage) && <button className="btn btn-sm btn-primary" disabled={!!startingIdea} onClick={() => void startManualContent(idea)}>{startingIdea === idea.id ? '正在打开…' : idea.content_id ? '继续写稿' : '开始写稿'}</button>}
+        {stage === 'saved' && <button className="btn btn-sm" onClick={() => void develop(idea)} disabled={!aiReady}>完善策划</button>}
         {stage === 'developing' && <span className="idea-progress-label">Agent 正在深化…</span>}
         {['review', 'ready'].includes(stage) && <button className="btn btn-sm btn-primary" onClick={() => void openBrief(idea.id)}>{stage === 'ready' ? '查看已确认策划' : '继续策划'}</button>}
-        {stage === 'production' && idea.content_id && <button className="btn btn-sm btn-primary" onClick={() => onOpenContent ? onOpenContent(idea.content_id!) : onUseTopic({ title: idea.title, ideaId: idea.id, contentId: idea.content_id })}>打开内容</button>}
+        {stage === 'production' && <button className="btn btn-sm" onClick={() => void openBrief(idea.id)}>编辑策划</button>}
         <button className="btn btn-sm" onClick={() => { setScheduleIdea(idea); setScheduleDate(''); setScheduleTime(''); }}><IconCalendar size={13} /> {idea.plan_id ? '调整排期' : '排期'}</button>
         {evaluationReady && <button className="btn btn-sm" disabled={evaluating} onClick={() => void evaluate(idea)}>七维评估</button>}
       </footer>
@@ -571,7 +615,7 @@ export default function IdeasPage({
   return <div className="page-scroll ideas-page ideas-workbench">
     <div className="page-head ideas-workbench-head">
       <div><h1 className="page-title"><IconIdea size={21} /> 选题库</h1><p className="page-subtitle">让 Agent 结合账号定位、每日热点和活动机会，先给候选，再把你选中的方向深化成可制作策划。</p></div>
-      <div className="idea-head-actions"><div className="idea-mode-switch"><button className={workbenchMode === 'proactive' ? 'active' : ''} onClick={() => setWorkbenchMode('proactive')}>主动发现{proactiveUnread > 0 && <b>{proactiveUnread}</b>}</button><button className={workbenchMode === 'manual' ? 'active' : ''} onClick={() => setWorkbenchMode('manual')}>按需找选题</button></div><button className="btn btn-sm" onClick={() => setHistoryOpen(true)}>历史批次</button><button className="btn btn-sm" onClick={() => { setEditId(''); setForm(blankIdea(persona)); }}>+ 记灵感</button></div>
+      <div className="idea-head-actions"><div className="idea-mode-switch"><button className={workbenchMode === 'proactive' ? 'active' : ''} onClick={() => setWorkbenchMode('proactive')}>主动发现{proactiveUnread > 0 && <b>{proactiveUnread}</b>}</button><button className={workbenchMode === 'manual' ? 'active' : ''} onClick={() => setWorkbenchMode('manual')}>按需找选题</button></div><button className="btn btn-sm" onClick={() => setHistoryOpen(true)}>历史批次</button><button className="btn btn-sm" onClick={() => { setEditId(''); setForm(blankIdea(persona, targetPlatforms)); }}>+ 记灵感</button></div>
     </div>
 
     {workbenchMode === 'proactive' ? <section className="idea-discovery-panel card">
@@ -579,7 +623,7 @@ export default function IdeasPage({
       {discoveryPolicy?.requires_review && <div className="campaign-snapshot-notice stale">{discoveryPolicy.review_reason || '画像或账号范围已变化，请确认策略后再继续主动发现。'} 当前不会启动新的模型分析。</div>}
       {!persona ? <div className="idea-discovery-empty"><strong>先选择账号画像</strong><p>主动发现需要一个长期账号策略；首次只需确认方向和目标平台。</p><button className="btn btn-sm" onClick={onNewPersona}>选择 / 创建画像</button></div>
         : (!discoveryPolicy?.enabled || policyEditing || discoveryPolicy?.requires_review) ? <div className="idea-policy-form">
-          <div className="idea-policy-row"><span>目标平台 *</span><div className="idea-target-platforms">{TARGET_PLATFORMS.map((platform) => <button key={platform} className={policyTargets.includes(platform) ? 'chip active' : 'chip'} onClick={() => setPolicyTargets((current) => current.includes(platform) ? current.filter((value) => value !== platform) : [...current, platform])}><PlatformIcon platform={platform} size={12} />{platformDisplayName(platform)}</button>)}</div></div>
+          <div className="idea-policy-row"><span>目标平台 *</span><div className="idea-target-platforms">{TARGET_PLATFORMS.map((platform) => <button key={platform} className={policyTargets.includes(platform) ? 'chip active' : 'chip'} onClick={() => setPolicyTargets((current) => current.includes(platform) ? current.filter((value) => value !== platform) : [...current, platform])}><PlatformIcon platform={platform} size={12} />{targetLabel(platform)}</button>)}</div></div>
           <div className="idea-policy-grid">
             <label className="wide">关注方向<input value={policyFocus} maxLength={800} onChange={(e) => setPolicyFocus(e.target.value)} placeholder="留空时沿用画像；也可填：AI工具实测，办公效率，真实体验" /></label>
             <label>机会范围<select value={policyMode} onChange={(e) => setPolicyMode(e.target.value as 'balanced' | 'combo_only')}><option value="balanced">组合优先，也允许独立热点 / 活动</option><option value="combo_only">只看热点 + 活动组合</option></select></label>
@@ -603,10 +647,11 @@ export default function IdeasPage({
       <div className="idea-command-primary">
         <label>账号画像<select value={persona} aria-label="选题账号画像" onChange={(e) => onPersonaChange(e.target.value)}><option value="">选择账号画像</option>{personas.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>
         <button className="r2-text-button" onClick={onNewPersona}>编辑 / 创建画像</button>
-        <div className="idea-target-platforms"><span>目标平台</span><button className={targetPlatforms.length === 0 ? 'chip active' : 'chip'} onClick={() => setTargetPlatforms([])}>智能分配</button>{TARGET_PLATFORMS.map((platform) => <button key={platform} className={targetPlatforms.includes(platform) ? 'chip active' : 'chip'} onClick={() => setTargetPlatforms((current) => current.includes(platform) ? current.filter((x) => x !== platform) : [...current, platform])}><PlatformIcon platform={platform} size={12} />{platformDisplayName(platform)}</button>)}</div>
+        <div className="idea-target-platforms"><span>目标平台</span><button className={targetPlatforms.length === 0 ? 'chip active' : 'chip'} onClick={() => setTargetPlatforms([])}>智能分配</button>{TARGET_PLATFORMS.map((platform) => <button key={platform} className={targetPlatforms.includes(platform) ? 'chip active' : 'chip'} onClick={() => setTargetPlatforms((current) => current.includes(platform) ? current.filter((x) => x !== platform) : [...current, platform])}><PlatformIcon platform={platform} size={12} />{targetLabel(platform)}</button>)}</div>
       </div>
       <div className="idea-command-secondary"><label>本次目标<input value={goal} maxLength={200} onChange={(e) => setGoal(e.target.value)} placeholder="例如：实用教程 / 活动投稿 / 新功能解读" /></label><label>制作投入<select value={effort} onChange={(e) => setEffort(Number(e.target.value))}><option value={0}>不限制</option><option value={60}>约 1 小时</option><option value={120}>约 2 小时</option><option value={240}>半天内</option><option value={480}>一天内</option></select></label><label className="idea-source-toggle"><input type="checkbox" checked={includeTrends} onChange={(e) => setIncludeTrends(e.target.checked)} />自动匹配热点</label><label className="idea-source-toggle"><input type="checkbox" checked={includeCampaigns} onChange={(e) => setIncludeCampaigns(e.target.checked)} />自动匹配活动</label></div>
       {includeTrends && <small className="idea-trend-scope">热点来源：{trendLabels.length ? trendLabels.join('、') : '使用可用热点源'}</small>}
+      <label className="idea-count-field">候选数量<select aria-label="候选数量" value={candidateCount} onChange={e => setCandidateCount(Number(e.target.value))}>{Array.from({ length: 12 }, (_, i) => <option value={i + 1} key={i + 1}>{i + 1} 个</option>)}</select><small>按此数量生成，最多 12 个。</small></label>
       {fixedTrendTitles.length > 0 && <div className="idea-seed-note"><span>已带入热点：{fixedTrendTitles.join('、')}{fixedTrendPlatform ? ` · 来源 ${platformDisplayName(fixedTrendPlatform)}` : ''}</span><button className="r2-text-button" type="button" onClick={() => { setFixedTrendTitles([]); setFixedTrendPlatform(''); }}>移除固定热点</button></div>}
       <div className="idea-command-bottom"><textarea value={instruction} maxLength={2000} onChange={(e) => setInstruction(e.target.value)} placeholder="补充要求，例如：只做有实测支撑的内容；不参与和科技工具无关的粉丝活动。" /><button className="btn btn-primary idea-run-button" disabled={!persona || !aiReady || (!!activeRun && ACTIVE_RUNS.has(activeRun.status))} onClick={() => void startRun()}><IconSkills size={14} /> 帮我找选题</button></div>
       {!persona && <p className="idea-command-hint">先选择账号画像，Agent 才能按赛道、受众和平台偏好筛选。</p>}{persona && !aiReady && <p className="idea-command-hint warn">Agent 推荐服务未配置。仍可以记录和管理已有选题。</p>}
@@ -620,13 +665,14 @@ export default function IdeasPage({
     {error && <div className="notice-error">{error}</div>}
 
     <div className="idea-tabs">
-      <button className={tab === 'candidates' ? 'active' : ''} onClick={() => setTab('candidates')}>{workbenchMode === 'proactive' ? '推荐机会' : '推荐候选'} <b>{visibleCandidates.length}</b></button>
+      <button className={tab === 'candidates' ? 'active' : ''} onClick={() => setTab('candidates')}>{workbenchMode === 'proactive' ? '推荐机会' : '本批次候选'} <b>{batchCandidates.length}</b></button>
       <button className={tab === 'mine' ? 'active' : ''} onClick={() => setTab('mine')}>我的选题 <b>{mine.length}</b></button>
     </div>
 
     {tab === 'candidates' ? <section className="idea-candidate-section">
-      {visibleCandidates.length === 0 ? <div className="idea-workbench-empty"><IconIdea size={26} /><strong>{workbenchMode === 'proactive' ? '还没有新的主动机会' : '还没有候选'}</strong><p>{workbenchMode === 'proactive' ? (discoveryPolicy?.enabled ? 'Agent 会在已同步热点或活动出现有效变化、且通过本地筛选后再分析；没有值得推荐的机会时不会为了凑数生成。' : '确认一次长期策略并开启主动发现；也可以切到“按需找选题”立即探索。') : '选择画像与目标平台后点击“帮我找选题”。已有热点和活动会作为线索，找不到自然关联时也可以给赛道常青题。'}</p></div>
-        : <div className="idea-candidate-grid">{visibleCandidates.map(candidateCard)}</div>}
+      {batchCandidates.length === 0 ? <div className="idea-workbench-empty"><IconIdea size={26} /><strong>{workbenchMode === 'proactive' ? '还没有新的主动机会' : '本批次还没有可用候选'}</strong><p>{workbenchMode === 'proactive' ? (discoveryPolicy?.enabled ? '有合适的新线索时会显示在这里。' : '开启主动发现，或切到“按需找选题”。') : '生成完成后在这里查看本次结果。以往候选保留在下方。'}</p></div>
+        : <div className="idea-candidate-grid">{batchCandidates.map(candidateCard)}</div>}
+      {historyCandidates.length > 0 && <details className="idea-rejected"><summary>以往候选 {historyCandidates.length}</summary><div className="idea-candidate-grid">{historyCandidates.map(candidateCard)}</div></details>}
       {rejected.length > 0 && <details className="idea-rejected"><summary>不感兴趣 / 已隐藏 {rejected.length}</summary><div>{rejected.slice(0, 20).map((idea) => <span key={idea.id}>{idea.title}<button className="r2-text-button" onClick={() => void feedback(idea, 'reopen')}>恢复</button></span>)}</div></details>}
     </section> : <section className="idea-mine-section">
       <div className="idea-mine-toolbar">
@@ -647,13 +693,14 @@ export default function IdeasPage({
 
     {historyOpen && <div className="overlay" onClick={() => setHistoryOpen(false)}><div className="modal idea-history-modal" onClick={(e) => e.stopPropagation()}>
       <header><h3>Agent 选题批次</h3><button className="icon-btn" onClick={() => setHistoryOpen(false)}>×</button></header>
-      <div className="idea-run-history">{runs.length === 0 && <p className="r2-muted">还没有 Agent 选题批次。</p>}{runs.map((run) => <div key={run.id}><div><strong>{run.kind === 'recommend' ? '候选推荐' : '策划深化'}</strong><span className={'run-status status-' + run.status}>{run.status}</span></div><p>{run.stage || run.error || '任务已提交'}</p><small>{new Date(run.created_at).toLocaleString('zh-CN')} · {run.target_platforms.length ? run.target_platforms.map(platformDisplayName).join(' / ') : '智能平台'}</small>{run.error && <em>{run.error}</em>}</div>)}</div>
+      <div className="idea-run-history">{runs.length === 0 && <p className="r2-muted">还没有 Agent 选题批次。</p>}{runs.map((run) => <div key={run.id}><div><strong>{run.kind === 'recommend' ? '候选推荐' : '策划深化'}</strong><span className={'run-status status-' + run.status}>{run.status}</span></div><p>{run.stage || run.error || '任务已提交'}</p><small>{new Date(run.created_at).toLocaleString('zh-CN')} · {run.target_platforms.length ? run.target_platforms.map(platformDisplayName).join(' / ') : '智能平台'}</small>{run.error && <em>{run.error}</em>}{run.kind === 'recommend' && <button className="btn btn-sm" onClick={() => restoreRun(run)}>查看结果并恢复条件</button>}</div>)}</div>
     </div></div>}
 
     {form && <div className="overlay" onClick={() => setForm(null)}><div className="modal idea-manual-modal" onClick={(e) => e.stopPropagation()}>
       <header><h3>{editId ? '编辑选题' : '记录灵感'}</h3><button className="icon-btn" onClick={() => setForm(null)}>×</button></header>
       <label className="field-label">选题 *</label><input className="field" value={form.title} autoFocus maxLength={240} onChange={(e) => setForm({ ...form, title: e.target.value })} />
       <label className="field-label">备注 / 想法</label><textarea className="field" value={form.note || ''} onChange={(e) => setForm({ ...form, note: e.target.value })} />
+      <fieldset className="idea-target-platforms"><legend>目标平台</legend>{TARGET_PLATFORMS.map(platform => <label key={platform}><input type="checkbox" checked={(form.target_platforms || []).includes(platform)} onChange={event => setForm({ ...form, target_platforms: event.target.checked ? [...(form.target_platforms || []), platform] : (form.target_platforms || []).filter(value => value !== platform) })} />{targetLabel(platform)}</label>)}</fieldset>
       <label className="field-label">来源</label><input className="field" value={form.source || ''} onChange={(e) => setForm({ ...form, source: e.target.value })} />
       <footer><button className="btn btn-sm" onClick={() => setForm(null)}>取消</button><button className="btn btn-sm btn-primary" disabled={!form.title.trim()} onClick={() => void saveForm()}>保存到我的选题</button></footer>
     </div></div>}

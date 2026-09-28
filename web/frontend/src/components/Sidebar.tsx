@@ -1,15 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ContentProfileContext, PersonaItem } from '../lib/api';
 import type { ComponentType } from 'react';
-import { getTheme, setTheme, type ThemeMode } from '../lib/theme';
+import type { ChatSession } from '../lib/store';
 import { platformDisplayName } from '../lib/platforms';
+import { fetchInteractionSources, fetchInteractions } from '../lib/ripple';
+import { interactionStats } from '../lib/replyEditing';
+import SessionActions from './SessionActions';
+import type { SessionAction } from './SessionActions';
+import { getTheme, setTheme, type ThemeMode } from '../lib/theme';
 import '../styles/account-profile.css';
 import {
   IconSkills, IconOutputs, IconChevron, IconLayout,
-  IconDashboard, IconPublish, IconCompass, IconFile, IconSun, IconMoon,
+  IconDashboard, IconPublish, IconCompass, IconFile, IconSun, IconMoon, IconChat,
 } from './icons';
 
-export type Page = 'dashboard' | 'chat' | 'trends' | 'campaigns' | 'ideas' | 'calendar' | 'publish' | 'interactions' | 'breakdown' | 'skills' | 'outputs' | 'accounts' | 'profile' | 'channels' | 'analytics' | 'contents' | 'integrations' | 'planning';
+export type Page = 'dashboard' | 'chat' | 'history' | 'trends' | 'campaigns' | 'ideas' | 'calendar' | 'publish' | 'interactions' | 'breakdown' | 'skills' | 'outputs' | 'accounts' | 'profile' | 'channels' | 'analytics' | 'contents' | 'integrations' | 'planning';
 
 interface SidebarProps {
   currentPage: Page;
@@ -23,10 +28,17 @@ interface SidebarProps {
   onManageAccounts: () => void;
   agentStatus: string;
   recommendationAiReady: boolean;
+  sessions: ChatSession[];
+  activeSessionId: string | null;
+  runningIds: Set<string>;
+  onNewConversation: () => void;
+  onOpenConversation: (id: string) => void;
+  onOpenHistory: () => void;
+  onSessionAction: (id: string, action: SessionAction, title?: string) => Promise<string | null>;
 }
 
 const TOPIC_PAGES: Page[] = ['trends', 'campaigns', 'ideas', 'planning', 'breakdown'];
-const PUBLISH_PAGES: Page[] = ['publish', 'interactions', 'calendar', 'analytics'];
+const PUBLISH_PAGES: Page[] = ['publish', 'calendar', 'analytics'];
 const RESOURCE_NAV: { page: Page; Icon: ComponentType<{ size?: number }>; label: string }[] = [
   { page: 'outputs', Icon: IconOutputs, label: '素材' },
 ];
@@ -37,11 +49,11 @@ const TOOL_NAV: { page: Page; Icon: ComponentType<{ size?: number }>; label: str
 
 const WIDTH_KEY = 'ripple_sidebar_width_v1';
 const COLLAPSED_KEY = 'ripple_sidebar_collapsed_v1';
-const DEFAULT_WIDTH = 212;
+const DEFAULT_WIDTH = 272;
 const MIN_WIDTH = 165;
 const MAX_WIDTH = 350;
 const COLLAPSED_WIDTH = 58;
-const MOBILE_BREAKPOINT = 700;
+const MOBILE_BREAKPOINT = 768;
 const TOPIC_TAB_KEY = 'ripple_last_topic_tab_v1';
 const PUBLISH_TAB_KEY = 'ripple_last_publish_tab_v1';
 function rememberedPage(key: string, allowed: Page[], fallback: Page): Page {
@@ -54,7 +66,8 @@ function storedWidth(): number {
     const raw = localStorage.getItem(WIDTH_KEY);
     if (raw === null || raw.trim() === '') return DEFAULT_WIDTH;
     const value = Number(raw);
-    return Number.isFinite(value) ? Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, value)) : DEFAULT_WIDTH;
+    // 旧版默认宽度为 212 px；其他手动调整过的宽度保持原值。
+    return Number.isFinite(value) ? Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, value === 212 ? DEFAULT_WIDTH : value)) : DEFAULT_WIDTH;
   } catch { return DEFAULT_WIDTH; }
 }
 function storedCollapsed(): boolean {
@@ -67,14 +80,30 @@ function widthCap(viewport: number): number {
 export default function Sidebar({
   currentPage, onPageChange, personas, selectedPersona,
   profileContext, selectedTarget, onScopeChange, onEditProfile, onManageAccounts,
-  agentStatus, recommendationAiReady,
+  agentStatus, recommendationAiReady, sessions, activeSessionId, runningIds,
+  onNewConversation, onOpenConversation, onOpenHistory, onSessionAction,
 }: SidebarProps) {
   const [theme, setThemeState] = useState<ThemeMode>(() => getTheme());
   const [width, setWidth] = useState(storedWidth);
   const [collapsed, setCollapsed] = useState(storedCollapsed);
   const [viewport, setViewport] = useState(() => window.innerWidth);
   const [resizing, setResizing] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const [pendingComments, setPendingComments] = useState<number | null>(null);
   const pointerId = useRef<number | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try {
+        const [sources, tasks] = await Promise.all([fetchInteractionSources('', 24), fetchInteractions({ limit: 200 })]);
+        if (!cancelled) setPendingComments(interactionStats(sources.items.filter(row => row.kind === 'remote'), tasks.items.filter(row => row.delivery === 'remote' && row.source_kind !== 'import')).pending);
+      } catch { if (!cancelled) setPendingComments(null); }
+    };
+    void refresh();
+    const timer = setInterval(() => { if (!document.hidden) void refresh(); }, 60000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [currentPage]);
 
   useEffect(() => {
     try {
@@ -89,7 +118,7 @@ export default function Sidebar({
   }, []);
 
   const mobileRail = viewport <= MOBILE_BREAKPOINT;
-  const effectiveWidth = mobileRail || collapsed ? COLLAPSED_WIDTH : Math.min(width, widthCap(viewport));
+  const effectiveWidth = mobileRail ? (mobileOpen ? Math.min(290, Math.floor(viewport * .86)) : 0) : collapsed ? COLLAPSED_WIDTH : Math.min(width, widthCap(viewport));
   useEffect(() => {
     document.documentElement.style.setProperty('--sidebar-width', `${effectiveWidth}px`);
     return () => { document.documentElement.style.removeProperty('--sidebar-width'); };
@@ -131,13 +160,17 @@ export default function Sidebar({
   const topicActive = TOPIC_PAGES.includes(currentPage);
   const publishActive = PUBLISH_PAGES.includes(currentPage);
   const compact = collapsed || mobileRail;
+  const visibleSessions = [...sessions].filter((item) => !item.archived).sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || (b.updatedAt || b.created) - (a.updatedAt || a.created));
   const targetRows = [...(profileContext?.accounts || []), ...(profileContext?.blogs || [])];
   const bindingByTarget = new Map((profileContext?.bindings || []).map((item) => [`${item.target_kind}:${item.account_id}`, item]));
   const currentProfile = (profileContext?.profiles || []).find((item) => item.legacy_name === selectedPersona);
   const scopeValue = selectedTarget ? `target:${selectedTarget}` : currentProfile ? `profile:${currentProfile.id}` : selectedPersona ? `legacy:${selectedPersona}` : 'generic';
 
   return (
-    <div className={`sidebar ${compact ? 'collapsed' : ''} ${resizing ? 'resizing' : ''}`} style={{ width: effectiveWidth, minWidth: effectiveWidth }}>
+    <>
+    {mobileRail && <button className="focus-mobile-menu-trigger" aria-label="打开侧边栏" onClick={() => setMobileOpen(true)}>☰</button>}
+    {mobileRail && mobileOpen && <button className="focus-mobile-shade" aria-label="关闭侧边栏" onClick={() => setMobileOpen(false)} />}
+    <div className={`sidebar ${compact && !mobileOpen ? 'collapsed' : ''} ${mobileOpen ? 'focus-mobile-open' : ''} ${resizing ? 'resizing' : ''}`} style={{ width: effectiveWidth, minWidth: effectiveWidth }}>
       <div className="sidebar-header">
         <div className="sidebar-logo-row">
           <div className="sidebar-logo">
@@ -145,6 +178,7 @@ export default function Sidebar({
             <h1>Ripple</h1>
           </div>
           {!mobileRail && <button className="sidebar-collapse-btn" type="button" aria-label={collapsed ? '展开侧边栏' : '折叠侧边栏'} title={collapsed ? '展开侧边栏' : '折叠侧边栏'} onClick={() => setCollapsed((value) => !value)}><IconChevron size={15} /></button>}
+          {mobileRail && <button className="sidebar-collapse-btn" aria-label="关闭侧边栏" onClick={() => setMobileOpen(false)}>×</button>}
         </div>
         <select className="persona-select" aria-label="当前工作范围" value={scopeValue} onChange={(e) => onScopeChange(e.target.value)} title="当前工作范围：账号画像或具体平台账号">
           <option value="generic">通用 / 未绑定规划</option>
@@ -180,12 +214,25 @@ export default function Sidebar({
         <button aria-label="内容" title="内容" className={`nav-item ${currentPage === 'contents' ? 'active' : ''}`} onClick={() => onPageChange('contents')}><span className="nav-icon"><IconFile size={18} /></span><span className="nav-item-label">内容</span></button>
 
         <button aria-label="发布" title="发布" className={`nav-item ${publishActive ? 'active' : ''}`} onClick={() => onPageChange(rememberedPage(PUBLISH_TAB_KEY, PUBLISH_PAGES, 'publish'))}><span className="nav-icon"><IconPublish size={18} /></span><span className="nav-item-label">发布</span></button>
+        <button aria-label="互动" title={pendingComments === null ? '互动' : `互动 · 全部账号已同步评论中 ${pendingComments} 条待回复`} className={`nav-item ${currentPage === 'interactions' ? 'active' : ''}`} onClick={() => onPageChange('interactions')}><span className="nav-icon"><IconChat size={18} /></span><span className="nav-item-label">互动{pendingComments !== null && pendingComments > 0 && <small style={{ marginLeft: 8 }}>{pendingComments}</small>}</span></button>
 
         <div className="nav-section-label">资源</div>
         {RESOURCE_NAV.map(({ page, Icon, label }) => <button key={page} aria-label={label} title={label} className={`nav-item ${currentPage === page || (page === 'channels' && currentPage === 'accounts') ? 'active' : ''}`} onClick={() => onPageChange(page)}><span className="nav-icon"><Icon size={18} /></span><span className="nav-item-label">{label}</span></button>)}
         <div className="nav-section-label">工具</div>
         {TOOL_NAV.map(({ page, Icon, label }) => <button key={page} aria-label={label} title={label} className={`nav-item ${currentPage === page ? 'active' : ''}`} onClick={() => onPageChange(page)}><span className="nav-icon"><Icon size={18} /></span><span className="nav-item-label">{label}</span></button>)}
       </nav>
+
+      <section className="focus-sidebar-sessions" aria-label="会话列表">
+        <button className="focus-new-conversation" onClick={() => { onNewConversation(); setMobileOpen(false); }}>＋ 新会话</button>
+        <div className="focus-session-scroll">{visibleSessions.map((item) => <div className="focus-session-entry" key={item.id}>
+          <button className={`focus-session-select ${item.id === activeSessionId && (currentPage === 'chat' || currentPage === 'contents') ? 'active' : ''}`} onClick={() => { onOpenConversation(item.id); setMobileOpen(false); }} title={item.title}>
+            <strong>{item.pinned && <span aria-label="已置顶">⌃ </span>}{item.title}</strong>
+            <span>{item.contentContext ? `主稿 · ${item.contentContext.title}` : item.workScope ? `${platformDisplayName(item.workScope.platform)} · ${item.workScope.accountLabel}` : item.persona ? `画像 · ${item.persona}` : '通用会话'} · {new Date(item.updatedAt || item.created).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+          </button>
+          <SessionActions session={item} running={runningIds.has(item.id)} onAction={onSessionAction} />
+        </div>)}</div>
+        <button className="focus-all-sessions" onClick={() => { onOpenHistory(); setMobileOpen(false); }}>查看历史会话 <span>{sessions.length} ↗</span></button>
+      </section>
 
       <div className="sidebar-status">
         <span className={`status-dot ${agentStatus === 'connected' || recommendationAiReady ? '' : 'offline'}`} />
@@ -199,5 +246,6 @@ export default function Sidebar({
         onDoubleClick={resetWidth}
         onKeyDown={(event) => { if (event.key === 'ArrowLeft') { event.preventDefault(); adjustWidth(-10); } else if (event.key === 'ArrowRight') { event.preventDefault(); adjustWidth(10); } else if (event.key === 'Home') { event.preventDefault(); resetWidth(); } }} />}
     </div>
+    </>
   );
 }

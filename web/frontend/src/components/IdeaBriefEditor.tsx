@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { Idea, IdeaBrief, IdeaBriefData } from '../lib/api';
 import { PlatformIcon } from './PlatformBrand';
 import { platformDisplayName } from '../lib/platforms';
@@ -8,7 +8,7 @@ interface Props {
   brief: IdeaBrief;
   busy?: boolean;
   onSave: (data: IdeaBriefData, locked: string[]) => Promise<void>;
-  onConfirm: () => Promise<void>;
+  onConfirm: (data: IdeaBriefData, locked: string[], startAfterConfirm?: boolean) => Promise<void>;
   onDevelop: (instruction: string) => Promise<void>;
   onStart: () => Promise<void>;
   onClose: () => void;
@@ -34,23 +34,36 @@ export default function IdeaBriefEditor({ idea, brief, busy, onSave, onConfirm, 
   const [locked, setLocked] = useState<string[]>(brief.locked_fields || []);
   const [instruction, setInstruction] = useState('');
   const [error, setError] = useState('');
+  const [detailed, setDetailed] = useState(false);
+  const actionPending = useRef(false);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(brief.data)
+    || JSON.stringify(locked) !== JSON.stringify(brief.locked_fields || []);
+  const confirmed = brief.status === 'confirmed' && !dirty;
 
   useEffect(() => { setDraft(clone(brief.data)); setLocked(brief.locked_fields || []); setError(''); }, [brief]);
 
   const patch = <K extends keyof IdeaBriefData>(key: K, value: IdeaBriefData[K]) => setDraft((current) => ({ ...current, [key]: value }));
   const toggleLock = (key: string) => setLocked((current) => current.includes(key) ? current.filter((x) => x !== key) : [...current, key]);
-  const run = async (fn: () => Promise<void>) => { setError(''); try { await fn(); } catch (e) { setError(e instanceof Error ? e.message : '操作失败'); } };
+  const run = async (fn: () => Promise<void>) => {
+    if (actionPending.current) return;
+    actionPending.current = true;
+    setError('');
+    try { await fn(); } catch (e) { setError(e instanceof Error ? e.message : '操作失败'); }
+    finally { actionPending.current = false; }
+  };
 
   return <div className="overlay idea-brief-overlay" onClick={() => !busy && onClose()}>
-    <div className="modal idea-brief-modal" onClick={(e) => e.stopPropagation()}>
+    <div className={`modal idea-brief-modal ${detailed ? 'details-open' : 'brief-simple'}`} onClick={(e) => e.stopPropagation()}>
       <header className="idea-brief-head">
-        <div><small>内容策划单 · V{brief.revision}</small><h2>{idea.title}</h2><p>确认方向和制作准备，再进入内容工作台写正文。</p></div>
+        <div><small>内容策划单 · V{brief.revision}</small><h2>{idea.title}</h2><p>确认后可直接生成正文与封面，也可以只保存策划，稍后再制作。</p></div>
         <button className="icon-btn" disabled={busy} onClick={onClose}>×</button>
       </header>
       {error && <div className="notice-error">{error}</div>}
-      <div className="idea-brief-grid">
+      {(draft.evidence_checks || []).filter(value => value.startsWith('经历与效果待核实：')).map(value => <p className="campaign-snapshot-notice stale" role="status" key={value}>{value}</p>)}
+      <button className="btn btn-sm" aria-pressed={detailed} onClick={() => setDetailed(value => !value)}>{detailed ? '收起详细策划' : '详细策划'}</button>
+      <div className="idea-brief-grid" inert={busy}>
         <section className="idea-brief-main">
-          {TEXT_FIELDS.map(({ key, label, placeholder }) => <div className="idea-brief-lock-row" key={key}>
+          {TEXT_FIELDS.filter(({ key }) => detailed || key === 'core_thesis').map(({ key, label, placeholder }) => <div className="idea-brief-lock-row" key={key}>
             <label className="idea-brief-field"><span>{label}</span><textarea value={String(draft[key] || '')} placeholder={placeholder}
               onChange={(e) => patch(key, e.target.value as never)} /></label>
             <button className={locked.includes(key) ? 'idea-lock active' : 'idea-lock'} title={locked.includes(key) ? '已锁定，Agent 调整时保留' : '锁定此字段'} onClick={() => toggleLock(key)}>锁定</button>
@@ -71,7 +84,7 @@ export default function IdeaBriefEditor({ idea, brief, busy, onSave, onConfirm, 
             <button className="btn btn-sm" onClick={() => patch('outline', [...(draft.outline || []), { title: '', purpose: '', evidence_needed: [] }])}>+ 添加段落</button>
           </div>
 
-          <div className="idea-brief-block">
+          <div className="idea-brief-block" hidden={!detailed}>
             <div className="idea-brief-block-head"><strong>平台表达</strong><button className={locked.includes('platform_plans') ? 'idea-lock active' : 'idea-lock'} onClick={() => toggleLock('platform_plans')}>锁定</button></div>
             {(draft.platform_plans || []).map((plan, index) => <div className="idea-platform-plan-editor" key={plan.platform + index}>
               <div className="idea-platform-plan-title"><PlatformIcon platform={plan.platform} size={15} /><b>{platformDisplayName(plan.platform)}</b></div>
@@ -84,30 +97,31 @@ export default function IdeaBriefEditor({ idea, brief, busy, onSave, onConfirm, 
         </section>
 
         <aside className="idea-brief-side">
-          <div className="idea-brief-block">
+          <div className="idea-brief-block" hidden={!detailed}>
             <div className="idea-brief-block-head"><strong>事实核验</strong><button className={locked.includes('evidence_checks') ? 'idea-lock active' : 'idea-lock'} onClick={() => toggleLock('evidence_checks')}>锁定</button></div>
             <LinesEditor label="" value={draft.evidence_checks || []} onChange={(value) => patch('evidence_checks', value)} />
           </div>
           <div className="idea-brief-block">
-            <div className="idea-brief-block-head"><strong>制作准备</strong><button className={locked.includes('production_tasks') ? 'idea-lock active' : 'idea-lock'} onClick={() => toggleLock('production_tasks')}>锁定</button></div>
+            <div className="idea-brief-block-head"><strong>封面与素材要求</strong><button className={locked.includes('production_tasks') ? 'idea-lock active' : 'idea-lock'} onClick={() => toggleLock('production_tasks')}>锁定</button></div>
             <LinesEditor label="" value={draft.production_tasks || []} onChange={(value) => patch('production_tasks', value)} />
           </div>
-          <div className="idea-brief-block">
+          <div className="idea-brief-block" hidden={!detailed}>
             <div className="idea-brief-block-head"><strong>待确认问题</strong><button className={locked.includes('open_questions') ? 'idea-lock active' : 'idea-lock'} onClick={() => toggleLock('open_questions')}>锁定</button></div>
             <LinesEditor label="" value={draft.open_questions || []} onChange={(value) => patch('open_questions', value)} />
           </div>
           {draft.source_refs?.length > 0 && <div className="idea-brief-sources"><strong>来源引用</strong>{draft.source_refs.map((ref) => <code key={ref}>{ref}</code>)}</div>}
           <div className="idea-agent-adjust">
             <label>让 Agent 局部调整<textarea value={instruction} onChange={(e) => setInstruction(e.target.value)} placeholder="例如：保留核心观点，只把抖音开头改成问题式。" /></label>
-            <button className="btn btn-sm" disabled={busy || !instruction.trim()} onClick={() => void run(async () => { await onDevelop(instruction.trim()); setInstruction(''); })}>Agent 调整</button>
+            <button className="btn btn-sm" disabled={busy || dirty || !instruction.trim()} onClick={() => void run(async () => { await onDevelop(instruction.trim()); setInstruction(''); })}>Agent 调整</button>
+            {dirty && <small>先保存当前修改，再让 Agent 调整。</small>}
           </div>
         </aside>
       </div>
       <footer className="idea-brief-actions">
-        <span>{brief.status === 'confirmed' ? '当前策划已确认。修改后需要重新确认。' : 'Agent 修改不会覆盖锁定字段；手动保存会产生新版本。'}</span>
-        <button className="btn btn-sm" disabled={busy} onClick={() => void run(() => onSave(draft, locked))}>保存修改</button>
-        {brief.status !== 'confirmed' && <button className="btn btn-sm btn-primary" disabled={busy} onClick={() => void run(onConfirm)}>确认策划</button>}
-        {brief.status === 'confirmed' && <button className="btn btn-sm btn-primary" disabled={busy} onClick={() => void run(onStart)}>进入内容制作</button>}
+        <span>{dirty ? '有未保存的修改。确认时会一并保存。' : confirmed ? '当前策划已确认，可继续编辑或生成草稿。' : '确认方向后，下一步生成图文草稿。'}</span>
+        <button className="btn btn-sm" disabled={busy || !dirty} onClick={() => void run(() => onSave(draft, locked))}>仅保存策划</button>
+        {!confirmed && <button className="btn btn-sm btn-primary" disabled={busy} onClick={() => void run(() => onConfirm(draft, locked, true))}>{idea.content_id ? '保存并继续已有稿' : '采用并生成草稿'}</button>}
+        {confirmed && <button className="btn btn-sm btn-primary" disabled={busy} onClick={() => void run(onStart)}>{idea.content_id ? '继续已有稿' : '生成图文草稿'}</button>}
       </footer>
     </div>
   </div>;

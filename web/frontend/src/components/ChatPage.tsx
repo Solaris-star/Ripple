@@ -3,7 +3,7 @@ import MessageBubble from './MessageBubble';
 import AgentSessionSelectors from './AgentSessionSelectors';
 import type { ChatSession, ChatMessage, StreamState } from '../lib/store';
 import { uploadFiles } from '../lib/api';
-import type { UploadedFile } from '../lib/api';
+import type { AgentTurnInjection, UploadedFile } from '../lib/api';
 import { errorText, fetchAgentCapabilities, fetchAgentProfiles, fetchAgentRuntimes, fetchAgentSessionConfig, saveAgentSessionConfig } from '../lib/ripple';
 import type { AgentCapabilityCatalog, AgentProfileState, AgentRuntimeCatalog, AgentSessionConfig } from '../lib/ripple';
 import { IconArrowUp, IconStop, IconPlus, IconFile } from './icons';
@@ -11,14 +11,17 @@ import { IconArrowUp, IconStop, IconPlus, IconFile } from './icons';
 interface ChatPageProps {
   session: ChatSession;
   stream?: StreamState;          // 进行中的流式态（来自 App，切页也不丢）
-  onSend: (displayText: string, attachments?: UploadedFile[]) => void;
+  onSend: (displayText: string, attachments?: UploadedFile[], injection?: AgentTurnInjection) => void;
   onStop: () => void;
   onOpenContent: (contentId: string) => void;
+  onDraftChange: (patch: Pick<ChatSession, 'draft' | 'draftAttachments' | 'draftSkills'>) => void;
+  onRestore: () => void;
   onResend: (
     userIndex: number,
     displayText: string,
     attachments?: UploadedFile[],
     legacyAgentText?: string,
+    injection?: AgentTurnInjection,
   ) => void; // 重试：仅对最后一轮
 }
 
@@ -36,9 +39,9 @@ function greeting(): string {
   return `${g}，想创作点什么？`;
 }
 
-export default function ChatPage({ session, stream, onSend, onStop, onOpenContent, onResend }: ChatPageProps) {
-  const [input, setInput] = useState('');
-  const [attachments, setAttachments] = useState<UploadedFile[]>([]);
+export default function ChatPage({ session, stream, onSend, onStop, onOpenContent, onDraftChange, onRestore, onResend }: ChatPageProps) {
+  const [input, setInput] = useState(() => session.draft || '');
+  const [attachments, setAttachments] = useState<UploadedFile[]>(() => session.draftAttachments || []);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [agentConfig, setAgentConfig] = useState<AgentSessionConfig | null>(null);
@@ -53,6 +56,16 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
   const isStreaming = !!stream;
   const isEmpty = session.messages.length === 0 && !isStreaming;
   const contentContext = session.contentContext;
+  useEffect(() => { setInput(session.draft || ''); setAttachments(session.draftAttachments || []); }, [session.id, session.draft, session.draftAttachments]);
+  useEffect(() => { if (!session.archived && session.messages.length === 0) textareaRef.current?.focus(); }, [session.id, session.archived, session.messages.length]);
+  useEffect(() => {
+    const value = new URLSearchParams(location.search).get('message');
+    if (value === null) return;
+    const index = Number(value);
+    if (!Number.isInteger(index) || index < 0) return;
+    const target = document.querySelectorAll('.chat-thread .message-row')[index];
+    target?.scrollIntoView({ block: 'center' }); target?.classList.add('focus-message-match');
+  }, [session.id, session.messages.length]);
 
   useEffect(() => {
     let ignore = false;
@@ -80,7 +93,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
     setUploading(true);
     try {
       const saved = await uploadFiles(arr, session.id);
-      setAttachments((a) => [...a, ...saved]);
+      const next = [...attachments, ...saved]; setAttachments(next); onDraftChange({ draftAttachments: next });
     } catch (err) {
       alert((err as Error).message || '上传失败');
     } finally {
@@ -94,7 +107,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
   const onPaste = (e: React.ClipboardEvent) => {
     if (e.clipboardData.files?.length) { e.preventDefault(); doUpload(e.clipboardData.files); }
   };
-  const removeAttachment = (path: string) => setAttachments((a) => a.filter((x) => x.path !== path));
+  const removeAttachment = (path: string) => { const next = attachments.filter((x) => x.path !== path); setAttachments(next); onDraftChange({ draftAttachments: next }); };
 
   useEffect(() => {
     if (!isEmpty) messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -110,15 +123,16 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
 
   const handleSend = () => {
     const trimmed = input.trim();
-    if ((!trimmed && attachments.length === 0) || isStreaming || uploading) return;
+    if ((!trimmed && attachments.length === 0) || isStreaming || uploading || session.archived) return;
     // 附件通过结构化字段发送；用户消息气泡只显示用户实际输入的文字。
-    onSend(trimmed, attachments);
+    onSend(trimmed, attachments, { skills: session.draftSkills || [] });
     setInput('');
     setAttachments([]);
+    onDraftChange({ draft: '', draftAttachments: [], draftSkills: [] });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       handleSend();
     }
@@ -132,6 +146,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
       <AgentSessionSelectors config={agentConfig} catalog={agentCatalog} runtimes={agentRuntimes} profiles={agentProfiles}
         isStreaming={isStreaming} messageCount={session.messages.length} onChange={updateAgentConfig} className="r2-global-agent-selectors" />
       {agentError && <div className="r2-chat-agent-error">{agentError}</div>}
+      {!!session.draftSkills?.length && <div className="focus-chat-skills">{session.draftSkills.map((skill) => <span key={skill}>仅本次 · {skill}<button aria-label={`移除 ${skill}`} onClick={() => onDraftChange({ draftSkills: session.draftSkills?.filter((item) => item !== skill) || [] })}>×</button></span>)}</div>}
       {attachments.length > 0 && (
         <div className="composer-attachments">
           {attachments.map((a) => (
@@ -147,7 +162,8 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
         className="chat-input"
         placeholder={dragOver ? '松手上传素材…' : contentContext ? '告诉 AI 你想怎么修改这份内容…（可拖入图片/文档当补充素材）' : hero ? '把你的想法告诉我，选题 / 文案 / 卡片 / 视频 / 发布都行…（可拖入图片/文档当素材）' : '发消息…（Enter 发送，Shift+Enter 换行，可拖入/粘贴素材）'}
         value={input}
-        onChange={(e) => setInput(e.target.value)}
+        disabled={session.archived}
+        onChange={(e) => { setInput(e.target.value); onDraftChange({ draft: e.target.value }); }}
         onKeyDown={handleKeyDown}
         onPaste={onPaste}
         rows={1}
@@ -164,7 +180,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
         {isStreaming ? (
           <button className="send-btn" onClick={onStop} title="停止生成"><IconStop size={15} /></button>
         ) : (
-          <button className="send-btn" onClick={handleSend} disabled={(!input.trim() && !attachments.length) || uploading} title="发送"><IconArrowUp size={17} /></button>
+          <button className="send-btn" onClick={handleSend} disabled={session.archived || (!input.trim() && !attachments.length) || uploading} title="发送"><IconArrowUp size={17} /></button>
         )}
       </div>
     </div>
@@ -174,6 +190,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
   if (isEmpty) {
     return (
       <div className="chat-page">
+        {session.archived && <div className="focus-archived-notice">这段会话已归档。历史消息仍保留，恢复后可以继续。<button onClick={onRestore}>恢复会话</button></div>}
         <div className="chat-hero">
           <div className="chat-hero-brand">
             <img src="./static/ripple-mark.svg" alt="" />
@@ -186,7 +203,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
           {!contentContext && <div className="suggestions">
             {SUGGESTIONS.map((s) => (
               <button key={s.title} className="card card-hover suggestion-card"
-                onClick={() => { if (!isStreaming) onSend(s.prompt); }}>
+                onClick={() => { if (!isStreaming) { onSend(s.prompt, [], { skills: session.draftSkills || [] }); onDraftChange({ draftSkills: [] }); } }}>
                 <span className="suggestion-icon">{s.icon}</span>
                 <span className="suggestion-body">
                   <span className="suggestion-title">{s.title}</span>
@@ -202,10 +219,11 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
 
   // ---- 对话态 ----
   const displayMessages: ChatMessage[] = [...session.messages];
-  if (isStreaming) displayMessages.push({ role: 'assistant', content: stream!.content || '', artifacts: stream!.artifacts });
+  if (isStreaming) displayMessages.push({ role: 'assistant', content: stream!.content || '', artifacts: stream!.artifacts, mediaTasks: stream!.mediaTasks });
 
   return (
     <div className="chat-page">
+      {session.archived && <div className="focus-archived-notice">这段会话已归档。历史消息仍保留，恢复后可以继续。<button onClick={onRestore}>恢复会话</button></div>}
       <div className="chat-messages">
         {contentContext && <div className="chat-context-bar"><div><strong>{contentContext.title || '未命名内容'}</strong><span>AI 协作正在围绕这份内容工作；正文以发送时从内容工作台读取的版本为准。</span></div><button onClick={() => onOpenContent(contentContext.id)}>打开内容工作台</button></div>}
         <div className="chat-thread">
@@ -222,7 +240,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
                 actions = {
                   onCopy: copy,
                   onRetry: isLastFinal
-                    ? () => onResend(i, msg.content, msg.attachments, msg.agentContent)
+                    ? () => onResend(i, msg.content, msg.attachments, msg.agentContent, { skills: msg.turnSkills })
                     : undefined,
                   canModify: !isStreaming,
                 };
@@ -232,7 +250,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
                 actions = {
                   onCopy: copy,
                   onRetry: (isLastFinal && prevUser)
-                    ? () => onResend(pi, prevUser.content, prevUser.attachments, prevUser.agentContent)
+                    ? () => onResend(pi, prevUser.content, prevUser.attachments, prevUser.agentContent, { skills: prevUser.turnSkills })
                     : undefined,
                   canModify: !isStreaming,
                 };
@@ -245,7 +263,7 @@ export default function ChatPage({ session, stream, onSend, onStop, onOpenConten
                 isStreaming={live}
                 thinking={live ? stream!.thinking : ''}
                 activity={live ? stream!.activity : ''}
-                onOpenContent={onOpenContent}
+          onOpenContent={onOpenContent}
                 actions={actions}
               />
             );

@@ -72,7 +72,7 @@ def test_real_mode_preflight_blocked(service):
 
 
 def test_idempotent_creation_and_payload_conflict(service):
-    req = CreateInput(title="同一草稿", idempotency_key="creation-key-001")
+    req = CreateInput(title="同一草稿", idempotency_key="draft-creation-001")
     first = service.create(req)
     assert service.create(req)["id"] == first["id"]
     with pytest.raises(WorkflowError):
@@ -374,9 +374,16 @@ def test_concurrent_processes_preserve_tasks(service):
 
 def test_manual_profile_does_not_start_ai(tmp_path, monkeypatch):
     import asyncio
+    from ripple import content_profiles
     from web import app as upstream
+    monkeypatch.setattr(content_profiles, "PROFILES_DIR", tmp_path / "profiles")
     monkeypatch.setattr(upstream, "PROFILES_DIR", tmp_path / "profiles")
     monkeypatch.setattr(upstream, "PROFILE_BUILD_DIR", tmp_path / "profile-status")
+    monkeypatch.setattr(
+        upstream,
+        "_CONTENT_PROFILES",
+        content_profiles.ContentProfileService(tmp_path / "profiles.sqlite3"),
+    )
     def forbidden(*args, **kwargs):
         raise AssertionError("AI must not be invoked")
     monkeypatch.setattr(upstream, "run_agent_sync", forbidden)
@@ -384,4 +391,5 @@ def test_manual_profile_does_not_start_ai(tmp_path, monkeypatch):
         name="本地画像", form={"direction": "知识分享", "platforms": ["个人 Blog"]})))
     assert result["created"] is True and result["async"] is False
     assert (tmp_path / "profiles" / "本地画像" / "identity.md").is_file()
-    assert not (tmp_path / "profile-status").exists()
+    status_file = tmp_path / "profile-status" / "本地画像.json"
+    assert json.loads(status_file.read_text(encoding="utf-8"))["state"] == "done"

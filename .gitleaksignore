@@ -1,0 +1,4 @@
+# 历史测试数据和已注明来源的签名算法常量，仅忽略这些提交中的具体命中。
+18ca79f18223bc148c69865218501b6aa8c67489:tests/test_campaign_sources.py:generic-api-key:697
+5545c225c6a94446d718ebad3fc56ac46cba7560:skills/openclaw/skill-xhs-analyzer/src/lib/signing.ts:generic-api-key:27
+69c5928b69f6dc0b0db0fc7fce4818b31add882c:skills/openclaw/skill-xhs-analyzer/src/lib/signing.ts:generic-api-key:27

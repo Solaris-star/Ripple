@@ -393,17 +393,32 @@ NOTE_JS = r"""() => {
   return {title:title.slice(0,200), body:body.slice(0,10000), author:author.slice(0,100), images, allText};
 }"""
 MY_NOTES_JS = r"""(limit) => {
-  const out=[];
+  const out=[]; const seen=new Set();
   const cards=Array.from(document.querySelectorAll(".note-card,[class*=note-card],[class*=noteCard]"));
-  for(const c of cards.slice(0,limit)) {
+  for(const c of cards) {
     const a=c.querySelector("a[href*='/explore/'],a[href*='/item/'],a[href*='xsec_token']");
     let noteId='';
     try { const raw=JSON.parse(c.getAttribute('data-impression')||'{}'); noteId=raw?.noteTarget?.value?.noteId||raw?.note_id||raw?.id||''; } catch(e) {}
+    const key=noteId || a?.href || '';
+    if(!key || seen.has(key)) continue;
+    seen.add(key);
     const title=(c.querySelector("[class*=title],.title")?.textContent||'').trim();
     const cover=c.querySelector('img')?.src||'';
     out.push({href:a?.href||'', noteId, title:title.slice(0,180), cover, text:(c.innerText||'').slice(0,800)});
+    if(out.length >= limit) break;
   }
   return out;
+}"""
+PROFILE_NOTES_JS = r"""(owner) => {
+  const rows=[]; const seen=new Set();
+  for(const a of document.querySelectorAll('a[href]')) {
+    const u=new URL(a.href);
+    const m=u.pathname.match(/^\/user\/profile\/([^/]+)\/([0-9A-Za-z]+)$/);
+    if(!m || m[1]!==owner || !u.searchParams.get('xsec_token') || seen.has(m[2])) continue;
+    seen.add(m[2]); u.pathname='/explore/'+m[2];
+    rows.push({noteId:m[2], href:u.href});
+  }
+  return rows;
 }"""
 CREATOR_EVENTS_JS = r"""(limit) => {
   const out=[]; const seen=new Set();
@@ -733,6 +748,9 @@ def _risk(page) -> None:
         raise XhsBrowserError('risk_control')
     if '登录' in body and ('扫码' in body or '手机号' in body) and 'login' in url.lower():
         raise XhsBrowserError('login_required')
+    login = page.locator('.login-container').first
+    if login.count() and login.is_visible():
+        raise XhsBrowserError('login_required')
 
 
 def _metric_number(text: str, labels: tuple[str, ...]) -> int | None:
@@ -834,17 +852,38 @@ def search(directory: Path, query: str, limit: int) -> dict[str, Any]:
     return _read_cards(directory, 'https://www.xiaohongshu.com/search_result?keyword=' + quote(query), 'keyword_search', limit)
 
 
-def account_notes(directory: Path, limit: int) -> dict[str, Any]:
+def account_notes(directory: Path, limit: int, expected_account_remote_id: str = '') -> dict[str, Any]:
     p, context, page = _launch(directory)
     try:
+        from .xhs_reply import IDENTITY_JS
+        _goto(page, 'https://www.xiaohongshu.com/explore', wait=1600)
+        if not expected_account_remote_id:
+            raise XhsBrowserError('account_identity_missing')
+        if page.evaluate(IDENTITY_JS) != [expected_account_remote_id]:
+            raise XhsBrowserError('account_mismatch')
         _goto(page, 'https://creator.xiaohongshu.com/new/note-manager', wait=2200)
         for _ in range(2):
             page.evaluate('window.scrollTo(0, document.body.scrollHeight)'); page.wait_for_timeout(700)
         raw = page.evaluate(MY_NOTES_JS, max(1, min(limit, 30))) or []
+        # 创作者卡片可能没有可打开的链接，从本人主页补充平台给出的完整定位链接。
+        if any(not row.get('href') for row in raw):
+            _goto(page, f'https://www.xiaohongshu.com/user/profile/{expected_account_remote_id}', wait=1800)
+            public_rows = page.evaluate(CARD_JS, 100) or []
+            links = {_note_id(str(item.get('href') or '')): item for item in public_rows if isinstance(item, dict)}
+            for item in page.evaluate(PROFILE_NOTES_JS, expected_account_remote_id) or []:
+                links[item['noteId']] = item
+            for row in raw:
+                if not row.get('href'):
+                    matched = links.get(str(row.get('noteId') or '')) or {}
+                    row['href'] = matched.get('href', '')
         items, locators = [], []
+        seen = set()
         for row in raw:
             href = str((row or {}).get('href') or '')
             nid = _note_id(href, str((row or {}).get('noteId') or ''))
+            if not nid or nid in seen or not href:
+                continue
+            seen.add(nid)
             text = str((row or {}).get('text') or '')
             item = {'note_id': nid, 'title': str((row or {}).get('title') or '(无标题)')[:180],
                     'url': public_note_url(href), 'scope': 'account_notes', 'metrics': _metrics(text)}
@@ -1163,20 +1202,29 @@ def note_detail(directory: Path, url: str) -> dict[str, Any]:
         _close(p, context)
 
 
-def comments(directory: Path, url: str, limit: int) -> dict[str, Any]:
+def comments(directory: Path, url: str, limit: int, expected_account_remote_id: str = '') -> dict[str, Any]:
     note_id, _, locator = parse_note_url(url)
     import xhs_comment
     p, context, page = _launch(directory)
     raw_pages: list[Any] = []
     try:
         def on_response(response):
-            if 'comment/page' in response.url:
-                try: raw_pages.append(response.json())
-                except Exception: pass
+            if 'comment/page' in response.url and parse_qs(urlsplit(response.url).query).get('note_id', [''])[0] == note_id:
+                try:
+                    value = response.json()
+                    if response.status == 200 and isinstance(value, dict) and value.get('success') is not False and isinstance((value.get('data') or {}).get('comments'), list):
+                        raw_pages.append(value)
+                except Exception:
+                    pass
         page.on('response', on_response)
         _goto(page, locator, wait=1600)
+        from .xhs_reply import verify_owner
+        verify_owner(page, note_id, expected_account_remote_id)
         for _ in range(3):
             page.evaluate('window.scrollTo(0, document.body.scrollHeight)'); page.wait_for_timeout(700)
+        _risk(page)
+        if not raw_pages:
+            raise XhsBrowserError('comments_sync_unconfirmed')
         rows = xhs_comment._collect_comments(raw_pages, max(1, min(limit, 100)))
         clean = [{
             'id': str(row.get('id') or '')[:100], 'nickname': str(row.get('nickname') or '')[:80],
@@ -1191,6 +1239,10 @@ def comments(directory: Path, url: str, limit: int) -> dict[str, Any]:
 
 def _target(page, target: dict[str, Any]):
     cid = str(target.get('id') or '')[:100]
+    if cid:
+        from .xhs_reply import TARGET_JS
+        element = page.evaluate_handle(TARGET_JS, cid).as_element()
+        return (element, '') if element else (None, 'target_not_found_or_ambiguous')
     nickname = str(target.get('nickname') or '')[:80]
     content = str(target.get('content') or '')[:500]
     count = int(page.evaluate(COMMENT_TARGET_COUNT_JS, [cid, nickname, content]) or 0)
@@ -1220,57 +1272,17 @@ def _verify_text(page, text: str) -> bool:
     except Exception: return False
 
 
-def reply(directory: Path, url: str, replies: list[dict[str, Any]]) -> dict[str, Any]:
-    _, _, locator = parse_note_url(url)
-    p, context, page = _launch(directory, headed=True)
-    results = []
-    try:
-        _goto(page, locator, wait=1800)
-        for target in replies[:20]:
-            text = str(target.get('reply') or '').strip()
-            if not text or len(text) > 1000:
-                results.append({'id': str(target.get('id') or ''), 'status': 'not_submitted', 'reason': 'invalid_reply'}); continue
-            container, reason = _target(page, target)
-            if not container:
-                results.append({'id': str(target.get('id') or ''), 'status': 'not_submitted', 'reason': reason}); continue
-            try:
-                reply_btn = None
-                for el in container.query_selector_all('*'):
-                    if (el.text_content() or '').strip() == '回复' and el.is_visible(): reply_btn = el; break
-                if not reply_btn:
-                    results.append({'id': str(target.get('id') or ''), 'status': 'not_submitted', 'reason': 'reply_button_missing'}); continue
-                reply_btn.click(); page.wait_for_timeout(500)
-                inp = _input(page)
-                if not inp:
-                    results.append({'id': str(target.get('id') or ''), 'status': 'not_submitted', 'reason': 'reply_input_missing'}); continue
-                _fill(inp, text)
-                clicked = False
-                for sel in ("button:has-text('发送')", "[class*='send-btn']", "[class*='submit']"):
-                    try:
-                        btn = page.locator(sel).first
-                        if btn.count() and btn.is_visible(): btn.click(); clicked = True; break
-                    except Exception: pass
-                if not clicked:
-                    try: inp.press('Control+Enter'); clicked = True
-                    except Exception: pass
-                if not clicked:
-                    results.append({'id': str(target.get('id') or ''), 'status': 'not_submitted', 'reason': 'send_control_missing'}); continue
-                page.wait_for_timeout(1200)
-                results.append({'id': str(target.get('id') or ''), 'status': 'verified' if _verify_text(page, text) else 'unknown_result', 'reason': ''})
-            except Exception:
-                results.append({'id': str(target.get('id') or ''), 'status': 'unknown_result', 'reason': 'interaction_error'})
-        return {'results': results}
-    finally:
-        _close(p, context)
-
-
-def delete_comments(directory: Path, url: str, targets: list[dict[str, Any]]) -> dict[str, Any]:
-    _, _, locator = parse_note_url(url)
-    p, context, page = _launch(directory, headed=True)
+def delete_comments(directory: Path, url: str, targets: list[dict[str, Any]], *, expected_account_remote_id: str = '', submission_file: str = '') -> dict[str, Any]:
+    from .xhs_reply import verify_owner, TARGET_JS
+    from .browser_submission import mark_submission
+    note_id, _, locator = parse_note_url(url)
+    p, context, page = _launch(directory, headed=False)
     results=[]
     try:
         _goto(page, locator, wait=1800)
+        verify_owner(page, note_id, expected_account_remote_id)
         for target in targets[:20]:
+            submitted = False
             container, reason = _target(page, target)
             if not container:
                 results.append({'id': str(target.get('id') or ''), 'status':'not_submitted','reason':reason}); continue
@@ -1289,6 +1301,9 @@ def delete_comments(directory: Path, url: str, targets: list[dict[str, Any]]) ->
                 if not menu.count(): menu = page.get_by_text('删除', exact=True).last
                 if not menu.count():
                     results.append({'id':str(target.get('id') or ''),'status':'not_submitted','reason':'delete_menu_missing'}); continue
+                verify_owner(page, note_id, expected_account_remote_id)
+                mark_submission(submission_file, {'target_id': note_id, 'comment_id': target['id'], 'account_remote_id': expected_account_remote_id})
+                submitted = True
                 menu.click(); page.wait_for_timeout(250)
                 for text in ('确定','确认','删除'):
                     try:
@@ -1296,37 +1311,47 @@ def delete_comments(directory: Path, url: str, targets: list[dict[str, Any]]) ->
                         if btn.count() and btn.is_visible(): btn.click(); break
                     except Exception: pass
                 page.wait_for_timeout(1000)
-                count=int(page.evaluate(COMMENT_TARGET_COUNT_JS,[str(target.get('id') or ''),str(target.get('nickname') or ''),str(target.get('content') or '')[:500]]) or 0)
-                results.append({'id':str(target.get('id') or ''),'status':'verified' if count==0 else 'unknown_result','reason':''})
-            except Exception:
-                results.append({'id':str(target.get('id') or ''),'status':'unknown_result','reason':'interaction_error'})
+                remaining = page.evaluate_handle(TARGET_JS, str(target.get('id') or '')).as_element()
+                results.append({'id':str(target.get('id') or ''),'status':'verified' if remaining is None else 'unknown_result','reason':''})
+            except Exception as exc:
+                results.append({'id':str(target.get('id') or ''),'status':'unknown_result' if submitted or isinstance(exc, FileExistsError) else 'not_submitted','reason':'interaction_error'})
         return {'results':results}
     finally:_close(p, context)
 
 
-def post_comment(directory: Path, url: str, text: str) -> dict[str, Any]:
-    _, _, locator = parse_note_url(url); text=str(text or '').strip()
+def post_comment(directory: Path, url: str, text: str, *, expected_account_remote_id: str = '', submission_file: str = '') -> dict[str, Any]:
+    from .xhs_reply import receipt_evidence, verify_owner
+    from .browser_submission import mark_submission
+    note_id, _, locator = parse_note_url(url); text=str(text or '').strip()
     if not text or len(text)>1000: raise XhsBrowserError('invalid_comment')
-    p, context, page=_launch(directory, headed=True)
+    p, context, page=_launch(directory, headed=False)
+    submitted = False
     try:
         _goto(page, locator, wait=1800)
-        inp=None
-        for sel in ("[placeholder*='说点什么']","[placeholder*='来聊聊']","[class*='comment-input'] [contenteditable='true']","[contenteditable='true']"):
-            try:
-                cand=page.locator(sel).first
-                if cand.count() and cand.is_visible(): inp=cand; break
-            except Exception:pass
+        verify_owner(page, note_id, expected_account_remote_id)
+        # 平台默认折叠评论框，先展开后再定位可编辑内容。
+        trigger = page.locator('[class*="not-active"]').first
+        if trigger.count() and trigger.is_visible():
+            trigger.click()
+            page.wait_for_timeout(300)
+        inp = _input(page)
         if not inp:return {'status':'not_submitted','reason':'comment_input_missing'}
         _fill(inp,text)
-        clicked=False
-        for sel in ("button:has-text('发送')","[class*='send-btn']","[class*='submit']"):
-            try:
-                btn=page.locator(sel).first
-                if btn.count() and btn.is_visible():btn.click();clicked=True;break
-            except Exception:pass
-        if not clicked:return {'status':'not_submitted','reason':'send_control_missing'}
-        page.wait_for_timeout(1200)
-        return {'status':'verified' if _verify_text(page,text) else 'unknown_result','reason':''}
+        buttons = page.get_by_role('button', name='发送', exact=True)
+        visible = [buttons.nth(i) for i in range(buttons.count()) if buttons.nth(i).is_visible()]
+        if len(visible) != 1:return {'status':'not_submitted','reason':'send_control_missing'}
+        verify_owner(page, note_id, expected_account_remote_id)
+        mark_submission(submission_file, {'target_id': note_id, 'account_remote_id': expected_account_remote_id})
+        with page.expect_response(lambda response: urlsplit(response.url).path == '/api/sns/web/v1/comment/post'
+                                  and response.request.method == 'POST', timeout=8000) as pending:
+            submitted = True
+            visible[0].click()
+        evidence = receipt_evidence(pending.value, note_id, '', expected_account_remote_id, text)
+        return {'status':'verified' if evidence else 'unknown_result', 'evidence': evidence or {},
+                'reason': '' if evidence else '缺少平台评论回执，请核对后处理。'}
+    except Exception as exc:
+        return {'status': 'unknown_result' if submitted or isinstance(exc, FileExistsError) else 'not_submitted',
+                'reason': '提交结果待核对。' if submitted or isinstance(exc, FileExistsError) else '提交前检查失败，本条未发送。'}
     finally:_close(p,context)
 
 
@@ -1334,7 +1359,7 @@ def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
     limit=max(1,min(int(params.get('limit') or 12),100))
     if action=='feed': return feed(directory,limit)
     if action=='search': return search(directory,str(params.get('query') or ''),limit)
-    if action=='notes': return account_notes(directory,limit)
+    if action=='notes': return account_notes(directory,limit,str(params.get('expected_account_remote_id') or ''))
     if action=='events':
         raw_event_limit = params.get('limit')
         raw_detail_limit = params.get('detail_limit')
@@ -1347,8 +1372,14 @@ def run(action: str, directory: Path, params: dict[str, Any]) -> dict[str, Any]:
             force=bool(params.get('force')),
         )
     if action=='note': return note_detail(directory,str(params.get('url') or ''))
-    if action=='comments': return comments(directory,str(params.get('url') or ''),limit)
-    if action=='reply': return reply(directory,str(params.get('url') or ''),list(params.get('items') or []))
-    if action=='delete': return delete_comments(directory,str(params.get('url') or ''),list(params.get('items') or []))
-    if action=='comment': return post_comment(directory,str(params.get('url') or ''),str(params.get('text') or ''))
+    if action=='comments': return comments(directory,str(params.get('url') or ''),limit,str(params.get('expected_account_remote_id') or ''))
+    if action=='reply':
+        from .xhs_reply import reply
+        return reply(directory, str(params.get('url') or ''), list(params.get('items') or []),
+                     expected_account_remote_id=str(params.get('expected_account_remote_id') or ''),
+                     submission_file=str(params.get('submission_file') or ''))
+    if action=='delete': return delete_comments(directory,str(params.get('url') or ''),list(params.get('items') or []),
+        expected_account_remote_id=str(params.get('expected_account_remote_id') or ''), submission_file=str(params.get('submission_file') or ''))
+    if action=='comment': return post_comment(directory,str(params.get('url') or ''),str(params.get('text') or ''),
+        expected_account_remote_id=str(params.get('expected_account_remote_id') or ''), submission_file=str(params.get('submission_file') or ''))
     raise XhsBrowserError('unsupported_action')

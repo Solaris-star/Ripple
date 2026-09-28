@@ -1,4 +1,8 @@
 import { securedFetchOptions } from './security';
+import { apiErrorMessage } from './apiError';
+import { parseChatArtifact, type ChatArtifactRef } from './chatArtifact';
+import { parseMediaTask, type MediaTask } from './mediaTask';
+export type { ChatArtifactRef };
 
 function getBasePath(): string {
   const path = window.location.pathname;
@@ -19,7 +23,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
       let detail = '';
       try {
         const j = await res.json();
-        detail = (j && (j.detail || j.message)) || '';
+        detail = apiErrorMessage(j, '');
       } catch {
         /* 响应体不是 JSON，忽略 */
       }
@@ -508,6 +512,7 @@ export interface CampaignPageResponse {
   total_pages: number;
   range_start: number;
   range_end: number;
+  query?: string;
   sort: CampaignListSort;
   platform: string;
   account_id: string;
@@ -530,6 +535,7 @@ export interface CampaignPageParams {
   deadline?: string;
   qualification?: string;
   snapshot_id?: string;
+  q?: string;
 }
 export interface CampaignSourceSyncState {
   at?: number; last_attempt_at?: number; last_success_at?: number; last_success_count?: number; next_run_at?: number;
@@ -598,12 +604,12 @@ function normalizeCampaign(item: Campaign): Campaign {
 export function fetchCampaigns(): Promise<Campaign[]> {
   return request<Campaign[]>('/api/campaigns').then((items) => items.map(normalizeCampaign));
 }
-export function fetchCampaignPage(params: CampaignPageParams = {}): Promise<CampaignPageResponse> {
+export function fetchCampaignPage(params: CampaignPageParams = {}, options?: Pick<RequestInit, 'signal'>): Promise<CampaignPageResponse> {
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && value !== '' && value !== 'all') query.set(key, String(value));
+    if (value !== undefined && value !== null && value !== '' && (key === 'q' || value !== 'all')) query.set(key, String(value));
   }
-  return request<CampaignPageResponse>(`/api/campaigns/page?${query.toString()}`).then((value) => ({
+  return request<CampaignPageResponse>(`/api/campaigns/page?${query.toString()}`, options).then((value) => ({
     ...value,
     items: (value.items || []).map(normalizeCampaign),
     stats: value.stats || { active: 0, soon: 0, saved: 0 },
@@ -826,10 +832,10 @@ export function confirmIdeaBrief(id: string, expectedRevision: number): Promise<
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ expected_revision: expectedRevision }),
   });
 }
-export function startIdeaContent(id: string, expectedRevision: number, idempotencyKey: string): Promise<{ idea: Idea; content: { id: string; version_id: string; content: { title: string } }; created: boolean }> {
+export function startIdeaContent(id: string, expectedRevision: number, idempotencyKey: string, manual = false): Promise<{ idea: Idea; content: { id: string; version_id: string; content: { title: string } }; created: boolean }> {
   return request('/api/ideas/' + encodeURIComponent(id) + '/start-content', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ expected_revision: expectedRevision, idempotency_key: idempotencyKey }),
+    body: JSON.stringify({ expected_revision: expectedRevision, idempotency_key: idempotencyKey, ...(manual ? { manual: true } : {}) }),
   });
 }
 export function planIdea(id: string, input: { scheduled_local: string; timezone: string; fold?: 0 | 1 | null; idempotency_key: string }): Promise<{ idea: Idea; plan: { id: string; version: number; scheduled_local: string; timezone: string } }> {
@@ -1150,10 +1156,6 @@ export function stopChat(sessionId: string): Promise<{ stopped: boolean }> {
   });
 }
 
-export interface ChatArtifactRef {
-  kind: 'content_draft'; id: string; version_id: string; title: string; status: 'draft';
-}
-
 export interface AgentTurnInjection { skills?: string[]; }
 export interface ChatContentScope {
   profileId: string;
@@ -1161,19 +1163,6 @@ export interface ChatContentScope {
   accountId: string;
   bindingRevision: number;
   overrides: Record<string, unknown>;
-}
-
-function parseChatArtifact(data: string): ChatArtifactRef | null {
-  try {
-    let value: unknown = JSON.parse(data);
-    if (typeof value === 'string') value = JSON.parse(value);
-    if (!value || typeof value !== 'object') return null;
-    const row = value as Record<string, unknown>;
-    if (row.kind !== 'content_draft' || typeof row.id !== 'string' || !/^[a-f0-9]{32}$/.test(row.id)
-        || typeof row.version_id !== 'string' || !/^[a-f0-9]{64}$/.test(row.version_id)) return null;
-    return { kind: 'content_draft', id: row.id, version_id: row.version_id,
-      title: typeof row.title === 'string' ? row.title.slice(0, 200) : '', status: 'draft' };
-  } catch { return null; }
 }
 
 export function streamChat(
@@ -1193,6 +1182,7 @@ export function streamChat(
   onArtifact?: (artifact: ChatArtifactRef) => void,
   injection: AgentTurnInjection = {},
   contentScope?: ChatContentScope,
+  onMediaTask?: (task: MediaTask) => void,
 ): AbortController {
   const controller = new AbortController();
   let lastEventId = 0;
@@ -1230,6 +1220,9 @@ export function streamChat(
         } else if (currentEvent === 'artifact' && onArtifact) {
           const artifact = parseChatArtifact(data);
           if (artifact) onArtifact(artifact);
+        } else if (currentEvent === 'media' && onMediaTask) {
+          const task = parseMediaTask(data);
+          if (task) onMediaTask(task);
         } else if (currentEvent === 'error') {
           let msg = '执行失败';
           try { msg = JSON.parse(data) as string; } catch { msg = data; }
@@ -1322,7 +1315,7 @@ export function streamChat(
 }
 
 /** 取某会话最近一轮的完整结果（SSE 断线后据此取回）。 */
-export function fetchLastTurn(sessionId: string, turnId?: string): Promise<{ status: string; text: string; turn_id?: string; artifacts?: ChatArtifactRef[] }> {
+export function fetchLastTurn(sessionId: string, turnId?: string): Promise<{ status: string; text: string; turn_id?: string; artifacts?: ChatArtifactRef[]; mediaTasks?: MediaTask[] }> {
   const query = turnId ? `?turn_id=${encodeURIComponent(turnId)}` : '';
   return request(`/api/chat/last/${encodeURIComponent(sessionId)}${query}`);
 }

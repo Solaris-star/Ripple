@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -31,10 +32,17 @@ def test_agent_content_tool_updates_existing_content_without_duplication(tmp_pat
         assert updated.status_code == 200
         payload = updated.json()
         assert payload["id"] == original["id"]
-        assert payload["updated"] is True
-        assert payload["version_id"] != original["version_id"]
+        assert payload["updated"] is False
+        assert payload["status"] == "proposal"
+        assert payload["version_id"] == original["version_id"]
         assert len(service.library.list()) == 1
         current = service.library.get(original["id"])
+        assert current["content"]["body"] == "第一版正文"
+        applied = service.library.apply_proposal(payload["proposal_id"], original["version_id"])
+        assert applied["status"] == "applied"
+        assert service.library.apply_proposal(payload["proposal_id"], original["version_id"])["applied_version_id"] == applied["applied_version_id"]
+        current = service.library.get(original["id"])
+        assert current["version"] == original["version"] + 1
         assert current["content"]["title"] == "原稿（AI 修改）"
         assert current["content"]["body"] == "第二版正文"
         assert current["content"]["tags"] == "新标签"
@@ -52,6 +60,9 @@ def test_agent_content_tool_updates_existing_content_without_duplication(tmp_pat
         })
         assert media_only.status_code == 200
         media_payload = media_only.json()
+        assert service.library.get(original["id"])["content"]["media"] == []
+        applied_media = service.library.apply_proposal(media_payload["proposal_id"], current["version_id"])
+        assert applied_media["status"] == "applied"
         current = service.library.get(original["id"])
         assert current["content"]["title"] == "原稿（AI 修改）"
         assert current["content"]["body"] == "第二版正文"
@@ -59,6 +70,17 @@ def test_agent_content_tool_updates_existing_content_without_duplication(tmp_pat
         assert current["content"]["media"] == ["AI媒体生成/generated.png"]
         assert media_payload["id"] == original["id"]
         assert len(service.library.list()) == 1
+
+        discarded = client.post("/api/ripple-agent/tools/content/draft", headers=headers, json={
+            "body": "应当放弃", "idempotency_key": "chat-bridge-discard",
+            "content_id": original["id"], "expected_version": current["version_id"],
+        })
+        assert discarded.status_code == 200
+        proposal_id = discarded.json()["proposal_id"]
+        assert service.library.dismiss_proposal(proposal_id)["status"] == "dismissed"
+        with pytest.raises(ValueError):
+            service.library.apply_proposal(proposal_id, current["version_id"])
+        assert service.library.get(original["id"])["content"]["body"] == "第二版正文"
 
         stale = client.post("/api/ripple-agent/tools/content/draft", headers=headers, json={
             "title": "不应覆盖",

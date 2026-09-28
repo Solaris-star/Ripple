@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { Page } from '../Sidebar';
-import { api, dateText, errorText, ACCOUNT_LABELS } from '../../lib/ripple';
-import type { Task, Account, Mother } from '../../lib/ripple';
+import { api, dateText, errorText } from '../../lib/ripple';
+import type { Task, Account, Mother, ContentPlan } from '../../lib/ripple';
 import type { PersonaItem } from '../../lib/api';
-import { Header, Feedback, Empty, Mark, Status } from './Common';
+import { Feedback } from './Common';
+import { taskNeedsAttention } from './variantPublishing';
 
 interface OverviewProps {
   onNavigate: (page: Page) => void;
@@ -14,45 +15,44 @@ interface OverviewProps {
   onEditPersona: (name: string) => void;
 }
 
+const ACTION: Record<string, string> = { unknown_result: '核对结果', verification_required: '查看核对', accepted: '核对回执', failed_retryable: '查看原因' };
+
 export default function Overview({ onNavigate, personas, selectedPersona, onPersonaChange, onNewPersona, onEditPersona }: OverviewProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [contents, setContents] = useState<Mother[]>([]);
+  const [plans, setPlans] = useState<ContentPlan[]>([]);
   const [counts, setCounts] = useState<Record<string, number>>({});
-  const [loaded, setLoaded] = useState(false);
   const [error, setError] = useState('');
   const refresh = useCallback(async () => {
-    const [t, a, c] = await Promise.all([api<{ items: Task[]; counts: Record<string, number> }>('/api/ripple/tasks'), api<Account[]>('/api/ripple/accounts'), api<Mother[]>('/api/ripple/contents')]);
-    setTasks(t.items); setCounts(t.counts); setAccounts(a); setContents(c); setLoaded(true); setError('');
+    const [taskRows, accountRows, contentRows, planRows] = await Promise.all([
+      api<{ items: Task[]; counts: Record<string, number> }>('/api/ripple/tasks'),
+      api<Account[]>('/api/ripple/accounts'),
+      api<Mother[]>('/api/ripple/contents'),
+      api<ContentPlan[]>('/api/ripple/plans'),
+    ]);
+    setTasks(taskRows.items); setCounts(taskRows.counts); setAccounts(accountRows); setContents(contentRows); setPlans(planRows); setError('');
   }, []);
-  useEffect(() => { void refresh().catch(e => setError(errorText(e))); }, [refresh]);
+  useEffect(() => { void refresh().catch((cause) => setError(errorText(cause))); }, [refresh]);
+  const featured = useMemo(() => [...contents].sort((a, b) => b.updated_at.localeCompare(a.updated_at))[0], [contents]);
+  const attention = tasks.filter(taskNeedsAttention);
+  const upcoming = [...plans.map((plan) => ({ id: plan.id, title: plan.title, at: plan.scheduled_at, label: '计划创作', kind: 'plan' as const })),
+    ...tasks.filter((task) => task.status === 'scheduled').map((task) => ({ id: task.id, title: task.content.title, at: task.content.scheduled_at || '', label: '已定时', kind: 'task' as const }))]
+    .filter((item) => item.at).sort((a, b) => a.at.localeCompare(b.at)).slice(0, 4);
   const openTask = (id: string) => { sessionStorage.setItem('ripple_task_focus', id); onNavigate('publish'); };
-  const attention = tasks.filter(t => ['unknown_result', 'verification_required', 'accepted', 'failed_retryable'].includes(t.status));
-  return <div className="page-scroll r2-page"><Header title="工作概览" subtitle="内容、排期和账号状态"><button className="r2-button" onClick={() => void refresh().catch(e => setError(errorText(e)))}>刷新</button><button className="r2-button primary" onClick={() => onNavigate('contents')}>新建内容</button></Header>
+  const openContent = (id: string) => { sessionStorage.setItem('ripple_content_focus', id); onNavigate('contents'); };
+  const today = new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date());
+
+  return <div className="page-scroll r2-page focus-overview">
     <Feedback error={error} />
-    <section className="r2-persona-card" aria-label="当前账号画像">
-      <div>
-        <h2>当前账号画像</h2>
-        <p>{selectedPersona ? `正在使用「${selectedPersona}」。热点推荐、AI 选题和对话会继承这个画像。` : '还没有选择画像。创建后，热点推荐、AI 选题和对话会结合账号定位。'}</p>
-      </div>
-      <div className="r2-persona-controls">
-        <select aria-label="首页账号画像" value={selectedPersona} onChange={(e) => onPersonaChange(e.target.value)}>
-          <option value="">通用模式</option>
-          {personas.map((persona) => <option key={persona.name} value={persona.name}>{persona.name}</option>)}
-        </select>
-        {selectedPersona && <button className="r2-button" onClick={() => onEditPersona(selectedPersona)}>编辑画像</button>}
-        <button className="r2-button primary" onClick={onNewPersona}>+ 创建账号画像</button>
-      </div>
-    </section>
-    <div className="r2-metrics">{[
-      ['内容', contents.length], ['待审核', (counts.draft || 0) + (counts.review_ready || 0)], ['待执行', (counts.approved || 0) + (counts.scheduled || 0)], ['待核对', (counts.accepted || 0) + (counts.unknown_result || 0) + (counts.verification_required || 0)],
-    ].map(([label, value]) => <div key={label}><span>{label}</span><strong>{loaded ? value : '—'}</strong></div>)}</div>
-    {attention.length > 0 && <section className="r2-section"><div className="r2-section-heading"><h2>需要处理</h2><span>{attention.length} 条</span></div>{attention.slice(0, 5).map(t => <button className="r2-attention-row" key={t.id} onClick={() => openTask(t.id)}><Mark platform={t.content.platform} /><strong>{t.content.title}</strong><span>{t.events.at(-1)?.note}</span><Status status={t.status} /></button>)}</section>}
-    <section className="r2-section"><div className="r2-section-heading"><h2>最近内容版本</h2><button className="r2-text-button" onClick={() => onNavigate('publish')}>打开发布工作台 →</button></div>
-      <div className="r2-table-wrap"><table className="r2-table"><thead><tr><th>内容</th><th>目标账号</th><th>状态</th><th>更新时间</th></tr></thead><tbody>{tasks.slice(0, 8).map(t => <tr key={t.id}><td><button className="r2-table-title" onClick={() => openTask(t.id)}><Mark platform={t.content.platform} /><span>{t.content.title}<small>平台版本 V{t.version}{t.content.mode !== 'real' ? ` · ${t.content.mode === 'blog' ? '本地导出' : '模拟'}` : ''}</small></span></button></td><td>{accounts.find(a => a.id === t.content.account_id)?.label || (t.content.mode === 'real' ? '尚未选择' : '本地')}</td><td><Status status={t.status} /></td><td className="r2-muted">{dateText(t.updated_at)}</td></tr>)}</tbody></table></div>
-      {loaded && tasks.length === 0 && <Empty title="还没有内容版本" description="先建立一份主稿，再为不同平台创建版本。"><button className="r2-button" onClick={() => onNavigate('contents')}>创建内容</button></Empty>}
-    </section>
-    <div className="r2-two-column"><section className="r2-section"><div className="r2-section-heading"><h2>账号</h2><button className="r2-text-button" onClick={() => onNavigate('channels')}>管理账号 →</button></div>{accounts.length === 0 ? <Empty title="尚未连接账号" description="支持独立扫码登录；每个账号使用自己的浏览器配置。"><button className="r2-button" onClick={() => onNavigate('channels')}>连接账号</button></Empty> : accounts.slice(0, 5).map(a => <div className="r2-compact-row" key={a.id}><Mark platform={a.platform} /><strong>{a.label}</strong><span>{ACCOUNT_LABELS[a.status] || a.status}</span></div>)}</section>
-    <section className="r2-section"><div className="r2-section-heading"><h2>近期排期</h2><button className="r2-text-button" onClick={() => onNavigate('calendar')}>打开日历 →</button></div>{tasks.filter(t => t.status === 'scheduled').length === 0 ? <Empty title="暂无待执行排期" description="在内容版本中设置时间，审核后进入发布队列。" /> : tasks.filter(t => t.status === 'scheduled').slice(0, 5).map(t => <button key={t.id} className="r2-attention-row" onClick={() => openTask(t.id)}><strong>{t.content.title}</strong><span>{dateText(t.content.scheduled_at)}</span></button>)}</section></div>
+    <header className="focus-overview-heading"><div><span className="focus-kicker">YOUR WORKSPACE</span><h1>今天，从这里继续。</h1><p>{today}{selectedPersona ? ` · ${selectedPersona}` : ' · 通用工作区'}</p></div><button className="focus-primary" onClick={() => onNavigate('contents')}>＋ 开始创作</button></header>
+
+    <section className="focus-overview-feature"><div><span className="focus-kicker">{featured ? `正在创作 · 主稿 V${featured.version}` : '开始创作'}</span><h2>{featured?.content.title || '把下一份想法写成主稿'}</h2><p>{featured ? '主稿和平台版本各自保存，可以接着完成上一次的内容。' : '创建一份主稿，再按需要为不同平台准备版本。'}</p><div><button className="focus-primary" onClick={() => featured ? openContent(featured.id) : onNavigate('contents')}>→ {featured ? '继续编辑' : '创建主稿'}</button>{featured?.variants?.length ? <button className="focus-text-button" onClick={() => openContent(featured.id)}>查看平台版本</button> : null}</div></div><div className="focus-feature-illustration" aria-hidden="true"><span>留一点时间，<br />给日常的观察。</span><i /><small>R / {new Date().getDate()}</small></div></section>
+
+    <div className="focus-overview-columns"><section className="focus-overview-card"><header><h2>需要你处理</h2><span>{attention.length} 项</span></header>{attention.length ? attention.slice(0, 4).map((task) => <button className="focus-overview-row" key={task.id} onClick={() => openTask(task.id)}><span className="focus-row-icon">▤</span><span><strong>{task.content.title}</strong><small>{task.events.at(-1)?.note || task.status}</small></span><em>{ACTION[task.status] || '查看'}</em></button>) : <div className="focus-overview-empty"><strong>目前没有待处理事项</strong><span>需要核对的发布结果会出现在这里。</span></div>}</section>
+      <section className="focus-overview-card"><header><h2>接下来的安排</h2><button className="focus-text-button" onClick={() => onNavigate('calendar')}>打开日历 →</button></header>{upcoming.length ? upcoming.map((item) => <button className="focus-overview-row" key={`${item.kind}:${item.id}`} onClick={() => item.kind === 'task' ? openTask(item.id) : onNavigate('calendar')}><time>{dateText(item.at)}</time><span><strong>{item.title}</strong><small>{item.label}</small></span><b>→</b></button>) : <div className="focus-overview-empty"><strong>近期还没有安排</strong><span>日历中的创作计划不会自动发布。</span><button className="focus-text-button" onClick={() => onNavigate('calendar')}>添加计划 →</button></div>}</section></div>
+
+    <footer className="focus-overview-footer"><span>创作记录</span><strong>{contents.length}</strong><span>份主稿</span><strong>{(counts.draft || 0) + (counts.review_ready || 0)}</strong><span>个版本待审核</span><strong>{(counts.published || 0) + (counts.exported || 0)}</strong><span>次发布已核对</span><button className="focus-text-button" onClick={() => onNavigate('publish')}>查看记录 →</button></footer>
+    <div className="focus-overview-persona"><span>当前账号画像：{selectedPersona || '通用模式'} · 已连接账号 {accounts.filter((item) => item.status === 'connected').length} 个</span><select aria-label="切换首页账号画像" value={selectedPersona} onChange={(event) => onPersonaChange(event.target.value)}><option value="">通用模式</option>{personas.map((persona) => <option key={persona.name} value={persona.name}>{persona.name}</option>)}</select>{selectedPersona ? <button onClick={() => onEditPersona(selectedPersona)}>编辑画像</button> : <button onClick={onNewPersona}>创建画像</button>}</div>
   </div>;
 }

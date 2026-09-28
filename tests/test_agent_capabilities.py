@@ -60,6 +60,27 @@ def test_session_persists_runtime_and_matching_profile(tmp_path):
         reg.update_session("native", {"runtime_id": "unknown"}, state, skills(), **scope)
 
 
+def test_saved_session_keeps_default_runtime_and_model_after_global_change(tmp_path):
+    reg = AgentCapabilityRegistry(tmp_path)
+    state = models(reg)
+    profile_runtimes = {"opencode:default": "opencode", "claude_code:default": "claude_code"}
+    old = reg.update_session("old-session", {}, state, skills(),
+                             runtime_ids=["opencode", "claude_code"], default_runtime="opencode",
+                             profile_runtimes=profile_runtimes, default_profile="opencode:default")
+    changed_state = {"default_model": "new-model", "models": [
+        {"id": "plain-model", "name": "Plain"}, {"id": "new-model", "name": "New"}]}
+    old_after = reg.get_session("old-session", changed_state, skills(),
+                                runtime_ids=["opencode", "claude_code"], default_runtime="claude_code",
+                                profile_runtimes=profile_runtimes, default_profile="claude_code:default")
+    fresh = reg.update_session("new-session", {}, changed_state, skills(),
+                               runtime_ids=["opencode", "claude_code"], default_runtime="claude_code",
+                               profile_runtimes=profile_runtimes, default_profile="claude_code:default")
+    assert old_after["runtime_id"] == old["runtime_id"] == "opencode"
+    assert old_after["model"] == old["model"] == "plain-model"
+    assert fresh["runtime_id"] == "claude_code"
+    assert fresh["model"] == "new-model"
+
+
 def test_session_model_is_validated_against_selected_runtime(tmp_path):
     reg = AgentCapabilityRegistry(tmp_path); state = models(reg)
     scope = {

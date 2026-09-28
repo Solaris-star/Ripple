@@ -2,6 +2,14 @@
 
 Ripple 自研代码按根目录 `LICENSE` 中的 Apache License 2.0 发布。本文件列出仓库内直接包含、改编或需要保留来源说明的主要第三方内容。依赖管理器安装的完整依赖许可证仍以对应包自身为准。
 
+## Unicode Emoji 计数数据
+
+- 来源：[Unicode 17.0 emoji-test.txt](https://www.unicode.org/Public/17.0.0/emoji/emoji-test.txt)。
+- 用途：`ripple/data/x_emoji_sequences.json`，供 Python 和前端共用 Emoji 序列及 X 字符权重配置。
+- 许可：Unicode License v3，完整文本见 `LICENSES/Unicode-3.0.txt`。
+- 生成方式：`scripts/update_x_emoji_data.py`。记录固定版本、来源和源文件 SHA-256。
+- 前端 URL 解析依赖 `twitter-text@3.1.0`（Apache-2.0）。Python 的 `ripple/_twitter_text/` 改编自 `twitter-text-parser==3.0.0` 的 URL 解析相关模块（MIT），原许可见 `LICENSES/twitter-text-parser-MIT.txt`；未包含原包的 Emoji 资源读取模块。
+
 ## Vendored / adapted skills and references
 
 详细逐项来源记录位于 `LICENSES/skill-attribution/`。
