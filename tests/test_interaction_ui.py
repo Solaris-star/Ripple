@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 from playwright.sync_api import sync_playwright, expect
 
 from ripple.accounts import AccountInput
+from ripple import execution_nodes
 from ripple.api import install
 from ripple.library import MotherCreate, MotherRevision
 from ripple.publishing import WorkflowError
@@ -251,7 +252,9 @@ def test_variant_sync_is_selective_and_reversible(ui):
     assert ui.errors == []
 
 
-def test_x_accounts_keep_edits_separate_and_show_weighted_limit(ui):
+def test_x_accounts_keep_edits_separate_and_show_weighted_limit(ui, monkeypatch):
+    # The UI uses isolated connected accounts; no real browser login is needed.
+    monkeypatch.setattr(execution_nodes, 'interactive_browser_channels', lambda: ['msedge'])
     account_ids = []
     for index in range(2):
         account = ui.service.accounts.create(AccountInput(platform='x', label=f'X 隔离账号 {index}', idempotency_key=f'x-ui-account-{index}'))

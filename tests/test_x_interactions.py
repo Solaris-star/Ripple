@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from ripple.accounts import AccountInput
+from ripple import execution_nodes
 from ripple.publishing import WorkflowError
 from ripple.workspace import WorkspaceService
 from ripple.x_interactions_browser import belongs_to, extract_posts, reply_evidence
@@ -48,7 +49,10 @@ def test_create_tweet_response_without_typename_keeps_media_separate_from_text()
 
 
 @pytest.fixture
-def work(tmp_path):
+def work(tmp_path, monkeypatch):
+    # These tests stub platform operations, not a real interactive login. Keep
+    # the account prerequisite independent of browsers installed on the host.
+    monkeypatch.setattr(execution_nodes, 'interactive_browser_channels', lambda: ['msedge'])
     service = WorkspaceService(tmp_path / 'outputs', private=tmp_path / 'private')
     account = service.accounts.create(AccountInput(platform='x', label='X 隔离账号', idempotency_key='x-replies-account'))
     with service.store.transaction() as state:

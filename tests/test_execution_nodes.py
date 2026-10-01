@@ -27,6 +27,21 @@ def register_remote(work: WorkspaceService):
     return result["node"], result["node_token"]
 
 
+def test_local_x_account_requires_interactive_login_capability(tmp_path, monkeypatch):
+    monkeypatch.setattr(execution_nodes, "available_browser_channels", lambda: ["chromium"])
+    monkeypatch.setattr(execution_nodes, "interactive_browser_channels", lambda: [])
+    work = WorkspaceService(tmp_path / "outputs", private=tmp_path / "private")
+    try:
+        node = work.execution_nodes.local()
+        assert "x.probe" in node["capabilities"]
+        assert "x.login" not in node["capabilities"]
+        with pytest.raises(WorkflowError, match="执行设备不支持此操作"):
+            work.accounts.create(AccountInput(platform="x", label="Headless X", idempotency_key="headless-x-account"))
+        assert work.accounts.list() == []
+    finally:
+        work.close()
+
+
 def test_execution_node_pairing_tokens_and_capabilities_are_bounded(tmp_path):
     work = WorkspaceService(tmp_path / "outputs", private=tmp_path / "private")
     try:
