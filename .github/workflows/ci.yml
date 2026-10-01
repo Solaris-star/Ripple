@@ -16,11 +16,21 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22.19.0'
+          cache: npm
+          cache-dependency-path: web/frontend/package-lock.json
       - name: Install package and audit tooling
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install pytest pip-audit build
+      - name: Install browser test runtime
+        run: python -m playwright install --with-deps chromium
+      - name: Install frontend test dependencies
+        working-directory: web/frontend
+        run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Tests
         run: python -m pytest -q
       - name: Python dependency audit

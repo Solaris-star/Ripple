@@ -20,8 +20,8 @@ def browser_page():
         browser = runtime.chromium.launch(headless=True, channel=os.environ.get('RIPPLE_TEST_BROWSER', 'msedge' if os.name == 'nt' else 'chromium'))
         context = browser.new_context()
         page = context.new_page()
-        original_wait = page.wait_for_timeout
-        page.wait_for_timeout = lambda ms: original_wait(min(ms, 50))
+        # Preserve the adapter's response waits: receipt callbacks are async even
+        # with intercepted network traffic, so a 50 ms cap races slower CI hosts.
         yield page
         context.close()
         browser.close()
@@ -131,7 +131,7 @@ def test_xhs_actual_click_needs_bound_receipt_not_visible_text(browser_page, mon
     requests = xhs_fixture(monkeypatch, browser_page, valid_receipt=valid_receipt)
     result = xhs_reply.reply(tmp_path, 'https://www.xiaohongshu.com/explore/note123', [{'id': 'c1', 'reply': '完整回复'}],
                              expected_account_remote_id='owner', submission_file=str(tmp_path / 'submission.json'))
-    assert result['results'][0]['status'] == expected
+    assert result['results'][0]['status'] == expected, (result, requests)
     assert len(requests) == browser_page.evaluate('window.clicks') == 1
     assert browser_page.locator('textarea').input_value() == '完整回复'
     replay = xhs_reply.reply(tmp_path, 'https://www.xiaohongshu.com/explore/note123', [{'id': 'c1', 'reply': '完整回复'}],
@@ -200,7 +200,7 @@ def test_x_browser_reply_uses_post_id_and_one_submission(browser_page, tmp_path,
     adapter, requests = x_fixture(browser_page, valid_receipt=valid_receipt)
     params = {'target_id': '100', 'expected_account_remote_id': 'x-web:owner', 'items': [{'id': '101', 'reply': '完整回复'}], 'submission_file': str(tmp_path / 'submission.json')}
     result = x_interactions_browser.run(adapter, None, 'reply', params)
-    assert result['results'][0]['status'] == expected
+    assert result['results'][0]['status'] == expected, (result, requests)
     assert len(requests) == 1
     assert requests[0]['variables']['reply']['in_reply_to_tweet_id'] == '101'
     replay = x_interactions_browser.run(adapter, None, 'reply', params)

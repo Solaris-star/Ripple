@@ -18,6 +18,15 @@
 
 ## 验证
 
+Python 测试包含真实浏览器和 React 组件测试，首次运行前需安装前端依赖和测试浏览器（Node.js 22.19+）：
+
+```bash
+npm --prefix web/frontend ci --ignore-scripts --no-audit --no-fund
+python -m playwright install chromium
+```
+
+Linux CI 使用 `python -m playwright install --with-deps chromium` 同时安装浏览器系统依赖。Windows 浏览器测试默认使用 Edge；如需使用上述 Chromium，可设置 `RIPPLE_TEST_BROWSER=chromium`。
+
 ```bash
 python -m pytest -q
 python scripts/ripple_smoke.py

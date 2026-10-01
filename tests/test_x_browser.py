@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -19,6 +20,7 @@ from ripple.publishing import ApprovalInput, CreateInput
 from ripple.workspace import WorkspaceService
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "skills/shared/scripts"
+TEST_BROWSER = os.environ.get("RIPPLE_TEST_BROWSER", "msedge" if os.name == "nt" else "chromium")
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 _spec = importlib.util.spec_from_file_location("ripple_test_x_browser", SCRIPTS / "x_browser.py")
@@ -96,7 +98,7 @@ def test_x_browser_profile_cookie_survives_workspace_restart(tmp_path, monkeypat
     profile = first.accounts.directory(account["id"]) / "browser" / "XProfile"
     first.close()
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(str(profile), channel="msedge", headless=True)
+        context = playwright.chromium.launch_persistent_context(str(profile), channel=TEST_BROWSER, headless=True)
         context.add_cookies([{"name": "ripple_fixture_session", "value": "persisted", "domain": "x.com", "path": "/", "expires": time.time() + 86400}])
         context.close()
     second = WorkspaceService(outputs, private=private)
@@ -104,7 +106,7 @@ def test_x_browser_profile_cookie_survives_workspace_restart(tmp_path, monkeypat
         assert second.accounts.get(account["id"])["id"] == account["id"]
         assert second.accounts.directory(account["id"]) / "browser" / "XProfile" == profile
         with sync_playwright() as playwright:
-            context = playwright.chromium.launch_persistent_context(str(profile), channel="msedge", headless=True)
+            context = playwright.chromium.launch_persistent_context(str(profile), channel=TEST_BROWSER, headless=True)
             cookies = context.cookies("https://x.com")
             context.close()
         assert any(c["name"] == "ripple_fixture_session" and c["value"] == "persisted" for c in cookies)
@@ -116,11 +118,11 @@ def test_x_browser_private_profile_gets_ripple_display_name(tmp_path):
     from playwright.sync_api import sync_playwright
     profile = tmp_path / "browser" / "XProfile"
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(str(profile), channel="msedge", headless=True)
+        context = playwright.chromium.launch_persistent_context(str(profile), channel=TEST_BROWSER, headless=True)
         context.close()
     x_browser._set_profile_name(profile, "个人账号")
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(str(profile), channel="msedge", headless=True)
+        context = playwright.chromium.launch_persistent_context(str(profile), channel=TEST_BROWSER, headless=True)
         context.close()
     local = json.loads((profile / "Local State").read_text(encoding="utf-8"))
     prefs = json.loads((profile / "Default" / "Preferences").read_text(encoding="utf-8"))
@@ -172,7 +174,7 @@ def test_x_browser_dispatch_uses_existing_approval_and_account_runner(work, monk
 def test_x_browser_identity_comes_from_visible_profile_link():
     from playwright.sync_api import sync_playwright
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel="msedge", headless=True)
+        browser = playwright.chromium.launch(channel=TEST_BROWSER, headless=True)
         page = browser.new_page()
         page.set_content('<a data-testid="AppTabBar_Profile_Link" href="/fixture_user">Profile</a>')
         assert x_browser.identity_from_page(page) == {
@@ -193,7 +195,7 @@ def test_x_browser_post_marks_boundary_only_immediately_before_click(tmp_path):
       <button data-testid="tweetButton" onclick="history.pushState({},'', '/home')">Post</button>
     </body></html>'''
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel="msedge", headless=True)
+        browser = playwright.chromium.launch(channel=TEST_BROWSER, headless=True)
         context = browser.new_context()
         page = context.new_page()
         page.route("http://fixture.local/**", lambda route: route.fulfill(status=200, content_type="text/html", body=html))
@@ -210,7 +212,7 @@ def test_x_browser_pre_submit_failure_keeps_not_submitted_boundary_absent(tmp_pa
     submission = tmp_path / "submission.json"
     args = SimpleNamespace(submission_file=str(submission), task_id="task", version_id="version", operation_id="op")
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(channel="msedge", headless=True)
+        browser = playwright.chromium.launch(channel=TEST_BROWSER, headless=True)
         page = browser.new_page()
         page.set_content('<div data-testid="tweetTextarea_0" contenteditable="true"></div>')
         x_browser._fill_composer(page, "hello")
